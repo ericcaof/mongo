@@ -2,7 +2,10 @@
  * Verifies that the data consistency checks work against the variety of cluster types we use in our
  * testing.
  *
- * @tags: [requires_replication, requires_sharding]
+ * @tags: [
+ *   requires_replication,
+ *   requires_sharding,
+ * ]
  */
 load("jstests/libs/logv2_helpers.js");
 

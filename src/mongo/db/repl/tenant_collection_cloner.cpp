@@ -42,6 +42,7 @@
 #include "mongo/db/repl/database_cloner_gen.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/tenant_collection_cloner.h"
+#include "mongo/db/repl/tenant_migration_decoration.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
@@ -58,6 +59,10 @@ const int kProgressMeterCheckInterval = 128;
 // Failpoint which causes the tenant database cloner to hang after it has successfully run
 // listIndexes and recorded the results and the operationTime.
 MONGO_FAIL_POINT_DEFINE(tenantCollectionClonerHangAfterGettingOperationTime);
+
+// Failpoint which causes the tenant collection cloner to hang after createCollection. This
+// failpoint doesn't check for cloner exit so we can rely on its timesEntered in tests.
+MONGO_FAIL_POINT_DEFINE(tenantCollectionClonerHangAfterCreateCollection);
 
 // Failpoint which causes tenant migration to hang after handling the next batch of results from the
 // DBClientConnection, optionally limited to a specific collection.
@@ -78,6 +83,10 @@ TenantCollectionCloner::TenantCollectionCloner(const NamespaceString& sourceNss,
       _sourceDbAndUuid(NamespaceString("UNINITIALIZED")),
       _collectionClonerBatchSize(collectionClonerBatchSize),
       _countStage("count", this, &TenantCollectionCloner::countStage),
+      _checkIfDonorCollectionIsEmptyStage(
+          "checkIfDonorCollectionIsEmpty",
+          this,
+          &TenantCollectionCloner::checkIfDonorCollectionIsEmptyStage),
       _listIndexesStage("listIndexes", this, &TenantCollectionCloner::listIndexesStage),
       _createCollectionStage(
           "createCollection", this, &TenantCollectionCloner::createCollectionStage),
@@ -111,7 +120,11 @@ TenantCollectionCloner::TenantCollectionCloner(const NamespaceString& sourceNss,
 }
 
 BaseCloner::ClonerStages TenantCollectionCloner::getStages() {
-    return {&_countStage, &_listIndexesStage, &_createCollectionStage, &_queryStage};
+    return {&_countStage,
+            &_checkIfDonorCollectionIsEmptyStage,
+            &_listIndexesStage,
+            &_createCollectionStage,
+            &_queryStage};
 }
 
 void TenantCollectionCloner::preStage() {
@@ -128,6 +141,7 @@ BaseCloner::AfterStageBehavior TenantCollectionCloner::TenantCollectionClonerSta
     try {
         return ClonerStage<TenantCollectionCloner>::run();
     } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+        // We can exit this cloner cleanly and move on to the next one.
         LOGV2(5289701,
               "TenantCollectionCloner stopped because collection was dropped on the donor.",
               "namespace"_attr = getCloner()->getSourceNss(),
@@ -162,11 +176,56 @@ BaseCloner::AfterStageBehavior TenantCollectionCloner::countStage() {
         count = 0;
     }
 
+    BSONObj res;
+    getClient()->runCommand(
+        _sourceNss.db().toString(), BSON("collStats" << _sourceNss.coll()), res);
+    auto status = getStatusFromCommandResult(res);
+    if (!status.isOK()) {
+        LOGV2_WARNING(5426601,
+                      "Skipping recording of data size metrics for collection due to failure in the"
+                      " 'collStats' command, tenant migration stats may be inaccurate.",
+                      "nss"_attr = _sourceNss,
+                      "migrationId"_attr = getSharedData()->getMigrationId(),
+                      "tenantId"_attr = _tenantId,
+                      "status"_attr = status);
+    }
+
     _progressMeter.setTotalWhileRunning(static_cast<unsigned long long>(count));
     {
         stdx::lock_guard<Latch> lk(_mutex);
         _stats.documentToCopy = count;
+        _stats.approxTotalDataSize = status.isOK() ? res.getField("size").safeNumberLong() : 0;
+        _stats.avgObjSize =
+            _stats.approxTotalDataSize ? res.getField("avgObjSize").safeNumberLong() : 0;
     }
+    return kContinueNormally;
+}
+
+// This avoids a race where an index may be created and data inserted after we do listIndexes.
+// That would result in doing a createIndexes on a non-empty collection during oplog application.
+// Instead, if the collection is empty before listIndexes, we do not clone the data -- it will be
+// added during oplog application.
+//
+// Note we cannot simply use the count() above, because that checks metadata which may not be 100%
+// accurate.
+BaseCloner::AfterStageBehavior TenantCollectionCloner::checkIfDonorCollectionIsEmptyStage() {
+    auto fieldsToReturn = BSON("_id" << 1);
+    auto cursor =
+        getClient()->query(_sourceDbAndUuid,
+                           {} /* Query */,
+                           1 /* limit */,
+                           0 /* skip */,
+                           &fieldsToReturn,
+                           QueryOption_SecondaryOk,
+                           0 /* batchSize */,
+                           ReadConcernArgs(ReadConcernLevel::kMajorityReadConcern).toBSONInner());
+    _donorCollectionWasEmptyBeforeListIndexes = !cursor->more();
+    LOGV2_DEBUG(5368500,
+                1,
+                "Checked if donor collection was empty",
+                "wasEmpty"_attr = _donorCollectionWasEmptyBeforeListIndexes,
+                "namespace"_attr = _sourceNss.ns(),
+                "tenantId"_attr = _tenantId);
     return kContinueNormally;
 }
 
@@ -229,14 +288,15 @@ BaseCloner::AfterStageBehavior TenantCollectionCloner::listIndexesStage() {
     };
 
     // Tenant collections are replicated collections and it's impossible to have an empty _id index
-    // and collection options 'autoIndexId' as false. These are extra sanity checks made on the
-    // response received from the remote node.
+    // and collection options 'autoIndexId' as false except for collections that use clustered
+    // index. These are extra sanity checks made on the response received from the remote node.
     uassert(
         ErrorCodes::IllegalOperation,
         str::stream() << "Found empty '_id' index spec but the collection is not specified with "
                          "'autoIndexId' as false, tenantId: "
                       << _tenantId << ", namespace: " << this->_sourceNss,
-        !_idIndexSpec.isEmpty() || _collectionOptions.autoIndexId == CollectionOptions::NO);
+        _collectionOptions.clusteredIndex || !_idIndexSpec.isEmpty() ||
+            _collectionOptions.autoIndexId == CollectionOptions::NO);
 
     if (!_idIndexSpec.isEmpty() && _collectionOptions.autoIndexId == CollectionOptions::NO) {
         LOGV2_WARNING(4884504,
@@ -280,6 +340,13 @@ BaseCloner::AfterStageBehavior TenantCollectionCloner::createCollectionStage() {
         // We are resuming and the collection already exists.
         DBDirectClient client(opCtx.get());
 
+        // Set the recipient info on the opCtx to bypass the access blocker for local reads.
+        tenantMigrationRecipientInfo(opCtx.get()) =
+            boost::make_optional<TenantMigrationRecipientInfo>(getSharedData()->getMigrationId());
+        // Reset the recipient info after local reads so oplog entries for future writes
+        // (createCollection/createIndex) don't get stamped with the fromTenantMigration field.
+        ON_BLOCK_EXIT([&opCtx] { tenantMigrationRecipientInfo(opCtx.get()) = boost::none; });
+
         auto fieldsToReturn = BSON("_id" << 1);
         _lastDocId =
             client.findOne(_existingNss->ns(), Query().sort(BSON("_id" << -1)), &fieldsToReturn);
@@ -292,6 +359,7 @@ BaseCloner::AfterStageBehavior TenantCollectionCloner::createCollectionStage() {
             {
                 stdx::lock_guard<Latch> lk(_mutex);
                 _stats.documentsCopied += count;
+                _stats.approxTotalBytesCopied = ((long)_stats.documentsCopied) * _stats.avgObjSize;
                 _progressMeter.hit(count);
             }
         } else {
@@ -331,10 +399,19 @@ BaseCloner::AfterStageBehavior TenantCollectionCloner::createCollectionStage() {
         uassertStatusOKWithContext(status, "Tenant collection cloner: create indexes");
     }
 
+    tenantCollectionClonerHangAfterCreateCollection.pauseWhileSet();
     return kContinueNormally;
 }
 
 BaseCloner::AfterStageBehavior TenantCollectionCloner::queryStage() {
+    if (_donorCollectionWasEmptyBeforeListIndexes) {
+        LOGV2_WARNING(5368501,
+                      "Collection was empty at clone time.",
+                      "namespace"_attr = _sourceNss,
+                      "tenantId"_attr = _tenantId);
+        return kContinueNormally;
+    }
+
     // Sets up tracking the lastVisibleOpTime from response metadata.
     auto requestMetadataWriter = [this](OperationContext* opCtx,
                                         BSONObjBuilder* metadataBob) -> Status {
@@ -344,13 +421,21 @@ BaseCloner::AfterStageBehavior TenantCollectionCloner::queryStage() {
     auto replyMetadataReader =
         [this](OperationContext* opCtx, const BSONObj& metadataObj, StringData source) -> Status {
         auto readResult = rpc::ReplSetMetadata::readFromMetadata(metadataObj);
-        if (!readResult.isOK()) {
-            return readResult.getStatus().withContext(
-                "tenant collection cloner failed to read repl set metadata");
+        if (readResult.isOK()) {
+            stdx::lock_guard<TenantMigrationSharedData> lk(*getSharedData());
+            getSharedData()->setLastVisibleOpTime(lk, readResult.getValue().getLastOpVisible());
+            return Status::OK();
         }
-        stdx::lock_guard<TenantMigrationSharedData> lk(*getSharedData());
-        getSharedData()->setLastVisibleOpTime(lk, readResult.getValue().getLastOpVisible());
-        return Status::OK();
+        if (readResult.getStatus() == ErrorCodes::NoSuchKey) {
+            // Some responses may not carry this information (e.g. reconnecting to verify a drop).
+            LOGV2_DEBUG(5328200,
+                        1,
+                        "No repl metadata found in response",
+                        "data"_attr = redact(metadataObj));
+            return Status::OK();
+        }
+        return readResult.getStatus().withContext(
+            "tenant collection cloner failed to read repl set metadata");
     };
     ScopedMetadataWriterAndReader mwr(getClient(), requestMetadataWriter, replyMetadataReader);
 
@@ -364,8 +449,15 @@ void TenantCollectionCloner::runQuery() {
         ? QUERY("query" << BSONObj())
         // Use $expr and the aggregation version of $gt to avoid type bracketing.
         : QUERY("$expr" << BSON("$gt" << BSON_ARRAY("$_id" << _lastDocId["_id"])));
-    query.hint(BSON("_id" << 1));
+    if (_collectionOptions.clusteredIndex) {
+        // RecordIds are _id values and has no separate _id index
+        query.hint(BSON("$natural" << 1));
+    } else {
+        query.hint(BSON("_id" << 1));
+    }
 
+    // Any errors that are thrown here (including NamespaceNotFound) will be handled on the stage
+    // level.
     getClient()->query([this](DBClientCursorBatchIterator& iter) { handleNextBatch(iter); },
                        _sourceDbAndUuid,
                        query,
@@ -374,7 +466,6 @@ void TenantCollectionCloner::runQuery() {
                            (collectionClonerUsesExhaust ? QueryOption_Exhaust : 0),
                        _collectionClonerBatchSize,
                        ReadConcernArgs(ReadConcernLevel::kMajorityReadConcern).toBSONInner());
-    _dbWorkTaskRunner.join();
 }
 
 void TenantCollectionCloner::handleNextBatch(DBClientCursorBatchIterator& iter) {
@@ -435,6 +526,7 @@ void TenantCollectionCloner::insertDocumentsCallback(
         }
         _documentsToInsert.swap(docs);
         _stats.documentsCopied += docs.size();
+        _stats.approxTotalBytesCopied = ((long)_stats.documentsCopied) * _stats.avgObjSize;
         ++_stats.insertedBatches;
         _progressMeter.hit(int(docs.size()));
     }
@@ -447,13 +539,18 @@ void TenantCollectionCloner::insertDocumentsCallback(
         DocumentValidationSettings::kDisableSchemaValidation |
             DocumentValidationSettings::kDisableInternalValidation);
 
-    write_ops::Insert insertOp(_existingNss.value_or(_sourceNss));
+    write_ops::InsertCommandRequest insertOp(_existingNss.value_or(_sourceNss));
     insertOp.setDocuments(std::move(docs));
-    insertOp.setWriteCommandBase([] {
-        write_ops::WriteCommandBase wcb;
+    insertOp.setWriteCommandRequestBase([] {
+        write_ops::WriteCommandRequestBase wcb;
         wcb.setOrdered(true);
         return wcb;
     }());
+
+    // Set the recipient info on the opCtx to skip checking user permissions in
+    // 'write_ops_exec::performInserts()'.
+    tenantMigrationRecipientInfo(cbd.opCtx) =
+        boost::make_optional<TenantMigrationRecipientInfo>(getSharedData()->getMigrationId());
 
     // write_ops_exec::PerformInserts() will handle limiting the batch size
     // that gets inserted in a single WUOW.
@@ -490,10 +587,10 @@ BSONObj TenantCollectionCloner::Stats::toBSON() const {
 }
 
 void TenantCollectionCloner::Stats::append(BSONObjBuilder* builder) const {
-    builder->appendNumber(kDocumentsToCopyFieldName, documentToCopy);
-    builder->appendNumber(kDocumentsCopiedFieldName, documentsCopied);
-    builder->appendNumber("indexes", indexes);
-    builder->appendNumber("insertedBatches", insertedBatches);
+    builder->appendNumber(kDocumentsToCopyFieldName, static_cast<long long>(documentToCopy));
+    builder->appendNumber(kDocumentsCopiedFieldName, static_cast<long long>(documentsCopied));
+    builder->appendNumber("indexes", static_cast<long long>(indexes));
+    builder->appendNumber("insertedBatches", static_cast<long long>(insertedBatches));
     if (start != Date_t()) {
         builder->appendDate("start", start);
         if (end != Date_t()) {
@@ -503,7 +600,7 @@ void TenantCollectionCloner::Stats::append(BSONObjBuilder* builder) const {
             builder->appendNumber("elapsedMillis", elapsedMillis);
         }
     }
-    builder->appendNumber("receivedBatches", receivedBatches);
+    builder->appendNumber("receivedBatches", static_cast<long long>(receivedBatches));
 }
 
 Timestamp TenantCollectionCloner::getOperationTime_forTest() {

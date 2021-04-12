@@ -34,6 +34,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/storage_stats_spec_gen.h"
 
 namespace mongo {
 
@@ -43,14 +44,14 @@ namespace mongo {
  * Params:
  * opCtx
  * nss Fully qualified namespace.
- * param Uses "scale" (default = 1) and "verbose".
+ * spec Includes options such as "scale" (default = 1) and "verbose".
  * builder out; object the stats will be appended to.
  *
  * returns Status, (note "NamespaceNotFound" will fill result with 0-ed stats)
  */
 Status appendCollectionStorageStats(OperationContext* opCtx,
                                     const NamespaceString& nss,
-                                    const BSONObj& param,
+                                    const StorageStatsSpec& spec,
                                     BSONObjBuilder* builder);
 
 /**

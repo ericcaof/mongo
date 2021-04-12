@@ -8,8 +8,11 @@
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallel_shell_helpers.js");
 
+// ErrorCodes
+const kIDLParserComparisonError = 51024;
+
 // runTest takes in the hello command or its aliases, isMaster and ismaster.
-function runTest(db, cmd) {
+function runTest(db, cmd, logFailpoint) {
     // Check the command response contains a topologyVersion even if maxAwaitTimeMS and
     // topologyVersion are not included in the request.
     const res = assert.commandWorked(db.runCommand(cmd));
@@ -30,6 +33,11 @@ function runTest(db, cmd) {
     assert.commandWorked(db.adminCommand({clearLog: 'global'}));
     let now = new Date();
     jsTestLog(`Running slow ${cmd}`);
+
+    // Get the slow query log failpoint for the command, to know the current timesEntered before
+    // the command runs.
+    const timesEnteredBeforeRunningCommand = configureFailPoint(db, logFailpoint).timesEntered;
+
     assert.commandWorked(
         db.runCommand({[cmd]: 1, topologyVersion: topologyVersionField, maxAwaitTimeMS: 20000}));
     let commandDuration = new Date() - now;
@@ -39,11 +47,10 @@ function runTest(db, cmd) {
         10000,
         cmd + ` command should have taken at least 10000ms, but completed in ${commandDuration}ms`);
 
-    assert(!checkLog.checkContainsOnceJson(db.getMongo(), 51803, {
-        'command': function(obj) {
-            return obj.hasOwnProperty(cmd);
-        }
-    }));
+    // Get the slow query log failpoint for the command, to make sure that it didn't get hit during
+    // the command run by checking that timesEntered is the same as before.
+    const timesEnteredAfterRunningCommand = configureFailPoint(db, logFailpoint).timesEntered;
+    assert(timesEnteredBeforeRunningCommand == timesEnteredAfterRunningCommand);
 
     // Check that the command appears in the slow query log if it's unexpectedly slow.
     function runHelloCommand(cmd, topologyVersionField) {
@@ -56,18 +63,18 @@ function runTest(db, cmd) {
 
     // Use a skip of 1, since the parallel shell runs hello when it starts.
     const helloFailpoint = configureFailPoint(db, "waitInHello", {}, {skip: 1});
+    const logFailPoint = configureFailPoint(db, logFailpoint);
     const awaitHello = startParallelShell(funWithArgs(runHelloCommand, cmd, topologyVersionField),
                                           db.getMongo().port);
     helloFailpoint.wait();
     sleep(1000);  // Make the command hang for a second in the parallel shell.
     helloFailpoint.off();
+
+    // Wait for the parallel shell to finish.
     awaitHello();
 
-    checkLog.containsJson(db.getMongo(), 51803, {
-        'command': function(obj) {
-            return obj.hasOwnProperty(cmd);
-        }
-    });
+    // Wait for the command to be logged.
+    logFailPoint.wait();
 
     // Check that when a different processId is given, the server responds immediately.
     now = new Date();
@@ -104,7 +111,7 @@ function runTest(db, cmd) {
     // Check that passing a topologyVersion not of type object fails.
     assert.commandFailedWithCode(
         db.runCommand({[cmd]: 1, topologyVersion: "topology_version_string", maxAwaitTimeMS: 0}),
-        10065);
+        ErrorCodes.TypeMismatch);
 
     // Check that a topologyVersion with an invalid processId and valid counter fails.
     assert.commandFailedWithCode(db.runCommand({
@@ -182,24 +189,24 @@ function runTest(db, cmd) {
         topologyVersion: topologyVersionField,
         maxAwaitTimeMS: -1,
     }),
-                                 [31373, 51759]);
+                                 [31373, 51759, kIDLParserComparisonError]);
 }
 
 // Set command log verbosity to 0 to avoid logging *all* commands in the "slow query" log.
 const conn = MongoRunner.runMongod({setParameter: {logComponentVerbosity: tojson({command: 0})}});
 assert.neq(null, conn, "mongod was unable to start up");
-runTest(conn.getDB("admin"), "hello");
-runTest(conn.getDB("admin"), "isMaster");
-runTest(conn.getDB("admin"), "ismaster");
+runTest(conn.getDB("admin"), "hello", "waitForHelloCommandLogged");
+runTest(conn.getDB("admin"), "isMaster", "waitForIsMasterCommandLogged");
+runTest(conn.getDB("admin"), "ismaster", "waitForIsMasterCommandLogged");
 MongoRunner.stopMongod(conn);
 
 const replTest = new ReplSetTest(
     {nodes: 1, nodeOptions: {setParameter: {logComponentVerbosity: tojson({command: 0})}}});
 replTest.startSet();
 replTest.initiate();
-runTest(replTest.getPrimary().getDB("admin"), "hello");
-runTest(replTest.getPrimary().getDB("admin"), "isMaster");
-runTest(replTest.getPrimary().getDB("admin"), "ismaster");
+runTest(replTest.getPrimary().getDB("admin"), "hello", "waitForHelloCommandLogged");
+runTest(replTest.getPrimary().getDB("admin"), "isMaster", "waitForIsMasterCommandLogged");
+runTest(replTest.getPrimary().getDB("admin"), "ismaster", "waitForIsMasterCommandLogged");
 replTest.stopSet();
 
 const st = new ShardingTest({
@@ -208,8 +215,8 @@ const st = new ShardingTest({
     config: 1,
     other: {mongosOptions: {setParameter: {logComponentVerbosity: tojson({command: 0})}}}
 });
-runTest(st.s.getDB("admin"), "hello");
-runTest(st.s.getDB("admin"), "isMaster");
-runTest(st.s.getDB("admin"), "ismaster");
+runTest(st.s.getDB("admin"), "hello", "waitForHelloCommandLogged");
+runTest(st.s.getDB("admin"), "isMaster", "waitForIsMasterCommandLogged");
+runTest(st.s.getDB("admin"), "ismaster", "waitForIsMasterCommandLogged");
 st.stop();
 })();

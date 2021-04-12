@@ -76,7 +76,8 @@ public:
                        OpTime applyFromOpTime,
                        RandomAccessOplogBuffer* oplogBuffer,
                        std::shared_ptr<executor::TaskExecutor> executor,
-                       ThreadPool* writerPool);
+                       ThreadPool* writerPool,
+                       Timestamp resumeBatchingTs = Timestamp());
 
     virtual ~TenantOplogApplier();
 
@@ -89,9 +90,30 @@ public:
      */
     SemiFuture<OpTimePair> getNotificationForOpTime(OpTime donorOpTime);
 
+    size_t getNumOpsApplied() {
+        stdx::lock_guard lk(_mutex);
+        return _numOpsApplied;
+    }
+
+    /**
+     * This should only be called once before the applier starts.
+     */
+    void setCloneFinishedRecipientOpTime(OpTime cloneFinishedRecipientOpTime);
+
+    /**
+     * Returns the optime the applier will start applying from. Used for testing.
+     */
+    OpTime getBeginApplyingOpTime_forTest() const;
+
+    /**
+     * Returns the timestamp the applier will resume batching from. Used for testing.
+     */
+    Timestamp getResumeBatchingTs_forTest() const;
+
 private:
     Status _doStartup_inlock() noexcept final;
     void _doShutdown_inlock() noexcept final;
+    void _preJoin() noexcept final;
     void _finishShutdown(WithLock lk, Status status);
 
     void _applyLoop(TenantOplogBatch batch);
@@ -101,10 +123,13 @@ private:
     Status _applyOplogBatchPerWorker(std::vector<const OplogEntry*>* ops);
     void _checkNsAndUuidsBelongToTenant(OperationContext* opCtx, const TenantOplogBatch& batch);
     OpTimePair _writeNoOpEntries(OperationContext* opCtx, const TenantOplogBatch& batch);
+
+    using TenantNoOpEntry = std::pair<const OplogEntry*, std::vector<OplogSlot>::iterator>;
     void _writeNoOpsForRange(OpObserver* opObserver,
-                             std::vector<TenantOplogEntry>::const_iterator begin,
-                             std::vector<TenantOplogEntry>::const_iterator end,
-                             std::vector<OplogSlot>::iterator firstSlot);
+                             std::vector<TenantNoOpEntry>::const_iterator begin,
+                             std::vector<TenantNoOpEntry>::const_iterator end);
+    void _writeSessionNoOpsForRange(std::vector<TenantNoOpEntry>::const_iterator begin,
+                                    std::vector<TenantNoOpEntry>::const_iterator end);
 
     Status _applyOplogEntryOrGroupedInserts(OperationContext* opCtx,
                                             const OplogEntryOrGroupedInserts& entryOrGroupedInserts,
@@ -112,11 +137,6 @@ private:
     std::vector<std::vector<const OplogEntry*>> _fillWriterVectors(OperationContext* opCtx,
                                                                    TenantOplogBatch* batch);
 
-    OpTime _getRecipientOpTime(const OpTime& donorOpTime);
-    // This is a convenience call for getRecipientOpTime which handles boost::none and nulls.
-    boost::optional<OpTime> _maybeGetRecipientOpTime(const boost::optional<OpTime>);
-    // _setRecipientOpTime must be called in optime order.
-    void _setRecipientOpTime(const OpTime& donorOpTime, const OpTime& recipientOpTime);
     /**
      * Sets the _finalStatus to the new status if and only if the old status is "OK".
      */
@@ -142,17 +162,24 @@ private:
     const OpTime _beginApplyingAfterOpTime;             // (R)
     RandomAccessOplogBuffer* _oplogBuffer;              // (R)
     std::shared_ptr<executor::TaskExecutor> _executor;  // (R)
+    // All no-op entries written by this tenant migration should have OpTime greater than this
+    // OpTime.
+    OpTime _cloneFinishedRecipientOpTime = OpTime();  // (R)
     // Keeps track of last applied donor and recipient optimes by the tenant oplog applier.
     // This gets updated only on batch boundaries.
     OpTimePair _lastAppliedOpTimesUpToLastBatch;  // (M)
-    std::vector<OpTimePair> _opTimeMapping;       // (M)
     // Pool of worker threads for writing ops to the databases.
     // Not owned by us.
-    ThreadPool* const _writerPool;                                        // (S)
+    ThreadPool* const _writerPool;  // (S)
+    // The timestamp to resume batching from. A null timestamp indicates that the oplog applier
+    // is starting fresh (not a retry), and will start batching from the beginning of the oplog
+    // buffer.
+    const Timestamp _resumeBatchingTs;                                    // (R)
     std::map<OpTime, SharedPromise<OpTimePair>> _opTimeNotificationList;  // (M)
     Status _finalStatus = Status::OK();                                   // (M)
     stdx::unordered_set<UUID, UUID::Hash> _knownGoodUuids;                // (X)
     bool _applyLoopApplyingBatch = false;                                 // (M)
+    size_t _numOpsApplied{0};                                             // (M)
 };
 
 /**

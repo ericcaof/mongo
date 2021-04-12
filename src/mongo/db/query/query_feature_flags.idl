@@ -34,3 +34,19 @@ feature_flags:
       description: "Feature flag for aggregation window function stage"
       cpp_varname: gFeatureFlagWindowFunctions
       default: false
+
+    featureFlagSBE:
+        description: >-
+          When set to true, SBE engine is used instead of the classic engine.
+        cpp_varname: gSBE
+        default: false
+
+    featureFlagChangeStreamsOptimization:
+      description: "Feature flag for enabling change streams optimization"
+      cpp_varname: gFeatureFlagChangeStreamsOptimization
+      default: false
+
+    featureFlagDotsAndDollars:
+      description: "Feature flag for allowing use of field names containing dots and dollars"
+      cpp_varname: gFeatureFlagDotsAndDollars
+      default: false

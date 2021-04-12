@@ -32,6 +32,7 @@
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 
 #include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/document_source_internal_unpack_bucket.h"
 #include "mongo/db/stats/counters.h"
 
 namespace mongo {
@@ -124,16 +125,76 @@ void LiteParsedPipeline::tickGlobalStageCounters() const {
     }
 }
 
-void LiteParsedPipeline::validatePipelineStagesIfAPIStrict(const std::string& version) const {
+void LiteParsedPipeline::validate(const OperationContext* opCtx,
+                                  bool performApiVersionChecks) const {
+    // An internal client could be one of the following :
+    //     - Does not have any transport session
+    //     - The transport session tag is internal
+    auto client = opCtx->getClient();
+    const auto isInternalClient =
+        !client->session() || (client->session()->getTags() & transport::Session::kInternalClient);
+
+    const auto apiParameters = APIParameters::get(opCtx);
+    auto apiVersion = apiParameters.getAPIVersion().value_or("");
+    auto apiStrict = apiParameters.getAPIStrict().value_or(false);
+    using AllowanceFlags = LiteParsedDocumentSource::AllowedWithApiStrict;
+
+    int internalUnpackBucketCount = 0;
     for (auto&& stage : _stageSpecs) {
-        if (version == "1") {
-            uassert(ErrorCodes::APIStrictError,
-                    str::stream() << "stage " << stage->getParseTimeName()
-                                  << " is not allowed with 'apiStrict: true' in API Version "
-                                  << version,
-                    isStageInAPIVersion1(stage->getParseTimeName()));
+        const auto& stageName = stage->getParseTimeName();
+        const auto& stageInfo = LiteParsedDocumentSource::getInfo(stageName);
+
+        uassert(5491300,
+                str::stream() << "The stage '" << stageName << "' is not allowed in user requests",
+                !(stageInfo.allowedWithClientType ==
+                      LiteParsedDocumentSource::AllowedWithClientType::kInternal &&
+                  !isInternalClient));
+
+        // Validate that the stage is API version compatible.
+        if (performApiVersionChecks && apiStrict) {
+            switch (stageInfo.allowedWithApiStrict) {
+                case AllowanceFlags::kNeverInVersion1: {
+                    uassert(ErrorCodes::APIStrictError,
+                            str::stream()
+                                << "stage " << stageName
+                                << " is not allowed with 'apiStrict: true' in API Version "
+                                << apiVersion,
+                            apiVersion != "1");
+                    break;
+                }
+                case AllowanceFlags::kInternal: {
+                    uassert(ErrorCodes::APIStrictError,
+                            str::stream()
+                                << "Internal stage " << stageName
+                                << " cannot be specified with 'apiStrict: true' in API Version "
+                                << apiVersion,
+                            isInternalClient);
+                    break;
+                }
+                case AllowanceFlags::kSometimes: {
+                    stage->assertPermittedInAPIVersion(apiParameters);
+                    break;
+                }
+                case AllowanceFlags::kAlways: {
+                    break;
+                }
+            }
+        }
+
+        internalUnpackBucketCount +=
+            (DocumentSourceInternalUnpackBucket::kStageName == stageName) ? 1 : 0;
+
+        for (auto&& subPipeline : stage->getSubPipelines()) {
+            subPipeline.validate(opCtx, performApiVersionChecks);
         }
     }
+
+
+    // Validates that the pipeline contains at most one $_internalUnpackBucket stage.
+    uassert(5348302,
+            str::stream() << "Encountered pipeline with more than one "
+                          << DocumentSourceInternalUnpackBucket::kStageName << " stage",
+            internalUnpackBucketCount <= 1);
 }
 
 }  // namespace mongo

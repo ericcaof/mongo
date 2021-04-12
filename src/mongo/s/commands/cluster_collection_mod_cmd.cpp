@@ -31,7 +31,10 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/auth/authorization_checks.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/coll_mod_gen.h"
+#include "mongo/db/coll_mod_reply_validation.h"
 #include "mongo/db/commands.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/cluster_commands_helpers.h"
@@ -40,9 +43,16 @@
 namespace mongo {
 namespace {
 
-class CollectionModCmd : public ErrmsgCommandDeprecated {
+constexpr auto kRawFieldName = "raw"_sd;
+constexpr auto kWriteConcernErrorFieldName = "writeConcernError"_sd;
+constexpr auto kTopologyVersionFieldName = "topologyVersion"_sd;
+
+class CollectionModCmd : public BasicCommandWithRequestParser<CollectionModCmd> {
 public:
-    CollectionModCmd() : ErrmsgCommandDeprecated("collMod") {}
+    using Request = CollMod;
+    using Reply = CollModReply;
+
+    CollectionModCmd() : BasicCommandWithRequestParser() {}
 
     const std::set<std::string>& apiVersions() const {
         return kApiVersions1;
@@ -60,19 +70,20 @@ public:
                                const std::string& dbname,
                                const BSONObj& cmdObj) const override {
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
-        return AuthorizationSession::get(client)->checkAuthForCollMod(nss, cmdObj, true);
+        return auth::checkAuthForCollMod(AuthorizationSession::get(client), nss, cmdObj, true);
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
 
-    bool errmsgRun(OperationContext* opCtx,
-                   const std::string& dbName,
-                   const BSONObj& cmdObj,
-                   std::string& errmsg,
-                   BSONObjBuilder& output) override {
-        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
+    bool runWithRequestParser(OperationContext* opCtx,
+                              const std::string& db,
+                              const BSONObj& cmdObj,
+                              const RequestParser& requestParser,
+                              BSONObjBuilder& result) final {
+        auto cmd = requestParser.request();
+        auto nss = cmd.getNamespace();
         LOGV2_DEBUG(22748,
                     1,
                     "collMod: {namespace} cmd: {command}",
@@ -84,18 +95,65 @@ public:
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
         auto shardResponses = scatterGatherVersionedTargetByRoutingTable(
             opCtx,
-            nss.db(),
+            cmd.getDbName(),
             nss,
             routingInfo,
             applyReadWriteConcern(
-                opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
+                opCtx,
+                this,
+                CommandHelpers::filterCommandRequestForPassthrough(cmd.toBSON(BSONObj()))),
             ReadPreferenceSetting::get(opCtx),
             Shard::RetryPolicy::kNoRetry,
             BSONObj() /* query */,
             BSONObj() /* collation */);
-        return appendRawResponses(opCtx, &errmsg, &output, std::move(shardResponses)).responseOK;
+        std::string errmsg;
+        auto ok = appendRawResponses(opCtx, &errmsg, &result, std::move(shardResponses)).responseOK;
+        if (!errmsg.empty()) {
+            CommandHelpers::appendSimpleCommandStatus(result, ok, errmsg);
+        }
+
+        return ok;
     }
 
+    void validateResult(const BSONObj& resultObj) final {
+        auto ctx = IDLParserErrorContext("CollModReply");
+        if (checkIsErrorStatus(resultObj, ctx)) {
+            return;
+        }
+
+        StringDataSet ignorableFields({kWriteConcernErrorFieldName,
+                                       ErrorReply::kOkFieldName,
+                                       kTopologyVersionFieldName,
+                                       kRawFieldName});
+        auto reply = Reply::parse(ctx, resultObj.removeFields(ignorableFields));
+        coll_mod_reply_validation::validateReply(reply);
+
+        if (!resultObj.hasField(kRawFieldName)) {
+            return;
+        }
+
+        const auto& rawData = resultObj[kRawFieldName];
+        if (!ctx.checkAndAssertType(rawData, Object)) {
+            return;
+        }
+
+        auto rawCtx = IDLParserErrorContext(kRawFieldName, &ctx);
+        for (const auto& element : rawData.Obj()) {
+            if (!rawCtx.checkAndAssertType(element, Object)) {
+                return;
+            }
+
+            const auto& shardReply = element.Obj();
+            if (!checkIsErrorStatus(shardReply, ctx)) {
+                auto reply = Reply::parse(ctx, shardReply.removeFields(ignorableFields));
+                coll_mod_reply_validation::validateReply(reply);
+            }
+        }
+    }
+
+    const AuthorizationContract* getAuthorizationContract() const final {
+        return &::mongo::CollMod::kAuthorizationContract;
+    }
 } collectionModCmd;
 
 }  // namespace

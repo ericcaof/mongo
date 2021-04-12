@@ -39,6 +39,7 @@
 #include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/create_gen.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -56,6 +57,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/ttl_collection_cache.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/idl/command_generic_argument.h"
 #include "mongo/logv2/log.h"
@@ -83,8 +85,7 @@ void assertMovePrimaryInProgress(OperationContext* opCtx, NamespaceString const&
             auto mpsm = dss->getMovePrimarySourceManager(dssLock);
 
             if (mpsm) {
-                LOGV2(
-                    4945200, "assertMovePrimaryInProgress", "movePrimaryNss"_attr = nss.toString());
+                LOGV2(4945200, "assertMovePrimaryInProgress", "namespace"_attr = nss.toString());
 
                 uasserted(ErrorCodes::MovePrimaryInProgress,
                           "movePrimary is in progress for namespace " + nss.toString());
@@ -92,7 +93,7 @@ void assertMovePrimaryInProgress(OperationContext* opCtx, NamespaceString const&
         }
     } catch (const DBException& ex) {
         if (ex.toStatus() != ErrorCodes::MovePrimaryInProgress) {
-            LOGV2(4945201, "Error when getting colleciton description", "what"_attr = ex.what());
+            LOGV2(4945201, "Error when getting collection description", "what"_attr = ex.what());
             return;
         }
         throw;
@@ -102,6 +103,7 @@ void assertMovePrimaryInProgress(OperationContext* opCtx, NamespaceString const&
 struct CollModRequest {
     const IndexDescriptor* idx = nullptr;
     BSONElement indexExpireAfterSeconds = {};
+    BSONElement clusteredIndexExpireAfterSeconds = {};
     BSONElement indexHidden = {};
     BSONElement viewPipeLine = {};
     std::string viewOn = {};
@@ -221,17 +223,32 @@ StatusWith<CollModRequest> parseCollModRequest(OperationContext* opCtx,
                 }
             }
 
-            // Hiding a hidden index or unhiding a visible index should be treated as a no-op.
-            if (!cmr.indexHidden.eoo() && cmr.idx->hidden() == cmr.indexHidden.booleanSafe()) {
-                // If the collMod includes "expireAfterSeconds", remove the no-op "hidden" parameter
-                // and write the remaining "index" object to the oplog entry builder.
-                if (!cmr.indexExpireAfterSeconds.eoo()) {
-                    oplogEntryBuilder->append(fieldName, indexObj.removeField("hidden"));
+            if (cmr.indexHidden) {
+                // Hiding a hidden index or unhiding a visible index should be treated as a no-op.
+                if (cmr.idx->hidden() == cmr.indexHidden.booleanSafe()) {
+                    // If the collMod includes "expireAfterSeconds", remove the no-op "hidden"
+                    // parameter and write the remaining "index" object to the oplog entry builder.
+                    if (!cmr.indexExpireAfterSeconds.eoo()) {
+                        oplogEntryBuilder->append(fieldName, indexObj.removeField("hidden"));
+                    }
+                    // Un-set "indexHidden" in CollModRequest, and skip the automatic write to the
+                    // oplogEntryBuilder that occurs at the end of the parsing loop.
+                    cmr.indexHidden = {};
+                    continue;
                 }
-                // Un-set "indexHidden" in CollModRequest, and skip the automatic write to the
-                // oplogEntryBuilder that occurs at the end of the parsing loop.
-                cmr.indexHidden = {};
-                continue;
+
+                // Disallow index hiding/unhiding on system collections.
+                // Bucket collections, which hold data for user-created time-series collections, do
+                // not have this restriction.
+                if (nss.isSystem() && !nss.isTimeseriesBucketsCollection()) {
+                    return Status(ErrorCodes::BadValue, "Can't hide index on system collection");
+                }
+
+                // Disallow index hiding/unhiding on _id indexes - these are created by default and
+                // are critical to most collection operations.
+                if (cmr.idx->isIdIndex()) {
+                    return Status(ErrorCodes::BadValue, "can't hide _id index");
+                }
             }
         } else if (fieldName == "validator" && !isView) {
             // If the feature compatibility version is not kLatest, and we are validating features
@@ -290,6 +307,30 @@ StatusWith<CollModRequest> parseCollModRequest(OperationContext* opCtx,
             }
 
             cmr.recordPreImages = e.trueValue();
+        } else if (fieldName == "clusteredIndex") {
+            if (coll->getRecordStore()->keyFormat() != KeyFormat::String) {
+                return Status(
+                    ErrorCodes::InvalidOptions,
+                    "'clusteredIndex' option is only supported on collections clustered by _id");
+            }
+
+            BSONElement elem = e.Obj()["expireAfterSeconds"];
+            if (elem.type() == mongo::String) {
+                const std::string elemStr = elem.String();
+                if (elemStr != "off") {
+                    return Status(
+                        ErrorCodes::InvalidOptions,
+                        str::stream()
+                            << "Invalid string value for the 'clusteredIndex::expireAfterSeconds' "
+                            << "option. Got: '" << elemStr << "'. Accepted value is 'off'");
+                }
+            } else {
+                invariant(elem.type() == mongo::NumberLong);
+                const int64_t elemNum = elem.safeNumberLong();
+                uassertStatusOK(index_key_validate::validateExpireAfterSeconds(elemNum));
+            }
+
+            cmr.clusteredIndexExpireAfterSeconds = e.Obj()["expireAfterSeconds"];
         } else {
             if (isView) {
                 return Status(ErrorCodes::InvalidOptions,
@@ -342,6 +383,48 @@ private:
     BSONObjBuilder* _result;
 };
 
+void _setClusteredExpireAfterSeconds(OperationContext* opCtx,
+                                     const CollectionOptions& oldCollOptions,
+                                     const CollectionPtr& coll,
+                                     const BSONElement& clusteredIndexExpireAfterSeconds) {
+    invariant(oldCollOptions.clusteredIndex.has_value());
+
+    boost::optional<int64_t> oldExpireAfterSeconds =
+        oldCollOptions.clusteredIndex->getExpireAfterSeconds();
+
+    if (clusteredIndexExpireAfterSeconds.type() == mongo::String) {
+        const std::string newExpireAfterSeconds = clusteredIndexExpireAfterSeconds.String();
+        invariant(newExpireAfterSeconds == "off");
+        if (!oldExpireAfterSeconds) {
+            // expireAfterSeconds is already disabled on the clustered index.
+            return;
+        }
+
+        DurableCatalog::get(opCtx)->updateClusteredIndexTTLSetting(
+            opCtx, coll->getCatalogId(), boost::none);
+        return;
+    }
+
+    invariant(clusteredIndexExpireAfterSeconds.type() == mongo::NumberLong);
+    int64_t newExpireAfterSeconds = clusteredIndexExpireAfterSeconds.safeNumberLong();
+    if (oldExpireAfterSeconds && *oldExpireAfterSeconds == newExpireAfterSeconds) {
+        // expireAfterSeconds is already the requested value on the clustered index.
+        return;
+    }
+
+    // If this collection was not previously TTL, inform the TTL monitor when we commit.
+    if (!oldExpireAfterSeconds) {
+        auto ttlCache = &TTLCollectionCache::get(opCtx->getServiceContext());
+        opCtx->recoveryUnit()->onCommit([ttlCache, uuid = coll->uuid()](auto _) {
+            ttlCache->registerTTLInfo(uuid, TTLCollectionCache::ClusteredId());
+        });
+    }
+
+    invariant(newExpireAfterSeconds >= 0);
+    DurableCatalog::get(opCtx)->updateClusteredIndexTTLSetting(
+        opCtx, coll->getCatalogId(), newExpireAfterSeconds);
+}
+
 Status _collModInternal(OperationContext* opCtx,
                         const NamespaceString& nss,
                         const BSONObj& cmdObj,
@@ -354,7 +437,7 @@ Status _collModInternal(OperationContext* opCtx,
     Database* const db = coll.getDb();
 
     CurOpFailpointHelpers::waitWhileFailPointEnabled(
-        &hangAfterDatabaseLock, opCtx, "hangAfterDatabaseLock", []() {}, false, nss);
+        &hangAfterDatabaseLock, opCtx, "hangAfterDatabaseLock", []() {}, nss);
 
     // May also modify a view instead of a collection.
     boost::optional<ViewDefinition> view;
@@ -371,6 +454,9 @@ Status _collModInternal(OperationContext* opCtx,
     if (coll) {
         assertMovePrimaryInProgress(opCtx, nss);
         IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(coll->uuid());
+        CollectionShardingState::get(opCtx, nss)
+            ->getCollectionDescription(opCtx)
+            .throwIfReshardingInProgress(nss);
     }
 
     // If db/collection/view does not exist, short circuit and return.
@@ -403,17 +489,11 @@ Status _collModInternal(OperationContext* opCtx,
     auto viewPipeline = cmrNew.viewPipeLine;
     auto viewOn = cmrNew.viewOn;
     auto indexExpireAfterSeconds = cmrNew.indexExpireAfterSeconds;
+    auto clusteredIndexExpireAfterSeconds = cmrNew.clusteredIndexExpireAfterSeconds;
     auto indexHidden = cmrNew.indexHidden;
     // WriteConflictExceptions thrown in the writeConflictRetry loop below can cause cmrNew.idx to
     // become invalid, so save a copy to use in the loop until we can refresh it.
     auto idx = cmrNew.idx;
-
-    if (indexHidden) {
-        if (coll->ns().isSystem())
-            return Status(ErrorCodes::BadValue, "Can't hide index on system collection");
-        if (idx->isIdIndex())
-            return Status(ErrorCodes::BadValue, "can't hide _id index");
-    }
 
     return writeConflictRetry(opCtx, "collMod", nss.ns(), [&] {
         WriteUnitOfWork wunit(opCtx);
@@ -452,6 +532,10 @@ Status _collModInternal(OperationContext* opCtx,
         boost::optional<IndexCollModInfo> indexCollModInfo;
 
         // Handle collMod operation type appropriately.
+        if (clusteredIndexExpireAfterSeconds) {
+            _setClusteredExpireAfterSeconds(
+                opCtx, oldCollOptions, coll.getCollection(), clusteredIndexExpireAfterSeconds);
+        }
 
         if (indexExpireAfterSeconds || indexHidden) {
             BSONElement newExpireSecs = {};

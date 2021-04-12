@@ -47,25 +47,16 @@ namespace mongo {
 
 Status appendCollectionStorageStats(OperationContext* opCtx,
                                     const NamespaceString& nss,
-                                    const BSONObj& param,
+                                    const StorageStatsSpec& storageStatsSpec,
                                     BSONObjBuilder* result) {
-    int scale = 1;
-    if (param["scale"].isNumber()) {
-        scale = param["scale"].numberInt();
-        if (scale < 1) {
-            return {ErrorCodes::BadValue, "scale has to be >= 1"};
-        }
-    } else if (param["scale"].trueValue()) {
-        return {ErrorCodes::BadValue, "scale has to be a number >= 1"};
-    }
-
-    bool verbose = param["verbose"].trueValue();
-    bool waitForLock = !param.hasField("waitForLock") || param["waitForLock"].trueValue();
+    auto scale = storageStatsSpec.getScale().value_or(1);
+    bool verbose = storageStatsSpec.getVerbose();
+    bool waitForLock = storageStatsSpec.getWaitForLock();
 
     bool isTimeseries = false;
     if (auto viewCatalog = DatabaseHolder::get(opCtx)->getViewCatalog(opCtx, nss.db())) {
         if (auto viewDef = viewCatalog->lookupWithoutValidatingDurableViews(opCtx, nss.ns())) {
-            isTimeseries = viewDef->timeseries().has_value();
+            isTimeseries = viewDef->timeseries();
         }
     }
 
@@ -102,12 +93,13 @@ Status appendCollectionStorageStats(OperationContext* opCtx,
 
     long long numRecords = collection->numRecords(opCtx);
     if (isTimeseries) {
-        result->append("bucketsNs", nss.makeTimeseriesBucketsNamespace().ns());
-        result->appendNumber("bucketCount", numRecords);
+        BSONObjBuilder bob(result->subobjStart("timeseries"));
+        bob.append("bucketsNs", nss.makeTimeseriesBucketsNamespace().ns());
+        bob.appendNumber("bucketCount", numRecords);
         if (numRecords) {
-            result->append("avgBucketSize", collection->averageObjectSize(opCtx));
+            bob.append("avgBucketSize", collection->averageObjectSize(opCtx));
         }
-        BucketCatalog::get(opCtx).appendExecutionStats(nss, result);
+        BucketCatalog::get(opCtx).appendExecutionStats(nss, &bob);
     } else {
         result->appendNumber("count", numRecords);
         if (numRecords) {
@@ -121,6 +113,13 @@ Status appendCollectionStorageStats(OperationContext* opCtx,
     result->appendNumber("storageSize", storageSize / scale);
     result->appendNumber("freeStorageSize",
                          static_cast<long long>(recordStore->freeStorageSize(opCtx)) / scale);
+
+    const bool isCapped = collection->isCapped();
+    result->appendBool("capped", isCapped);
+    if (isCapped) {
+        result->appendNumber("max", collection->getCappedMaxDocs());
+        result->appendNumber("maxSize", collection->getCappedMaxSize() / scale);
+    }
 
     recordStore->appendCustomStats(opCtx, result, scale);
 

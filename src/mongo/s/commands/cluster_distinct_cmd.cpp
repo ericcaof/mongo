@@ -133,17 +133,18 @@ public:
             }
 
             auto viewAggCmd = OpMsgRequest::fromDBAndBody(nss.db(), aggCmdOnView.getValue()).body;
-            auto aggRequestOnView =
-                aggregation_request_helper::parseFromBSON(nss, viewAggCmd, verbosity);
-            if (!aggRequestOnView.isOK()) {
-                return aggRequestOnView.getStatus();
-            }
+            auto aggRequestOnView = aggregation_request_helper::parseFromBSON(
+                nss,
+                viewAggCmd,
+                verbosity,
+                APIParameters::get(opCtx).getAPIStrict().value_or(false));
+
 
             auto bodyBuilder = result->getBodyBuilder();
             // An empty PrivilegeVector is acceptable because these privileges are only checked on
             // getMore and explain will not open a cursor.
             return ClusterAggregate::retryOnViewError(opCtx,
-                                                      aggRequestOnView.getValue(),
+                                                      aggRequestOnView,
                                                       *ex.extraInfo<ResolvedView>(),
                                                       nss,
                                                       PrivilegeVector(),
@@ -208,10 +209,13 @@ public:
             uassertStatusOK(aggCmdOnView.getStatus());
 
             auto viewAggCmd = OpMsgRequest::fromDBAndBody(nss.db(), aggCmdOnView.getValue()).body;
-            auto aggRequestOnView = aggregation_request_helper::parseFromBSON(nss, viewAggCmd);
-            uassertStatusOK(aggRequestOnView.getStatus());
+            auto aggRequestOnView = aggregation_request_helper::parseFromBSON(
+                nss,
+                viewAggCmd,
+                boost::none,
+                APIParameters::get(opCtx).getAPIStrict().value_or(false));
 
-            auto resolvedAggRequest = ex->asExpandedViewAggregation(aggRequestOnView.getValue());
+            auto resolvedAggRequest = ex->asExpandedViewAggregation(aggRequestOnView);
             auto resolvedAggCmd =
                 aggregation_request_helper::serializeToCommandObj(resolvedAggRequest);
 

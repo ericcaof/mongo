@@ -1,4 +1,6 @@
-// @tags: [requires_sharding]
+// @tags: [
+//   requires_sharding,
+// ]
 
 (function() {
 'use strict';

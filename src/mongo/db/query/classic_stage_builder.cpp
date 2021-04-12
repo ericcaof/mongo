@@ -59,11 +59,11 @@
 #include "mongo/db/exec/skip.h"
 #include "mongo/db/exec/sort.h"
 #include "mongo/db/exec/sort_key_generator.h"
-#include "mongo/db/exec/text.h"
+#include "mongo/db/exec/text_match.h"
+#include "mongo/db/exec/text_or.h"
 #include "mongo/db/index/fts_access_method.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/s/collection_sharding_state.h"
-#include "mongo/db/storage/oplog_hack.h"
 #include "mongo/logv2/log.h"
 
 namespace mongo::stage_builder {
@@ -78,12 +78,12 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
             CollectionScanParams params;
             params.tailable = csn->tailable;
             params.shouldTrackLatestOplogTimestamp = csn->shouldTrackLatestOplogTimestamp;
-            params.assertMinTsHasNotFallenOffOplog = csn->assertMinTsHasNotFallenOffOplog;
+            params.assertTsHasNotFallenOffOplog = csn->assertTsHasNotFallenOffOplog;
             params.direction = (csn->direction == 1) ? CollectionScanParams::FORWARD
                                                      : CollectionScanParams::BACKWARD;
             params.shouldWaitForOplogVisibility = csn->shouldWaitForOplogVisibility;
-            params.minTs = csn->minTs;
-            params.maxTs = csn->maxTs;
+            params.minRecord = csn->minRecord;
+            params.maxRecord = csn->maxRecord;
             params.requestResumeToken = csn->requestResumeToken;
             params.resumeAfterRecordId = csn->resumeAfterRecordId;
             params.stopApplyingFilterAfterFirstMatch = csn->stopApplyingFilterAfterFirstMatch;
@@ -160,30 +160,33 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
         case STAGE_PROJECTION_DEFAULT: {
             auto pn = static_cast<const ProjectionNodeDefault*>(root);
             auto childStage = build(pn->children[0]);
-            return std::make_unique<ProjectionStageDefault>(_cq.getExpCtx(),
-                                                            _cq.getQueryRequest().getProj(),
-                                                            _cq.getProj(),
-                                                            _ws,
-                                                            std::move(childStage));
+            return std::make_unique<ProjectionStageDefault>(
+                _cq.getExpCtx(),
+                _cq.getFindCommandRequest().getProjection(),
+                _cq.getProj(),
+                _ws,
+                std::move(childStage));
         }
         case STAGE_PROJECTION_COVERED: {
             auto pn = static_cast<const ProjectionNodeCovered*>(root);
             auto childStage = build(pn->children[0]);
-            return std::make_unique<ProjectionStageCovered>(_cq.getExpCtxRaw(),
-                                                            _cq.getQueryRequest().getProj(),
-                                                            _cq.getProj(),
-                                                            _ws,
-                                                            std::move(childStage),
-                                                            pn->coveredKeyObj);
+            return std::make_unique<ProjectionStageCovered>(
+                _cq.getExpCtxRaw(),
+                _cq.getFindCommandRequest().getProjection(),
+                _cq.getProj(),
+                _ws,
+                std::move(childStage),
+                pn->coveredKeyObj);
         }
         case STAGE_PROJECTION_SIMPLE: {
             auto pn = static_cast<const ProjectionNodeSimple*>(root);
             auto childStage = build(pn->children[0]);
-            return std::make_unique<ProjectionStageSimple>(_cq.getExpCtxRaw(),
-                                                           _cq.getQueryRequest().getProj(),
-                                                           _cq.getProj(),
-                                                           _ws,
-                                                           std::move(childStage));
+            return std::make_unique<ProjectionStageSimple>(
+                _cq.getExpCtxRaw(),
+                _cq.getFindCommandRequest().getProjection(),
+                _cq.getProj(),
+                _ws,
+                std::move(childStage));
         }
         case STAGE_LIMIT: {
             const LimitNode* ln = static_cast<const LimitNode*>(root);
@@ -270,26 +273,47 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
             return std::make_unique<GeoNear2DSphereStage>(
                 params, expCtx, _ws, _collection, s2Index);
         }
-        case STAGE_TEXT: {
-            const TextNode* node = static_cast<const TextNode*>(root);
-            invariant(_collection);
-            const IndexDescriptor* desc = _collection->getIndexCatalog()->findIndexByName(
-                _opCtx, node->index.identifier.catalogName);
-            invariant(desc);
-            const FTSAccessMethod* fam = static_cast<const FTSAccessMethod*>(
-                _collection->getIndexCatalog()->getEntry(desc)->accessMethod());
-            invariant(fam);
+        case STAGE_TEXT_OR: {
+            tassert(5432204,
+                    "text index key prefix must be defined before processing TEXT_OR node",
+                    _ftsKeyPrefixSize);
 
-            TextStageParams params(fam->getSpec());
-            params.index = desc;
-            params.indexPrefix = node->indexPrefix;
+            auto node = static_cast<const TextOrNode*>(root);
+            auto ret = std::make_unique<TextOrStage>(
+                expCtx, *_ftsKeyPrefixSize, _ws, node->filter.get(), _collection);
+            for (auto childNode : root->children) {
+                ret->addChild(build(childNode));
+            }
+            return ret;
+        }
+        case STAGE_TEXT_MATCH: {
+            auto node = static_cast<const TextMatchNode*>(root);
+            tassert(5432200, "collection object is not provided", _collection);
+            auto catalog = _collection->getIndexCatalog();
+            tassert(5432201, "index catalog is unavailable", catalog);
+            auto desc = catalog->findIndexByName(_opCtx, node->index.identifier.catalogName);
+            tassert(5432202,
+                    str::stream() << "no index named '" << node->index.identifier.catalogName
+                                  << "' found in catalog",
+                    catalog);
+            auto fam = static_cast<const FTSAccessMethod*>(catalog->getEntry(desc)->accessMethod());
+            tassert(5432203, "access method for index is not defined", fam);
+
             // We assume here that node->ftsQuery is an FTSQueryImpl, not an FTSQueryNoop. In
             // practice, this means that it is illegal to use the StageBuilder on a QuerySolution
             // created by planning a query that contains "no-op" expressions.
-            params.query = static_cast<FTSQueryImpl&>(*node->ftsQuery);
-            params.wantTextScore = _cq.metadataDeps()[DocumentMetadataFields::kTextScore];
-            return std::make_unique<TextStage>(
-                expCtx, _collection, params, _ws, node->filter.get());
+            TextMatchParams params{desc,
+                                   fam->getSpec(),
+                                   node->indexPrefix,
+                                   static_cast<const FTSQueryImpl&>(*node->ftsQuery)};
+
+            // Children of this node may need to know about the key prefix size, so we'll set it
+            // here before recursively descending into procession child nodes, and will reset once a
+            // text sub-tree is constructed.
+            _ftsKeyPrefixSize.emplace(params.spec.numExtraBefore());
+            ON_BLOCK_EXIT([&] { _ftsKeyPrefixSize = {}; });
+
+            return std::make_unique<TextMatchStage>(expCtx, build(root->children[0]), params, _ws);
         }
         case STAGE_SHARDING_FILTER: {
             const ShardingFilterNode* fn = static_cast<const ShardingFilterNode*>(root);
@@ -357,7 +381,11 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
         }
         case STAGE_VIRTUAL_SCAN: {
             const auto* vsn = static_cast<const VirtualScanNode*>(root);
-            invariant(vsn->hasRecordId);
+
+            // The classic stage builder currently only supports VirtualScanNodes which represent
+            // collection scans that do not produce record ids.
+            invariant(!vsn->hasRecordId);
+            invariant(vsn->scanType == VirtualScanNode::ScanType::kCollScan);
 
             auto qds = std::make_unique<QueuedDataStage>(expCtx, _ws);
             for (auto&& arr : vsn->docs) {
@@ -387,11 +415,11 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
         case STAGE_MULTI_PLAN:
         case STAGE_QUEUED_DATA:
         case STAGE_RECORD_STORE_FAST_COUNT:
+        case STAGE_SAMPLE_FROM_TIMESERIES_BUCKET:
         case STAGE_SUBPLAN:
-        case STAGE_TEXT_MATCH:
-        case STAGE_TEXT_OR:
         case STAGE_TRIAL:
         case STAGE_UNKNOWN:
+        case STAGE_UNPACK_TIMESERIES_BUCKET:
         case STAGE_UPDATE: {
             LOGV2_WARNING(4615604, "Can't build exec tree for node", "node"_attr = *root);
         }

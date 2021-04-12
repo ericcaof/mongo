@@ -37,9 +37,9 @@
 #include "mongo/bson/ordering.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/index/multikey_paths.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/key_string.h"
-#include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/util/debug_util.h"
@@ -140,6 +140,19 @@ public:
                              const MultikeyPaths& multikeyPaths) = 0;
 
     /**
+     * Sets the index to be multikey with the provided paths. This performs minimal validation of
+     * the inputs and is intended to be used internally to "correct" multikey metadata that drifts
+     * from the underlying data.
+     *
+     * This may also be used to allow indexes built before 3.4 to start tracking multikey path
+     * metadata in the catalog.
+     */
+    virtual void forceSetMultikey(OperationContext* const opCtx,
+                                  const CollectionPtr& coll,
+                                  bool isMultikey,
+                                  const MultikeyPaths& multikeyPaths) = 0;
+
+    /**
      * Returns whether this index is ready for queries. This is potentially unsafe in that it does
      * not consider whether the index is visible or ready in the current storage snapshot. For
      * that, use isReadyInMySnapshot() or isPresentInMySnapshot().
@@ -163,8 +176,6 @@ public:
      * built either.
      */
     virtual bool isFrozen() const = 0;
-
-    virtual KVPrefix getPrefix() const = 0;
 
     /**
      * If return value is not boost::none, reads with majority read concern using an older snapshot

@@ -1,7 +1,11 @@
 /**
  * Test that a change stream pipeline which encounters a retryable exception responds to the client
  * with an error object that includes the "ResumableChangeStreamError" label.
- * @tags: [requires_replication, requires_journaling, uses_change_streams]
+ * @tags: [
+ *   requires_journaling,
+ *   requires_replication,
+ *   uses_change_streams,
+ * ]
  */
 (function() {
 "use strict";

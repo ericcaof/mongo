@@ -38,6 +38,7 @@
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/bson/dotted_path_support.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/util/str.h"
 
@@ -71,9 +72,8 @@ boost::optional<ShardKeyPattern> CollectionMetadata::getReshardingKeyIfShouldFor
     switch (reshardingFields.get().getState()) {
         case CoordinatorStateEnum::kUnused:
         case CoordinatorStateEnum::kInitializing:
-        case CoordinatorStateEnum::kMirroring:
-        case CoordinatorStateEnum::kCommitted:
-        case CoordinatorStateEnum::kRenaming:
+        case CoordinatorStateEnum::kBlockingWrites:
+        case CoordinatorStateEnum::kDecisionPersisted:
         case CoordinatorStateEnum::kDone:
         case CoordinatorStateEnum::kError:
             return boost::none;
@@ -94,6 +94,15 @@ boost::optional<ShardKeyPattern> CollectionMetadata::getReshardingKeyIfShouldFor
     return ShardKeyPattern(donorFields->getReshardingKey());
 }
 
+void CollectionMetadata::throwIfReshardingInProgress(NamespaceString const& nss) const {
+    if (isSharded() && getReshardingFields()) {
+        LOGV2(5277122, "reshardCollection in progress", "namespace"_attr = nss.toString());
+
+        uasserted(ErrorCodes::ReshardCollectionInProgress,
+                  "reshardCollection is in progress for namespace " + nss.toString());
+    }
+}
+
 bool CollectionMetadata::disallowWritesForResharding(const UUID& currentCollectionUUID) const {
     if (!isSharded())
         return false;
@@ -109,11 +118,10 @@ bool CollectionMetadata::disallowWritesForResharding(const UUID& currentCollecti
         case CoordinatorStateEnum::kCloning:
         case CoordinatorStateEnum::kApplying:
             return false;
-        case CoordinatorStateEnum::kMirroring:
+        case CoordinatorStateEnum::kBlockingWrites:
             // Only return true if this is also the donor shard.
             return reshardingFields->getDonorFields() != boost::none;
-        case CoordinatorStateEnum::kCommitted:
-        case CoordinatorStateEnum::kRenaming:
+        case CoordinatorStateEnum::kDecisionPersisted:
             break;
         case CoordinatorStateEnum::kDone:
         case CoordinatorStateEnum::kError:
@@ -123,11 +131,11 @@ bool CollectionMetadata::disallowWritesForResharding(const UUID& currentCollecti
     const auto& recipientFields = reshardingFields->getRecipientFields();
     uassert(5325800,
             "Missing 'recipientFields' in collection metadata for resharding operation that has "
-            "committed",
+            "decision persisted",
             recipientFields);
 
-    const auto& originalUUID = recipientFields->getExistingUUID();
-    const auto& reshardingUUID = reshardingFields->getUuid();
+    const auto& originalUUID = recipientFields->getSourceUUID();
+    const auto& reshardingUUID = reshardingFields->getReshardingUUID();
 
     if (currentCollectionUUID == originalUUID) {
         // This shard must be both a donor and recipient. Neither the drop or renameCollection have
@@ -174,6 +182,12 @@ void CollectionMetadata::toBSONBasic(BSONObjBuilder& bb) const {
         ChunkVersion::UNSHARDED().appendLegacyWithField(&bb, "collVersion");
         ChunkVersion::UNSHARDED().appendLegacyWithField(&bb, "shardVersion");
     }
+}
+
+BSONObj CollectionMetadata::toBSON() const {
+    BSONObjBuilder builder;
+    toBSONBasic(builder);
+    return builder.obj();
 }
 
 std::string CollectionMetadata::toStringBasic() const {
@@ -235,6 +249,13 @@ Status CollectionMetadata::checkChunkIsValid(const ChunkType& chunk) const {
     }
 
     return Status::OK();
+}
+
+bool CollectionMetadata::currentShardHasAnyChunks() const {
+    invariant(isSharded());
+    std::set<ShardId> shards;
+    _cm->getAllShardIds(&shards);
+    return shards.find(_thisShardId) != shards.end();
 }
 
 boost::optional<ChunkRange> CollectionMetadata::getNextOrphanRange(

@@ -67,6 +67,8 @@
 #include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/commands/feature_compatibility_version_gen.h"
 #include "mongo/db/commands/shutdown.h"
+#include "mongo/db/commands/test_commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/flow_control_ticketholder.h"
 #include "mongo/db/concurrency/lock_state.h"
@@ -125,6 +127,7 @@
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/repl/tenant_migration_donor_op_observer.h"
 #include "mongo/db/repl/tenant_migration_donor_service.h"
+#include "mongo/db/repl/tenant_migration_recipient_op_observer.h"
 #include "mongo/db/repl/tenant_migration_recipient_service.h"
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
@@ -141,6 +144,7 @@
 #include "mongo/db/s/resharding/resharding_op_observer.h"
 #include "mongo/db/s/resharding/resharding_recipient_service.h"
 #include "mongo/db/s/shard_server_op_observer.h"
+#include "mongo/db/s/sharding_ddl_coordinator_service.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/sharding_state_recovery.h"
 #include "mongo/db/s/transaction_coordinator_service.h"
@@ -153,6 +157,7 @@
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/backup_cursor_hooks.h"
 #include "mongo/db/storage/control/storage_control.h"
+#include "mongo/db/storage/durable_history_pin.h"
 #include "mongo/db/storage/encryption_hooks.h"
 #include "mongo/db/storage/flow_control.h"
 #include "mongo/db/storage/flow_control_parameters_gen.h"
@@ -308,14 +313,17 @@ void registerPrimaryOnlyServices(ServiceContext* serviceContext) {
     auto registry = repl::PrimaryOnlyServiceRegistry::get(serviceContext);
 
     std::vector<std::unique_ptr<repl::PrimaryOnlyService>> services;
-    services.push_back(std::make_unique<TenantMigrationDonorService>(serviceContext));
-    services.push_back(std::make_unique<repl::TenantMigrationRecipientService>(serviceContext));
 
     if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
         services.push_back(std::make_unique<ReshardingCoordinatorService>(serviceContext));
     } else if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+        services.push_back(std::make_unique<ShardingDDLCoordinatorService>(serviceContext));
         services.push_back(std::make_unique<ReshardingDonorService>(serviceContext));
         services.push_back(std::make_unique<ReshardingRecipientService>(serviceContext));
+    } else {
+        // Tenant migrations are not supported in sharded clusters.
+        services.push_back(std::make_unique<TenantMigrationDonorService>(serviceContext));
+        services.push_back(std::make_unique<repl::TenantMigrationRecipientService>(serviceContext));
     }
 
     for (auto& service : services) {
@@ -492,6 +500,11 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
         LOGV2(20536, "Flow Control is enabled on this deployment");
     }
 
+    {
+        Lock::GlobalWrite globalLk(startupOpCtx.get());
+        DurableHistoryRegistry::get(serviceContext)->reconcilePins(startupOpCtx.get());
+    }
+
     // Notify the storage engine that startup is completed before repair exits below, as repair sets
     // the upgrade flag to true.
     serviceContext->getStorageEngine()->notifyStartupComplete();
@@ -572,7 +585,7 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
             "**          This mode should only be used to manually repair corrupted auth data");
     }
 
-    WaitForMajorityService::get(serviceContext).setUp(serviceContext);
+    WaitForMajorityService::get(serviceContext).startup(serviceContext);
 
     // This function may take the global lock.
     auto shardingInitialized = ShardingInitializationMongoD::get(startupOpCtx.get())
@@ -624,13 +637,13 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
         replCoord->startup(startupOpCtx.get(), lastStorageEngineShutdownState);
     }
 
+    startMongoDFTDC();
+
     if (!storageGlobalParams.readOnly) {
 
         if (storageEngine->supportsCappedCollections()) {
             logStartup(startupOpCtx.get());
         }
-
-        startMongoDFTDC();
 
         startFreeMonitoring(serviceContext);
 
@@ -998,19 +1011,25 @@ void setUpReplication(ServiceContext* serviceContext) {
 void setUpObservers(ServiceContext* serviceContext) {
     auto opObserverRegistry = std::make_unique<OpObserverRegistry>();
     if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+        DurableHistoryRegistry::get(serviceContext)
+            ->registerPin(std::make_unique<ReshardingHistoryHook>());
         opObserverRegistry->addObserver(std::make_unique<OpObserverShardingImpl>());
         opObserverRegistry->addObserver(std::make_unique<ShardServerOpObserver>());
+        opObserverRegistry->addObserver(std::make_unique<ReshardingOpObserver>());
     } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
         opObserverRegistry->addObserver(std::make_unique<OpObserverImpl>());
         opObserverRegistry->addObserver(std::make_unique<ConfigServerOpObserver>());
         opObserverRegistry->addObserver(std::make_unique<ReshardingOpObserver>());
     } else {
         opObserverRegistry->addObserver(std::make_unique<OpObserverImpl>());
+        // Tenant migrations are not supported in sharded clusters.
+        opObserverRegistry->addObserver(std::make_unique<repl::TenantMigrationDonorOpObserver>());
+        opObserverRegistry->addObserver(
+            std::make_unique<repl::TenantMigrationRecipientOpObserver>());
     }
     opObserverRegistry->addObserver(std::make_unique<AuthOpObserver>());
     opObserverRegistry->addObserver(
         std::make_unique<repl::PrimaryOnlyServiceOpObserver>(serviceContext));
-    opObserverRegistry->addObserver(std::make_unique<repl::TenantMigrationDonorOpObserver>());
     opObserverRegistry->addObserver(std::make_unique<FcvOpObserver>());
 
     setupFreeMonitoringOpObserver(opObserverRegistry.get());
@@ -1380,6 +1399,16 @@ int mongod_main(int argc, char* argv[]) {
             quickExit(EXIT_FAILURE);
         }
     }();
+
+    {
+        // Create the durable history registry prior to calling the `setUp*` methods. They may
+        // depend on it existing at this point.
+        DurableHistoryRegistry::set(service, std::make_unique<DurableHistoryRegistry>());
+        DurableHistoryRegistry* registry = DurableHistoryRegistry::get(service);
+        if (getTestCommandsEnabled()) {
+            registry->registerPin(std::make_unique<TestingDurableHistoryPin>());
+        }
+    }
 
     setUpCollectionShardingState(service);
     setUpCatalog(service);

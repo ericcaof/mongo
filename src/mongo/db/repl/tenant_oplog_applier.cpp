@@ -45,29 +45,38 @@
 #include "mongo/db/repl/cloner_utils.h"
 #include "mongo/db/repl/insert_group.h"
 #include "mongo/db/repl/oplog_applier_utils.h"
+#include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/repl/session_update_tracker.h"
 #include "mongo/db/repl/tenant_migration_decoration.h"
 #include "mongo/db/repl/tenant_migration_recipient_service.h"
 #include "mongo/db/repl/tenant_oplog_batcher.h"
+#include "mongo/db/session_catalog_mongod.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/concurrency/thread_pool.h"
 
 namespace mongo {
 namespace repl {
 
+MONGO_FAIL_POINT_DEFINE(hangInTenantOplogApplication);
+MONGO_FAIL_POINT_DEFINE(fpBeforeTenantOplogApplyingBatch);
+
 TenantOplogApplier::TenantOplogApplier(const UUID& migrationUuid,
                                        const std::string& tenantId,
                                        OpTime applyFromOpTime,
                                        RandomAccessOplogBuffer* oplogBuffer,
                                        std::shared_ptr<executor::TaskExecutor> executor,
-                                       ThreadPool* writerPool)
+                                       ThreadPool* writerPool,
+                                       Timestamp resumeBatchingTs)
     : AbstractAsyncComponent(executor.get(), std::string("TenantOplogApplier_") + tenantId),
       _migrationUuid(migrationUuid),
       _tenantId(tenantId),
       _beginApplyingAfterOpTime(applyFromOpTime),
       _oplogBuffer(oplogBuffer),
       _executor(std::move(executor)),
-      _writerPool(writerPool) {}
+      _writerPool(writerPool),
+      _resumeBatchingTs(resumeBatchingTs) {}
 
 TenantOplogApplier::~TenantOplogApplier() {
     shutdown();
@@ -93,8 +102,25 @@ SemiFuture<TenantOplogApplier::OpTimePair> TenantOplogApplier::getNotificationFo
     return iter->second.getFuture().semi();
 }
 
+OpTime TenantOplogApplier::getBeginApplyingOpTime_forTest() const {
+    return _beginApplyingAfterOpTime;
+}
+
+Timestamp TenantOplogApplier::getResumeBatchingTs_forTest() const {
+    return _resumeBatchingTs;
+}
+
+void TenantOplogApplier::setCloneFinishedRecipientOpTime(OpTime cloneFinishedRecipientOpTime) {
+    stdx::lock_guard lk(_mutex);
+    invariant(!_isActive_inlock());
+    invariant(!cloneFinishedRecipientOpTime.isNull());
+    invariant(_cloneFinishedRecipientOpTime.isNull());
+    _cloneFinishedRecipientOpTime = cloneFinishedRecipientOpTime;
+}
+
 Status TenantOplogApplier::_doStartup_inlock() noexcept {
-    _oplogBatcher = std::make_shared<TenantOplogBatcher>(_tenantId, _oplogBuffer, _executor);
+    _oplogBatcher =
+        std::make_shared<TenantOplogBatcher>(_tenantId, _oplogBuffer, _executor, _resumeBatchingTs);
     auto status = _oplogBatcher->startup();
     if (!status.isOK())
         return status;
@@ -131,6 +157,12 @@ void TenantOplogApplier::_doShutdown_inlock() noexcept {
         // We actually hold the required lock, but the lock object itself is not passed through.
         _finishShutdown(WithLock::withoutLock(),
                         {ErrorCodes::CallbackCanceled, "Tenant oplog applier shut down"});
+    }
+}
+
+void TenantOplogApplier::_preJoin() noexcept {
+    if (_oplogBatcher) {
+        _oplogBatcher->join();
     }
 }
 
@@ -258,6 +290,7 @@ void TenantOplogApplier::_applyOplogBatch(TenantOplogBatch* batch) {
         uassertStatusOK(status);
     }
 
+    fpBeforeTenantOplogApplyingBatch.pauseWhileSet();
 
     LOGV2_DEBUG(4886011,
                 1,
@@ -274,6 +307,8 @@ void TenantOplogApplier::_applyOplogBatch(TenantOplogBatch* batch) {
             lastBatchCompletedOpTimes.recipientOpTime;
     }
 
+    _numOpsApplied += batch->ops.size();
+
     LOGV2_DEBUG(4886002,
                 1,
                 "Tenant Oplog Applier finished applying batch",
@@ -288,6 +323,18 @@ void TenantOplogApplier::_applyOplogBatch(TenantOplogBatch* batch) {
         iter->second.emplaceValue(_lastAppliedOpTimesUpToLastBatch);
     }
     _opTimeNotificationList.erase(_opTimeNotificationList.begin(), firstUnexpiredIter);
+
+    hangInTenantOplogApplication.executeIf(
+        [&](const BSONObj& data) {
+            LOGV2(
+                5272315,
+                "hangInTenantOplogApplication failpoint enabled -- blocking until it is disabled.",
+                "tenant"_attr = _tenantId,
+                "migrationUuid"_attr = _migrationUuid,
+                "lastBatchCompletedOpTimes"_attr = lastBatchCompletedOpTimes);
+            hangInTenantOplogApplication.pauseWhileSet(opCtx.get());
+        },
+        [&](const BSONObj& data) { return !lastBatchCompletedOpTimes.recipientOpTime.isNull(); });
 }
 
 void TenantOplogApplier::_checkNsAndUuidsBelongToTenant(OperationContext* opCtx,
@@ -358,6 +405,11 @@ TenantOplogApplier::OpTimePair TenantOplogApplier::_writeNoOpEntries(
     OperationContext* opCtx, const TenantOplogBatch& batch) {
     auto* opObserver = cc().getServiceContext()->getOpObserver();
 
+    // Group donor oplog entries from the same session together.
+    LogicalSessionIdMap<std::vector<TenantNoOpEntry>> sessionOps;
+    // All other oplog entries.
+    std::vector<TenantNoOpEntry> nonSessionOps;
+
     // We start WriteUnitOfWork only to reserve oplog slots. So, it's ok to abort the
     // WriteUnitOfWork when it goes out of scope.
     WriteUnitOfWork wuow(opCtx);
@@ -374,14 +426,18 @@ TenantOplogApplier::OpTimePair TenantOplogApplier::_writeNoOpEntries(
             slotIter++;
             continue;
         }
-        greatestOplogSlotUsed = *slotIter;
-        _setRecipientOpTime(op.entry.getOpTime(), *slotIter++);
+        // Group oplog entries from the same session for noop writes.
+        if (auto sessionId = op.entry.getOperationSessionInfo().getSessionId()) {
+            sessionOps[*sessionId].emplace_back(&op.entry, slotIter);
+        } else {
+            nonSessionOps.emplace_back(&op.entry, slotIter);
+        }
+        greatestOplogSlotUsed = *slotIter++;
     }
+
     const size_t numOplogThreads = _writerPool->getStats().numThreads;
     const size_t numOpsPerThread = std::max(std::size_t(minOplogEntriesPerThread.load()),
-                                            (batch.ops.size() / numOplogThreads));
-    slotIter = oplogSlots.begin();
-    auto opsIter = batch.ops.begin();
+                                            (nonSessionOps.size() / numOplogThreads));
     LOGV2_DEBUG(4886003,
                 1,
                 "Tenant Oplog Applier scheduling no-ops ",
@@ -390,10 +446,19 @@ TenantOplogApplier::OpTimePair TenantOplogApplier::_writeNoOpEntries(
                 "firstDonorOptime"_attr = batch.ops.front().entry.getOpTime(),
                 "lastDonorOptime"_attr = batch.ops.back().entry.getOpTime(),
                 "numOplogThreads"_attr = numOplogThreads,
-                "numOpsPerThread"_attr = numOpsPerThread);
-    size_t numOpsRemaining = batch.ops.size();
-    std::vector<Status> statusVector(numOplogThreads, Status::OK());
-    for (size_t thread = 0; thread < numOplogThreads && opsIter != batch.ops.end(); thread++) {
+                "numOpsPerThread"_attr = numOpsPerThread,
+                "numOplogEntries"_attr = batch.ops.size(),
+                "numSessionsInBatch"_attr = sessionOps.size());
+
+    // Vector to store errors from each writer thread. The first numOplogThreads entries store
+    // errors from the noop writes for non-session oplog entries. And the rest store errors from the
+    // noop writes for each session in the batch.
+    std::vector<Status> statusVector(numOplogThreads + sessionOps.size(), Status::OK());
+
+    // Dispatch noop writes for non-session oplog entries into numOplogThreads writer threads.
+    auto opsIter = nonSessionOps.begin();
+    size_t numOpsRemaining = nonSessionOps.size();
+    for (size_t thread = 0; thread < numOplogThreads && opsIter != nonSessionOps.end(); thread++) {
         auto numOps = std::min(numOpsPerThread, numOpsRemaining);
         if (thread == numOplogThreads - 1) {
             numOps = numOpsRemaining;
@@ -403,16 +468,36 @@ TenantOplogApplier::OpTimePair TenantOplogApplier::_writeNoOpEntries(
                 status = scheduleStatus;
             } else {
                 try {
-                    _writeNoOpsForRange(opObserver, opsIter, opsIter + numOps, slotIter);
+                    _writeNoOpsForRange(opObserver, opsIter, opsIter + numOps);
                 } catch (const DBException& e) {
                     status = e.toStatus();
                 }
             }
         });
-        slotIter += numOps;
         opsIter += numOps;
         numOpsRemaining -= numOps;
     }
+    invariant(opsIter == nonSessionOps.end());
+
+    // Dispatch noop writes for oplog entries from the same session into the same writer thread.
+    size_t sessionThreadNum = 0;
+    for (const auto& s : sessionOps) {
+        _writerPool->schedule([=, &status = statusVector.at(numOplogThreads + sessionThreadNum)](
+                                  auto scheduleStatus) {
+            if (!scheduleStatus.isOK()) {
+                status = scheduleStatus;
+            } else {
+                try {
+                    _writeSessionNoOpsForRange(s.second.begin(), s.second.end());
+                } catch (const DBException& e) {
+                    status = e.toStatus();
+                }
+            }
+        });
+        sessionThreadNum++;
+    }
+
+    _writerPool->waitForIdle();
 
     // Make sure all the workers succeeded.
     for (const auto& status : statusVector) {
@@ -425,81 +510,345 @@ TenantOplogApplier::OpTimePair TenantOplogApplier::_writeNoOpEntries(
         }
         uassertStatusOK(status);
     }
-
-    invariant(opsIter == batch.ops.end());
-    _writerPool->waitForIdle();
     return {batch.ops.back().entry.getOpTime(), greatestOplogSlotUsed};
 }
 
-
-// These two routines can't be the ultimate solution.  It's not necessarily practical to keep a list
-// of every op we've written, and it doesn't work for failover.  But as far as I can tell, it's
-// possible to refer to oplog entries arbitarily far back.  We probably don't want to search the
-// oplog each time because it requires a collection scan to do so.
-// TODO(SERVER-50263): Come up with the right way to do this.
-OpTime TenantOplogApplier::_getRecipientOpTime(const OpTime& donorOpTime) {
-    stdx::lock_guard lk(_mutex);
-    auto times = std::upper_bound(
-        _opTimeMapping.begin(), _opTimeMapping.end(), OpTimePair(donorOpTime, OpTime()));
-    uassert(4886000,
-            str::stream() << "Recipient optime not found for donor optime "
-                          << donorOpTime.toString(),
-            times->donorOpTime == donorOpTime);
-    return times->recipientOpTime;
-}
-
-void TenantOplogApplier::_setRecipientOpTime(const OpTime& donorOpTime,
-                                             const OpTime& recipientOpTime) {
-    stdx::lock_guard lk(_mutex);
-    // The _opTimeMapping is an array strictly ordered by donorOpTime; this uassert assures the
-    // order remains intact.
-    uassert(4886001,
-            str::stream() << "Donor optimes inserted out of order "
-                          << _opTimeMapping.back().donorOpTime.toString()
-                          << " >= " << donorOpTime.toString(),
-            _opTimeMapping.empty() || _opTimeMapping.back().donorOpTime < donorOpTime);
-    _opTimeMapping.emplace_back(donorOpTime, recipientOpTime);
-}
-
-boost::optional<OpTime> TenantOplogApplier::_maybeGetRecipientOpTime(
-    const boost::optional<OpTime> donorOpTime) {
-    if (!donorOpTime || donorOpTime->isNull())
-        return donorOpTime;
-    return _getRecipientOpTime(*donorOpTime);
-}
-
-void TenantOplogApplier::_writeNoOpsForRange(OpObserver* opObserver,
-                                             std::vector<TenantOplogEntry>::const_iterator begin,
-                                             std::vector<TenantOplogEntry>::const_iterator end,
-                                             std::vector<OplogSlot>::iterator firstSlot) {
+void TenantOplogApplier::_writeSessionNoOpsForRange(
+    std::vector<TenantNoOpEntry>::const_iterator begin,
+    std::vector<TenantNoOpEntry>::const_iterator end) {
     auto opCtx = cc().makeOperationContext();
     tenantMigrationRecipientInfo(opCtx.get()) =
         boost::make_optional<TenantMigrationRecipientInfo>(_migrationUuid);
+
+    // Since the client object persists across each noop write call and the same writer thread could
+    // be reused to write noop entries with older optime, we need to clear the lastOp associated
+    // with the client to avoid the invariant in replClientInfo::setLastOp that the optime only goes
+    // forward.
+    repl::ReplClientInfo::forClient(opCtx->getClient()).clearLastOp();
+
+    // All the ops will have the same session, so we can retain the scopedSession throughout
+    // the loop, except when invalidated by multi-document transactions. This allows us to
+    // track the statements in a retryable write.
+    boost::optional<MongoDOperationContextSessionWithoutOplogRead> scopedSession;
+
+    // Make sure a partial session doesn't escape.
+    ON_BLOCK_EXIT([this, &scopedSession, &opCtx] {
+        if (scopedSession) {
+            auto txnParticipant = TransactionParticipant::get(opCtx.get());
+            invariant(txnParticipant);
+            txnParticipant.invalidate(opCtx.get());
+        }
+    });
+
+    boost::optional<MutableOplogEntry> prePostImageEntry = boost::none;
+    OpTime originalPrePostImageOpTime;
+    for (auto iter = begin; iter != end; iter++) {
+        const auto& entry = *iter->first;
+        invariant(!isResumeTokenNoop(entry));
+        invariant(entry.getSessionId());
+
+        MutableOplogEntry noopEntry;
+        noopEntry.setOpType(repl::OpTypeEnum::kNoop);
+        noopEntry.setNss(entry.getNss());
+        noopEntry.setUuid(entry.getUuid());
+        noopEntry.setObject({});  // Empty 'o' field.
+        noopEntry.setObject2(entry.getEntry().toBSON());
+        noopEntry.setOpTime(*iter->second);
+        noopEntry.setWallClockTime(opCtx->getServiceContext()->getFastClockSource()->now());
+
+        boost::optional<SessionTxnRecord> sessionTxnRecord;
+        std::vector<StmtId> stmtIds;
+        boost::optional<OpTime> prevWriteOpTime = boost::none;
+        if (entry.getTxnNumber() && !entry.isPartialTransaction() &&
+            (entry.getCommandType() == repl::OplogEntry::CommandType::kCommitTransaction ||
+             entry.getCommandType() == repl::OplogEntry::CommandType::kApplyOps)) {
+            // Final applyOp for a transaction.
+            auto sessionId = *entry.getSessionId();
+            auto txnNumber = *entry.getTxnNumber();
+            opCtx->setLogicalSessionId(sessionId);
+            opCtx->setTxnNumber(txnNumber);
+            opCtx->setInMultiDocumentTransaction();
+            LOGV2_DEBUG(5351502,
+                        1,
+                        "Tenant Oplog Applier committing transaction",
+                        "sessionId"_attr = sessionId,
+                        "txnNumber"_attr = txnNumber,
+                        "tenant"_attr = _tenantId,
+                        "migrationUuid"_attr = _migrationUuid,
+                        "op"_attr = redact(entry.toBSONForLogging()));
+
+            // Check out the session.
+            if (!scopedSession)
+                scopedSession.emplace(opCtx.get());
+            auto txnParticipant = TransactionParticipant::get(opCtx.get());
+            uassert(
+                5351500,
+                str::stream() << "Tenant oplog application failed to get transaction participant "
+                                 "for transaction "
+                              << txnNumber << " on session " << sessionId,
+                txnParticipant);
+            // We should only write the noop entry for this transaction commit once.
+            uassert(5351501,
+                    str::stream() << "Tenant oplog application cannot apply transaction "
+                                  << txnNumber << " on session " << sessionId
+                                  << " because the transaction number "
+                                  << txnParticipant.getActiveTxnNumber() << " has already started",
+                    txnParticipant.getActiveTxnNumber() < txnNumber);
+            txnParticipant.beginOrContinueTransactionUnconditionally(opCtx.get(), txnNumber);
+
+            // Only set sessionId and txnNumber for the final applyOp in a transaction.
+            noopEntry.setSessionId(sessionId);
+            noopEntry.setTxnNumber(txnNumber);
+
+            // Use the same wallclock time as the noop entry.
+            sessionTxnRecord.emplace(sessionId, txnNumber, OpTime(), noopEntry.getWallClockTime());
+            sessionTxnRecord->setState(DurableTxnStateEnum::kCommitted);
+
+            // If we have a prePostImage no-op here, it is orphaned; this can happen in some
+            // very unlikely rollback situations.
+            prePostImageEntry = boost::none;
+        } else if (!entry.getStatementIds().empty() &&
+                   !SessionUpdateTracker::isTransactionEntry(entry)) {
+            // If it has a statement id but isn't a transaction, it's a retryable write.
+            auto sessionId = *entry.getSessionId();
+            auto txnNumber = *entry.getTxnNumber();
+            auto entryStmtIds = entry.getStatementIds();
+            LOGV2_DEBUG(5351000,
+                        2,
+                        "Tenant Oplog Applier processing retryable write",
+                        "entry"_attr = redact(entry.toBSONForLogging()),
+                        "sessionId"_attr = sessionId,
+                        "txnNumber"_attr = txnNumber,
+                        "statementIds"_attr = entryStmtIds,
+                        "tenant"_attr = _tenantId,
+                        "migrationUuid"_attr = _migrationUuid);
+            if (entry.getOpType() == repl::OpTypeEnum::kNoop) {
+                // There are two types of no-ops we expect here.  One is pre/post image, which
+                // will have an empty o2 field.  The other is previously transformed oplog
+                // entries from earlier migrations.
+
+                // We don't wrap the no-ops in another no-op.
+                // If object2 is missing, this is a preImage/postImage.
+                if (!entry.getObject2()) {
+                    // *noopEntry.getObject2() is the original migrated no-op in BSON format.
+                    prePostImageEntry =
+                        uassertStatusOK(MutableOplogEntry::parse(*noopEntry.getObject2()));
+                    originalPrePostImageOpTime = entry.getOpTime();
+                    prePostImageEntry->setOpTime(noopEntry.getOpTime());
+                    prePostImageEntry->setWallClockTime(noopEntry.getWallClockTime());
+                    prePostImageEntry->setFromMigrate(true);
+                    // Clear the old tenant migration UUID.
+                    prePostImageEntry->setFromTenantMigration(boost::none);
+                    // Don't write the no-op entry.
+                    continue;
+                } else {
+                    // Otherwise this is a previously migrated retryable write.  Avoid
+                    // re-wrapping it.
+                    uassert(5351003,
+                            str::stream() << "Tenant Oplog Applier received unexpected Empty o2 "
+                                             "field (original oplog entry) in migrated noop: "
+                                          << redact(entry.toBSONForLogging()),
+                            !entry.getObject2()->isEmpty());
+                    // *noopEntry.getObject2() is the original migrated no-op in BSON format.
+                    noopEntry = uassertStatusOK(MutableOplogEntry::parse(*noopEntry.getObject2()));
+                    noopEntry.setOpTime(*iter->second);
+                    noopEntry.setWallClockTime(
+                        opCtx->getServiceContext()->getFastClockSource()->now());
+                    // Clear the old tenant migration UUID.
+                    noopEntry.setFromTenantMigration(boost::none);
+                }
+            }
+            stmtIds.insert(stmtIds.end(), entryStmtIds.begin(), entryStmtIds.end());
+
+            if (entry.getPreImageOpTime()) {
+                uassert(
+                    5351005,
+                    str::stream()
+                        << "Tenant oplog application cannot apply retryable write with txnNumber  "
+                        << txnNumber << " statementNumber " << stmtIds.front() << " on session "
+                        << sessionId << " because the preImage is missing",
+                    prePostImageEntry);
+
+                uassert(
+                    5351002,
+                    str::stream()
+                        << "Tenant oplog application cannot apply retryable write with txnNumber  "
+                        << txnNumber << " statementNumber " << stmtIds.front() << " on session "
+                        << sessionId << " because the preImage op time "
+                        << originalPrePostImageOpTime.toString()
+                        << " does not match the expected optime "
+                        << entry.getPreImageOpTime()->toString(),
+                    originalPrePostImageOpTime == entry.getPreImageOpTime());
+                noopEntry.setPreImageOpTime(prePostImageEntry->getOpTime());
+            } else if (entry.getPostImageOpTime()) {
+                uassert(
+                    5351006,
+                    str::stream()
+                        << "Tenant oplog application cannot apply retryable write with txnNumber  "
+                        << txnNumber << " statementNumber " << stmtIds.front() << " on session "
+                        << sessionId << " because the postImage is missing",
+                    prePostImageEntry);
+
+                uassert(
+                    5351007,
+                    str::stream()
+                        << "Tenant oplog application cannot apply retryable write with txnNumber  "
+                        << txnNumber << " statementNumber " << stmtIds.front() << " on session "
+                        << sessionId << " because the postImage op time "
+                        << originalPrePostImageOpTime.toString()
+                        << " does not match the expected optime "
+                        << entry.getPostImageOpTime()->toString(),
+                    originalPrePostImageOpTime == entry.getPostImageOpTime());
+                noopEntry.setPostImageOpTime(prePostImageEntry->getOpTime());
+            } else {
+                // Got a prePostImage no-op without the original entry; this can happen in some
+                // very unlikely rollback situations.
+                prePostImageEntry = boost::none;
+            }
+
+            opCtx->setLogicalSessionId(sessionId);
+            opCtx->setTxnNumber(txnNumber);
+            if (!scopedSession)
+                scopedSession.emplace(opCtx.get());
+            auto txnParticipant = TransactionParticipant::get(opCtx.get());
+            uassert(5350900,
+                    str::stream() << "Tenant oplog application failed to get retryable write "
+                                     "for transaction "
+                                  << txnNumber << " on session " << sessionId,
+                    txnParticipant);
+            // beginOrContinue throws on failure, which will abort the migration. Failure should
+            // only result from out-of-order processing, which should not happen.
+            txnParticipant.beginOrContinue(opCtx.get(),
+                                           txnNumber,
+                                           boost::none /* autocommit */,
+                                           boost::none /* startTransaction */);
+
+            // We should never process the same donor statement twice, except in failover
+            // cases where we'll also have "forgotten" the statement was executed.
+            uassert(5350902,
+                    str::stream() << "Tenant oplog application processed same retryable write "
+                                     "twice for transaction "
+                                  << txnNumber << " statement " << entryStmtIds.front()
+                                  << " on session " << sessionId,
+                    !txnParticipant.checkStatementExecutedNoOplogEntryFetch(entryStmtIds.front()));
+
+            // We could have an existing lastWriteOpTime for the same retryable write chain from a
+            // previously aborted migration. This could also happen if the tenant being migrated has
+            // previously resided in this replica set. So we want to start a new history chain
+            // instead of linking the newly generated no-op to the existing chain before the current
+            // migration starts. Otherwise, we could have duplicate entries for the same stmtId.
+            invariant(!_cloneFinishedRecipientOpTime.isNull());
+            if (txnParticipant.getLastWriteOpTime() > _cloneFinishedRecipientOpTime) {
+                prevWriteOpTime = txnParticipant.getLastWriteOpTime();
+            } else {
+                prevWriteOpTime = OpTime();
+            }
+
+            // Set sessionId, txnNumber, and statementId for all ops in a retryable write.
+            noopEntry.setSessionId(sessionId);
+            noopEntry.setTxnNumber(txnNumber);
+            noopEntry.setStatementIds(entryStmtIds);
+
+            // set fromMigrate on the no-op so the session update tracker recognizes it.
+            noopEntry.setFromMigrate(true);
+
+            // Use the same wallclock time as the noop entry.  The lastWriteOpTime will be filled
+            // in after the no-op is written.
+            sessionTxnRecord.emplace(sessionId, txnNumber, OpTime(), noopEntry.getWallClockTime());
+        } else {
+            // This is a partial transaction oplog entry.
+
+            // If we have a prePostImage no-op here, it is orphaned; this can happen in some
+            // very unlikely rollback situations.
+            prePostImageEntry = boost::none;
+        }
+
+        noopEntry.setPrevWriteOpTimeInTransaction(prevWriteOpTime);
+
+        LOGV2_DEBUG(5535700,
+                    2,
+                    "Tenant Oplog Applier writing session no-op",
+                    "tenant"_attr = _tenantId,
+                    "migrationUuid"_attr = _migrationUuid,
+                    "op"_attr = redact(noopEntry.toBSON()));
+
+        AutoGetOplog oplogWrite(opCtx.get(), OplogAccessMode::kWrite);
+        writeConflictRetry(
+            opCtx.get(), "writeTenantNoOps", NamespaceString::kRsOplogNamespace.ns(), [&] {
+                WriteUnitOfWork wuow(opCtx.get());
+
+                // Write the pre/post image entry, if it exists.
+                if (prePostImageEntry)
+                    repl::logOp(opCtx.get(), &*prePostImageEntry);
+                // Write the noop entry and update config.transactions.
+                auto oplogOpTime = repl::logOp(opCtx.get(), &noopEntry);
+                if (sessionTxnRecord) {
+                    // We do not need to record the last write op time for migrated transactions, so
+                    // we leave it null for consistency with transactions completed before the
+                    // migration..
+                    if (!opCtx->inMultiDocumentTransaction())
+                        sessionTxnRecord->setLastWriteOpTime(oplogOpTime);
+                    TransactionParticipant::get(opCtx.get())
+                        .onWriteOpCompletedOnPrimary(opCtx.get(), {stmtIds}, *sessionTxnRecord);
+                }
+
+                wuow.commit();
+            });
+        prePostImageEntry = boost::none;
+
+        // Invalidate in-memory state so that the next time the session is checked out, it
+        // would reload the transaction state from config.transactions.
+        if (opCtx->inMultiDocumentTransaction()) {
+            auto txnParticipant = TransactionParticipant::get(opCtx.get());
+            invariant(txnParticipant);
+            txnParticipant.invalidate(opCtx.get());
+            opCtx->resetMultiDocumentTransactionState();
+            scopedSession = boost::none;
+        }
+    }
+}
+
+void TenantOplogApplier::_writeNoOpsForRange(OpObserver* opObserver,
+                                             std::vector<TenantNoOpEntry>::const_iterator begin,
+                                             std::vector<TenantNoOpEntry>::const_iterator end) {
+    auto opCtx = cc().makeOperationContext();
+    tenantMigrationRecipientInfo(opCtx.get()) =
+        boost::make_optional<TenantMigrationRecipientInfo>(_migrationUuid);
+
+    // Since the client object persists across each noop write call and the same writer thread could
+    // be reused to write noop entries with older optime, we need to clear the lastOp associated
+    // with the client to avoid the invariant in replClientInfo::setLastOp that the optime only goes
+    // forward.
+    repl::ReplClientInfo::forClient(opCtx->getClient()).clearLastOp();
+
     AutoGetOplog oplogWrite(opCtx.get(), OplogAccessMode::kWrite);
     writeConflictRetry(
         opCtx.get(), "writeTenantNoOps", NamespaceString::kRsOplogNamespace.ns(), [&] {
             WriteUnitOfWork wuow(opCtx.get());
-            auto slot = firstSlot;
-            for (auto iter = begin; iter != end; iter++, slot++) {
-                const auto& entry = iter->entry;
+            for (auto iter = begin; iter != end; iter++) {
+                const auto& entry = *iter->first;
                 if (isResumeTokenNoop(entry)) {
                     // We don't want to write noops for resume token noop oplog entries. They would
                     // not be applied in a change stream anyways.
                     continue;
                 }
+                // We don't need to link no-ops entries for operations done outside of a session.
+                const boost::optional<OpTime> preImageOpTime = boost::none;
+                const boost::optional<OpTime> postImageOpTime = boost::none;
+                const boost::optional<OpTime> prevWriteOpTimeInTransaction = boost::none;
                 opObserver->onInternalOpMessage(
                     opCtx.get(),
                     entry.getNss(),
                     entry.getUuid(),
+                    {},  // Empty 'o' field.
                     entry.getEntry().toBSON(),
-                    BSONObj(),
                     // We link the no-ops together by recipient op time the same way the actual ops
                     // were linked together by donor op time.  This is to allow retryable writes
                     // and changestreams to find the ops they need.
-                    _maybeGetRecipientOpTime(entry.getPreImageOpTime()),
-                    _maybeGetRecipientOpTime(entry.getPostImageOpTime()),
-                    _maybeGetRecipientOpTime(entry.getPrevWriteOpTimeInTransaction()),
-                    *slot);
+                    preImageOpTime,
+                    postImageOpTime,
+                    prevWriteOpTimeInTransaction,
+                    *iter->second);
             }
             wuow.commit();
         });
@@ -528,11 +877,22 @@ std::vector<std::vector<const OplogEntry*>> TenantOplogApplier::_fillWriterVecto
 
         if (op.expansionsEntry >= 0) {
             // This is an applyOps or transaction; add the expansions to the writer vectors.
+
+            auto isTransactionWithCommand = false;
+            auto expansions = &batch->expansions[op.expansionsEntry];
+            for (auto&& op : *expansions) {
+                if (op.isCommand()) {
+                    // If the transaction contains a command, serialize the operations.
+                    isTransactionWithCommand = true;
+                    break;
+                }
+            }
+
             OplogApplierUtils::addDerivedOps(opCtx,
-                                             &batch->expansions[op.expansionsEntry],
+                                             expansions,
                                              &writerVectors,
                                              &collPropertiesCache,
-                                             false /* serial */);
+                                             isTransactionWithCommand /* serial */);
         } else {
             // Add a single op to the writer vectors.
             OplogApplierUtils::addToWriterVector(
@@ -554,15 +914,18 @@ Status TenantOplogApplier::_applyOplogEntryOrGroupedInserts(
     invariant(oplogApplicationMode == OplogApplication::Mode::kInitialSync);
 
     auto op = entryOrGroupedInserts.getOp();
-    if (op.isIndexCommandType()) {
-        // TODO(SERVER-48862): Handle index builds during oplog application.
+    if (op.isIndexCommandType() && op.getCommandType() != OplogEntry::CommandType::kCreateIndexes &&
+        op.getCommandType() != OplogEntry::CommandType::kDropIndexes) {
         LOGV2_ERROR(488610,
-                    "Index operations are not currently supported in tenant migration",
+                    "Index creation, except createIndex on empty collections, is not supported in "
+                    "tenant migration",
                     "tenant"_attr = _tenantId,
                     "migrationUuid"_attr = _migrationUuid,
                     "op"_attr = redact(op.toBSONForLogging()));
 
-        return Status::OK();
+        uasserted(5434700,
+                  "Index creation, except createIndex on empty collections, is not supported in "
+                  "tenant migration");
     }
     // We don't count tenant application in the ops applied stats.
     auto incrementOpsAppliedStats = [] {};
@@ -588,6 +951,9 @@ Status TenantOplogApplier::_applyOplogBatchPerWorker(std::vector<const OplogEntr
     auto opCtx = cc().makeOperationContext();
     tenantMigrationRecipientInfo(opCtx.get()) =
         boost::make_optional<TenantMigrationRecipientInfo>(_migrationUuid);
+
+    // Set this to satisfy low-level locking invariants.
+    opCtx->lockState()->setShouldConflictWithSecondaryBatchApplication(false);
 
     const bool allowNamespaceNotFoundErrorsOnCrudOps(true);
     auto status = OplogApplierUtils::applyOplogBatchCommon(

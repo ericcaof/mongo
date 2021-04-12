@@ -4,6 +4,8 @@
  * Perform CRUD operations, some of which may implicitly create collections. Also perform index
  * creations which may implicitly create collections. Performs these in parallel with collection-
  * dropping operations.
+ *
+ * @tags: [requires_fcv_49]
  */
 load('jstests/concurrency/fsm_libs/extend_workload.js');         // for extendWorkload
 load('jstests/concurrency/fsm_workloads/CRUD_and_commands.js');  // for $config
@@ -18,15 +20,18 @@ var $config = extendWorkload($config, function($config, $super) {
             db[collName].createIndex({value: 1});
         },
         createIdIndex: function createIdIndex(db, collName) {
-            try {
-                assertWhenOwnColl.commandWorked(db[collName].createIndex({_id: 1}));
-            } catch (e) {
-                if (e.code == ErrorCodes.ConflictingOperationInProgress) {
-                    // createIndex concurrently with dropCollection can throw.
-                    if (TestData.runInsideTransaction) {
-                        e["errorLabels"] = ["TransientTransactionError"];
+            let created = false;
+            while (!created) {
+                try {
+                    assertWhenOwnColl.commandWorked(db[collName].createIndex({_id: 1}));
+                    created = true;
+                } catch (e) {
+                    if (e.code != ErrorCodes.ConflictingOperationInProgress) {
+                        // unexpected error, rethrow
                         throw e;
                     }
+                    // createIndex concurrently with dropCollection can throw a conflict.
+                    // fall through to retry
                 }
             }
         },

@@ -101,20 +101,25 @@ void QueryPlannerTest::addIndex(BSONObj keyPattern, bool multikey, bool sparse) 
 }
 
 void QueryPlannerTest::addIndex(BSONObj keyPattern, bool multikey, bool sparse, bool unique) {
-    params.indices.push_back(
-        {keyPattern,
-         IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
-         IndexDescriptor::kLatestIndexVersion,
-         multikey,
-         {},
-         {},
-         sparse,
-         unique,
-         IndexEntry::Identifier{"sql_query_walks_into_bar_and_says_can_i_join_you?"},
-         nullptr,  // filterExpr
-         BSONObj(),
-         nullptr,
-         nullptr});
+    addIndex(
+        keyPattern, multikey, sparse, unique, "sql_query_walks_into_bar_and_says_can_i_join_you?");
+}
+
+void QueryPlannerTest::addIndex(
+    BSONObj keyPattern, bool multikey, bool sparse, bool unique, const std::string& name) {
+    params.indices.push_back({keyPattern,
+                              IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                              IndexDescriptor::kLatestIndexVersion,
+                              multikey,
+                              {},
+                              {},
+                              sparse,
+                              unique,
+                              IndexEntry::Identifier{name},
+                              nullptr,  // filterExpr
+                              BSONObj(),
+                              nullptr,
+                              nullptr});
 }
 
 void QueryPlannerTest::addIndex(BSONObj keyPattern, BSONObj infoObj) {
@@ -321,27 +326,28 @@ void QueryPlannerTest::runQueryFull(const BSONObj& query,
                                     const BSONObj& maxObj) {
     clearState();
 
-    auto qr = std::make_unique<QueryRequest>(nss);
-    qr->setFilter(query);
-    qr->setSort(sort);
-    qr->setProj(proj);
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(query);
+    findCommand->setSort(sort);
+    findCommand->setProjection(proj);
     if (skip) {
-        qr->setSkip(skip);
+        findCommand->setSkip(skip);
     }
     if (ntoreturn) {
         if (ntoreturn < 0) {
             ASSERT_NE(ntoreturn, std::numeric_limits<long long>::min());
             ntoreturn = -ntoreturn;
-            qr->setSingleBatchField(true);
+            findCommand->setSingleBatch(true);
         }
-        qr->setNToReturn(ntoreturn);
+        findCommand->setNtoreturn(ntoreturn);
     }
-    qr->setHint(hint);
-    qr->setMin(minObj);
-    qr->setMax(maxObj);
+    findCommand->setHint(hint);
+    findCommand->setMin(minObj);
+    findCommand->setMax(maxObj);
     auto statusWithCQ =
         CanonicalQuery::canonicalize(opCtx.get(),
-                                     std::move(qr),
+                                     std::move(findCommand),
+                                     false,
                                      expCtx,
                                      ExtensionsCallbackNoop(),
                                      MatchExpressionParser::kAllowAllSpecialFeatures);
@@ -401,27 +407,28 @@ void QueryPlannerTest::runInvalidQueryFull(const BSONObj& query,
                                            const BSONObj& maxObj) {
     clearState();
 
-    auto qr = std::make_unique<QueryRequest>(nss);
-    qr->setFilter(query);
-    qr->setSort(sort);
-    qr->setProj(proj);
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(query);
+    findCommand->setSort(sort);
+    findCommand->setProjection(proj);
     if (skip) {
-        qr->setSkip(skip);
+        findCommand->setSkip(skip);
     }
     if (ntoreturn) {
         if (ntoreturn < 0) {
             ASSERT_NE(ntoreturn, std::numeric_limits<long long>::min());
             ntoreturn = -ntoreturn;
-            qr->setSingleBatchField(true);
+            findCommand->setSingleBatch(true);
         }
-        qr->setNToReturn(ntoreturn);
+        findCommand->setNtoreturn(ntoreturn);
     }
-    qr->setHint(hint);
-    qr->setMin(minObj);
-    qr->setMax(maxObj);
+    findCommand->setHint(hint);
+    findCommand->setMin(minObj);
+    findCommand->setMax(maxObj);
     auto statusWithCQ =
         CanonicalQuery::canonicalize(opCtx.get(),
-                                     std::move(qr),
+                                     std::move(findCommand),
+                                     false,
                                      expCtx,
                                      ExtensionsCallbackNoop(),
                                      MatchExpressionParser::kAllowAllSpecialFeatures);
@@ -443,11 +450,13 @@ void QueryPlannerTest::runQueryAsCommand(const BSONObj& cmdObj) {
 
     // If there is no '$db', append it.
     auto cmd = OpMsgRequest::fromDBAndBody(nss.db(), cmdObj).body;
-    std::unique_ptr<QueryRequest> qr(QueryRequest::makeFromFindCommand(cmd, isExplain, nss));
+    std::unique_ptr<FindCommandRequest> findCommand(
+        query_request_helper::makeFromFindCommandForTests(cmd, nss));
 
     auto statusWithCQ =
         CanonicalQuery::canonicalize(opCtx.get(),
-                                     std::move(qr),
+                                     std::move(findCommand),
+                                     isExplain,
                                      expCtx,
                                      ExtensionsCallbackNoop(),
                                      MatchExpressionParser::kAllowAllSpecialFeatures);
@@ -468,11 +477,13 @@ void QueryPlannerTest::runInvalidQueryAsCommand(const BSONObj& cmdObj) {
 
     // If there is no '$db', append it.
     auto cmd = OpMsgRequest::fromDBAndBody(nss.db(), cmdObj).body;
-    std::unique_ptr<QueryRequest> qr(QueryRequest::makeFromFindCommand(cmd, isExplain, nss));
+    std::unique_ptr<FindCommandRequest> findCommand(
+        query_request_helper::makeFromFindCommandForTests(cmd, nss));
 
     auto statusWithCQ =
         CanonicalQuery::canonicalize(opCtx.get(),
-                                     std::move(qr),
+                                     std::move(findCommand),
+                                     isExplain,
                                      expCtx,
                                      ExtensionsCallbackNoop(),
                                      MatchExpressionParser::kAllowAllSpecialFeatures);

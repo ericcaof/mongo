@@ -21,7 +21,7 @@
 // Below is the list of known equivalent error code groups. As new groups of equivalent error codes
 // are discovered, they should be added to this list.
 const equivalentErrorCodesList = [
-    [9, 5166503],
+    [9, 5166503, 5166605, 5338802],
     [28651, 5073201],
     [16006, 4997703, 4998202],
     [28689, 5126701],
@@ -32,6 +32,9 @@ const equivalentErrorCodesList = [
     [16608, 4848401],
     [16609, 5073101],
     [16610, 4848403],
+    [16611, 5154000],
+    [16612, 4974202],
+    [16554, 4974203],
     [16555, 5073102],
     [28664, 5153400],
     [28680, 4903701],
@@ -45,6 +48,7 @@ const equivalentErrorCodesList = [
     [28766, 4903706],
     [31034, 4848972],
     [31095, 4848972],
+    [34435, 5154901],
     [40066, 4934200],
     [40085, 5155402],
     [40086, 5155400],
@@ -55,18 +59,37 @@ const equivalentErrorCodesList = [
     [40094, 5075301, 5075302],
     [40096, 5075303, 5075305],
     [40097, 5075304, 5075306],
-    [40485, 5075307, 4997704, 4998201, 5166505],
+    [40485, 5075307, 4997704, 4998201, 5166505, 5166602],
     [40515, 4848979],
-    [40517, 4848980, 4997701, 5166504],
+    [40517, 4848980, 4997701, 5166504, 5166601],
     [40521, 4997702],
     [40522, 4997700],
     [40523, 4848972],
     [40533, 4998200],
     [5166306, 5166502],
     [5166307, 5166500, 5166501],
+    [5166403, 5166603],
+    [5166404, 5166604],
+    [5166405, 5166606],
+    [51246, 5291401],
+    [51247, 5291402],
     [51744, 5154400],
     [51745, 5154400],
     [51746, 5154400],
+    [51104, 5073401],
+    [51105, 5126601, 5073405],
+    [51106, 5126603, 5126607],
+    [51107, 5126605, 5073406],
+    [51109, 5126602, 5073407],
+    [51110, 5126604, 5073408],
+    [51111, 5073402],
+    [51151, 5126606],
+    [51156, 5073403],
+    [5338800, 5338801],
+    [5439013, 5166502],
+    [5439014, 5166503],
+    [5439015, 5338801],
+    [5439016, 5338802],
 ];
 
 // This map is generated based on the contents of 'equivalentErrorCodesList'. This map should _not_
@@ -101,6 +124,10 @@ const equivalentErrorCodesMap = function() {
 }();
 
 const lookupEquivalentErrorCodes = function(errorCodes) {
+    if (errorCodes === assert._kAnyErrorCode) {
+        return errorCodes;
+    }
+
     if (!Array.isArray(errorCodes)) {
         errorCodes = [errorCodes];
     }
@@ -128,5 +155,19 @@ assert.commandFailedWithCode = function(res, expectedCode, msg) {
 const assertWriteErrorWithCodeOriginal = assert.writeErrorWithCode;
 assert.writeErrorWithCode = function(res, expectedCode, msg) {
     return assertWriteErrorWithCodeOriginal(res, lookupEquivalentErrorCodes(expectedCode), msg);
+};
+
+// NOTE: Consider using 'assert.commandFailedWithCode' and 'assert.writeErrorWithCode' instead.
+// This function should be only used when error code does not come from command. For instance, when
+// validating explain output, which includes error code in the execution stats.
+assert.errorCodeEq = function(actualErrorCode, expectedErrorCodes, msg) {
+    if (expectedErrorCodes === assert._kAnyErrorCode) {
+        return;
+    }
+
+    const equivalentErrorCodes = lookupEquivalentErrorCodes(expectedErrorCodes);
+    assert(equivalentErrorCodes.includes(actualErrorCode),
+           actualErrorCode + " not found in the list of expected error codes: " +
+               tojson(equivalentErrorCodes) + ": " + msg);
 };
 }());

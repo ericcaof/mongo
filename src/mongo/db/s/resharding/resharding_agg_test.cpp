@@ -40,6 +40,8 @@
 namespace mongo {
 namespace {
 
+using namespace fmt::literals;
+
 /**
  * Mock interface to allow specifiying mock results for the lookup pipeline.
  */
@@ -267,13 +269,11 @@ protected:
         expCtx->ns = _remoteOplogNss;
         expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(pipelineSource);
 
-        const bool doesDonorOwnMinKeyChunk = false;
         auto pipeline = createOplogFetchingPipelineForResharding(
             expCtx,
             ReshardingDonorOplogId(Timestamp::min(), Timestamp::min()),
             _reshardingCollUUID,
-            {_destinedRecipient},
-            doesDonorOwnMinKeyChunk);
+            {_destinedRecipient});
 
         pipeline->addInitialSource(DocumentSourceMock::createForTest(pipelineSource, expCtx));
 
@@ -281,7 +281,8 @@ protected:
     }
 
     const NamespaceString _remoteOplogNss{"local.oplog.rs"};
-    const NamespaceString _localOplogBufferNss{"config.localReshardingOplogBuffer.xxx.yyy"};
+    const NamespaceString _localOplogBufferNss{"{}.{}xxx.yyy"_format(
+        NamespaceString::kConfigDb, NamespaceString::kReshardingLocalOplogBufferPrefix)};
     const NamespaceString _crudNss{"test.foo"};
     // Use a constant value so unittests can store oplog entries as extended json strings in code.
     const UUID _reshardingCollUUID =
@@ -552,6 +553,43 @@ TEST_F(ReshardingAggTest, OplogPipelineWithPreAndPostImage) {
     ASSERT(!pipeline->getNext());
 }
 
+TEST_F(ReshardingAggTest, VerifyPipelineReturnsStartIndexBuildEntry) {
+    const auto oplogBSON = fromjson(R"({
+        "op" : "c",
+        "ns" : "test.$cmd",
+        "ui": { "$binary": "iSa6jmEaQsK7Gjt4GfYQ7Q==", "$type": "04" },
+        "o" : {
+          "startIndexBuild" : "weather",
+          "indexBuildUUID" : { "binary": "bac65b70-e5c7-48f5-bc09-be78e69733a7", "$type": "04" },
+          "indexes" : [ {
+              "v" : 2,
+              "key" : { "col" : 1 },
+              "name" : "col_1"
+            }
+          ]
+        },
+        "ts" : { "$timestamp": { "t": 1612471173, "i": 2 } },
+        "t" : { "$numberLong": "1" },
+        "wall" : { "$date": "2021-02-04T20:39:33.860Z" },
+        "v" : { "$numberLong": "2" }
+    })");
+
+    auto pipeline = createPipeline({Document(oplogBSON)});
+
+    auto doc = pipeline->getNext();
+    ASSERT(doc);
+
+    auto oplogEntry = uassertStatusOK(repl::OplogEntry::parse(doc->toBson()));
+
+    ASSERT(oplogEntry.isCommand());
+    ASSERT(repl::OplogEntry::CommandType::kStartIndexBuild == oplogEntry.getCommandType());
+    ASSERT_EQ(oplogBSON["ts"].timestamp(), oplogEntry.getTimestamp());
+    ASSERT(validateOplogId(oplogBSON["ts"].timestamp(), Document(oplogBSON), oplogEntry));
+
+    doc = pipeline->getNext();
+    ASSERT(!doc);
+}
+
 TEST_F(ReshardingAggTest, VerifyPipelineOutputHasOplogSchema) {
     repl::MutableOplogEntry insertOplog = makeInsertOplog();
     auto updateOplog = makeUpdateOplog();
@@ -574,15 +612,13 @@ TEST_F(ReshardingAggTest, VerifyPipelineOutputHasOplogSchema) {
     expCtx->ns = _remoteOplogNss;
     expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(pipelineSource);
 
-    const bool doesDonorOwnMinKeyChunk = false;
     std::unique_ptr<Pipeline, PipelineDeleter> pipeline = createOplogFetchingPipelineForResharding(
         expCtx,
         // Use the test to also exercise the stages for resuming. The timestamp passed in is
         // excluded from the results.
         ReshardingDonorOplogId(insertOplog.getTimestamp(), insertOplog.getTimestamp()),
         _reshardingCollUUID,
-        {_destinedRecipient},
-        doesDonorOwnMinKeyChunk);
+        {_destinedRecipient});
     auto bsonPipeline = pipeline->serializeToBson();
     if (debug) {
         std::cout << "Pipeline stages:" << std::endl;
@@ -677,13 +713,11 @@ TEST_F(ReshardingAggTest, VerifyPipelinePreparedTxn) {
     expCtx->ns = _remoteOplogNss;
     expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(pipelineSource);
 
-    const bool doesDonorOwnMinKeyChunk = false;
     std::unique_ptr<Pipeline, PipelineDeleter> pipeline = createOplogFetchingPipelineForResharding(
         expCtx,
         ReshardingDonorOplogId(Timestamp::min(), Timestamp::min()),
         _reshardingCollUUID,
-        {_destinedRecipient},
-        doesDonorOwnMinKeyChunk);
+        {_destinedRecipient});
     if (debug) {
         std::cout << "Pipeline stages:" << std::endl;
         // This is can be changed to process a prefix of the pipeline for debugging.
@@ -1025,8 +1059,7 @@ TEST_F(ReshardingAggTest, VerifyPipelinePreparedTxnAbort) {
             {"ts" : {"$timestamp" : {"t" : 1609800492, "i" : 4}}, "t" : {"$numberLong" : "1"}}
     })"))};
 
-    // TODO(SERVER-53625): uncomment the following code when this ticket is completed.
-    // auto clusterTime = pipelineSource.back().getDocument()["ts"].getTimestamp();
+    auto clusterTime = pipelineSource.back().getDocument()["ts"].getTimestamp();
     auto pipeline = createPipeline(pipelineSource);
 
     auto doc = pipeline->getNext();
@@ -1035,14 +1068,14 @@ TEST_F(ReshardingAggTest, VerifyPipelinePreparedTxnAbort) {
     auto oplogEntry = uassertStatusOK(repl::OplogEntry::parse(doc->toBson()));
 
     ASSERT(oplogEntry.isCommand());
-    // ASSERT(repl::OplogEntry::CommandType::kAbortTransaction == oplogEntry.getCommandType());
-    // ASSERT_FALSE(oplogEntry.shouldPrepare());
-    // ASSERT_FALSE(oplogEntry.isPartialTransaction());
-    // ASSERT_EQ(pipelineSource[1].getDocument()["ts"].getTimestamp(), oplogEntry.getTimestamp());
-    // ASSERT(validateOplogId(clusterTime, pipelineSource[1].getDocument(), oplogEntry));
+    ASSERT(repl::OplogEntry::CommandType::kAbortTransaction == oplogEntry.getCommandType());
+    ASSERT_FALSE(oplogEntry.shouldPrepare());
+    ASSERT_FALSE(oplogEntry.isPartialTransaction());
+    ASSERT_EQ(pipelineSource[1].getDocument()["ts"].getTimestamp(), oplogEntry.getTimestamp());
+    ASSERT(validateOplogId(clusterTime, pipelineSource[1].getDocument(), oplogEntry));
 
-    // doc = pipeline->getNext();
-    // ASSERT(!doc);
+    doc = pipeline->getNext();
+    ASSERT(!doc);
 }
 
 TEST_F(ReshardingAggTest, VerifyPipelineLargePreparedTxn) {
@@ -1259,8 +1292,7 @@ TEST_F(ReshardingAggTest, VerifyPipelineLargePreparedTxnAbort) {
         }
     })"))};
 
-    // TODO(SERVER-53625): uncomment the following code when this ticket is completed.
-    // auto clusterTime = pipelineSource.back().getDocument()["ts"].getTimestamp();
+    auto clusterTime = pipelineSource.back().getDocument()["ts"].getTimestamp();
     auto pipeline = createPipeline(pipelineSource);
 
     auto doc = pipeline->getNext();
@@ -1269,15 +1301,14 @@ TEST_F(ReshardingAggTest, VerifyPipelineLargePreparedTxnAbort) {
     auto oplogEntry = uassertStatusOK(repl::OplogEntry::parse(doc->toBson()));
 
     ASSERT(oplogEntry.isCommand());
-    // TODO(SERVER-53625): uncomment the following code when this ticket is completed.
-    // ASSERT(repl::OplogEntry::CommandType::kAbortTransaction == oplogEntry.getCommandType());
-    // ASSERT_FALSE(oplogEntry.shouldPrepare());
-    // ASSERT_FALSE(oplogEntry.isPartialTransaction());
-    // ASSERT_EQ(pipelineSource[2].getDocument()["ts"].getTimestamp(), oplogEntry.getTimestamp());
-    // ASSERT(validateOplogId(clusterTime, pipelineSource[2].getDocument(), oplogEntry));
+    ASSERT(repl::OplogEntry::CommandType::kAbortTransaction == oplogEntry.getCommandType());
+    ASSERT_FALSE(oplogEntry.shouldPrepare());
+    ASSERT_FALSE(oplogEntry.isPartialTransaction());
+    ASSERT_EQ(pipelineSource[2].getDocument()["ts"].getTimestamp(), oplogEntry.getTimestamp());
+    ASSERT(validateOplogId(clusterTime, pipelineSource[2].getDocument(), oplogEntry));
 
-    // doc = pipeline->getNext();
-    // ASSERT(!doc);
+    doc = pipeline->getNext();
+    ASSERT(!doc);
 }
 
 TEST_F(ReshardingAggTest, VerifyPipelineLargeTxn) {
@@ -1436,8 +1467,7 @@ TEST_F(ReshardingAggTest, VerifyPipelineLargeTxnAbort) {
         }
     })"))};
 
-    // TODO(SERVER-53625): uncomment the following code when this ticket is completed.
-    // auto clusterTime = pipelineSource.back().getDocument()["ts"].getTimestamp();
+    auto clusterTime = pipelineSource.back().getDocument()["ts"].getTimestamp();
     auto pipeline = createPipeline(pipelineSource);
 
     auto doc = pipeline->getNext();
@@ -1445,16 +1475,15 @@ TEST_F(ReshardingAggTest, VerifyPipelineLargeTxnAbort) {
 
     auto oplogEntry = uassertStatusOK(repl::OplogEntry::parse(doc->toBson()));
 
-    // TODO(SERVER-53625): uncomment the following code when this ticket is completed.
     ASSERT(oplogEntry.isCommand());
-    // ASSERT(repl::OplogEntry::CommandType::kAbortTransaction == oplogEntry.getCommandType());
-    // ASSERT_FALSE(oplogEntry.shouldPrepare());
-    // ASSERT_FALSE(oplogEntry.isPartialTransaction());
-    // ASSERT_EQ(pipelineSource[1].getDocument()["ts"].getTimestamp(), oplogEntry.getTimestamp());
-    // ASSERT(validateOplogId(clusterTime, pipelineSource[1].getDocument(), oplogEntry));
+    ASSERT(repl::OplogEntry::CommandType::kAbortTransaction == oplogEntry.getCommandType());
+    ASSERT_FALSE(oplogEntry.shouldPrepare());
+    ASSERT_FALSE(oplogEntry.isPartialTransaction());
+    ASSERT_EQ(pipelineSource[1].getDocument()["ts"].getTimestamp(), oplogEntry.getTimestamp());
+    ASSERT(validateOplogId(clusterTime, pipelineSource[1].getDocument(), oplogEntry));
 
-    // doc = pipeline->getNext();
-    // ASSERT(!doc);
+    doc = pipeline->getNext();
+    ASSERT(!doc);
 }
 
 TEST_F(ReshardingAggTest, VerifyPipelineLargeTxnIncomplete) {

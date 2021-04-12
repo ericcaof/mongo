@@ -33,17 +33,51 @@
 #include "mongo/db/exec/sbe/values/value.h"
 
 namespace mongo::sbe {
-class MakeObjStage final : public PlanStage {
+
+enum class MakeObjFieldBehavior { drop, keep };
+
+enum class MakeObjOutputType { object, bsonObject };
+
+/**
+ * Base stage for creating a bsonObject or object.
+ *
+ * Template argument 'O' indicates which output type to use.
+ */
+template <MakeObjOutputType O>
+class MakeObjStageBase final : public PlanStage {
 public:
-    MakeObjStage(std::unique_ptr<PlanStage> input,
-                 value::SlotId objSlot,
-                 boost::optional<value::SlotId> rootSlot,
-                 std::vector<std::string> restrictFields,
-                 std::vector<std::string> projectFields,
-                 value::SlotVector projectVars,
-                 bool forceNewObject,
-                 bool returnOldObject,
-                 PlanNodeId planNodeId);
+    using FieldBehavior = MakeObjFieldBehavior;
+
+    /**
+     * Constructor. Arguments:
+     * -input: Child PlanStage.
+     * -objSlot: The output slot.
+     *
+     * -rootSlot (optional): Slot containing an object which the return object will be based on.
+     * -fieldBehavior (optional): This may only be specified when 'rootSlot' is specified. Describes
+     * what the behavior should be for each field in 'fields'. Either "drop" or "keep".
+     * -fields: List of fields. What the stage does with each field depends on 'fieldBehavior'.
+     *
+     * -projectFields: List of fields which should be added to the result object using the values
+     * from 'projectVars'.
+     * -projectVars: See above.
+     *
+     * -forceNewObject, returnOldObject: Describes what the behavior should be when the resulting
+     * object has no fields. May either return 'Nothing', an empty object, or the object in
+     * 'rootSlot' unmodified.
+     *
+     * -planNodeId: Mapping to the corresponding QuerySolutionNode.
+     */
+    MakeObjStageBase(std::unique_ptr<PlanStage> input,
+                     value::SlotId objSlot,
+                     boost::optional<value::SlotId> rootSlot,
+                     boost::optional<FieldBehavior> fieldBehavior,
+                     std::vector<std::string> fields,
+                     std::vector<std::string> projectFields,
+                     value::SlotVector projectVars,
+                     bool forceNewObject,
+                     bool returnOldObject,
+                     PlanNodeId planNodeId);
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -59,29 +93,47 @@ public:
 
 private:
     void projectField(value::Object* obj, size_t idx);
+    void projectField(UniqueBSONObjBuilder* bob, size_t idx);
 
-    bool isFieldRestricted(const std::string_view& sv) const {
-        return _restrictAllFields || _restrictFieldsSet.count(sv) != 0;
+    bool isFieldRestricted(const StringMapHashedKey& key) const {
+        return _fieldSet.count(key) == (*_fieldBehavior == FieldBehavior::keep ? 0 : 1);
     }
+
+    void resetAlreadyProjected() {
+        if (!_alreadyProjected.empty()) {
+            std::memset(_alreadyProjected.data(),
+                        0,
+                        _alreadyProjected.size() *
+                            sizeof(typename decltype(_alreadyProjected)::value_type));
+        }
+    }
+
+    void produceObject();
 
     const value::SlotId _objSlot;
     const boost::optional<value::SlotId> _rootSlot;
-    const std::vector<std::string> _restrictFields;
+    const boost::optional<FieldBehavior> _fieldBehavior;
+    const std::vector<std::string> _fields;
     const std::vector<std::string> _projectFields;
     const value::SlotVector _projectVars;
     const bool _forceNewObject;
     const bool _returnOldObject;
 
-    absl::flat_hash_set<std::string> _restrictFieldsSet;
-    absl::flat_hash_map<std::string, size_t> _projectFieldsMap;
+    StringSet _fieldSet;
+    StringMap<size_t> _projectFieldsMap;
 
     std::vector<std::pair<std::string, value::SlotAccessor*>> _projects;
 
     value::OwnedValueAccessor _obj;
 
+    // Reset to all 0's on each call to getNext(). Kept here to avoid repeated allocations.
+    std::vector<char> _alreadyProjected;
+
     value::SlotAccessor* _root{nullptr};
 
     bool _compiled{false};
-    bool _restrictAllFields{false};
 };
+
+using MakeObjStage = MakeObjStageBase<MakeObjOutputType::object>;
+using MakeBsonObjStage = MakeObjStageBase<MakeObjOutputType::bsonObject>;
 }  // namespace mongo::sbe

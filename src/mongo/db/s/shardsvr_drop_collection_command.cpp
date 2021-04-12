@@ -29,20 +29,32 @@
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/drop_database_gen.h"
-#include "mongo/db/s/sharding_logging.h"
-#include "mongo/s/catalog/type_database.h"
-#include "mongo/s/catalog_cache.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/s/drop_collection_coordinator.h"
+#include "mongo/db/s/drop_collection_legacy.h"
+#include "mongo/db/s/sharding_ddl_coordinator_service.h"
+#include "mongo/db/s/sharding_state.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/s/sharded_collections_ddl_parameters_gen.h"
 
 namespace mongo {
 namespace {
 
 class ShardsvrDropCollectionCommand final : public TypedCommand<ShardsvrDropCollectionCommand> {
 public:
+    using Request = ShardsvrDropCollection;
+
+    std::string help() const override {
+        return "Internal command, which is exported by the primary sharding server. Do not call "
+               "directly. Drops a collection.";
+    }
+
     bool acceptsAnyApiVersionParameters() const override {
         return true;
     }
@@ -51,42 +63,63 @@ public:
         return Command::AllowedOnSecondary::kNever;
     }
 
-    std::string help() const override {
-        return "Internal command, which is exported by the primary sharding server. Do not call "
-               "directly. Drops a collection.";
-    }
-
-    using Request = ShardsvrDropCollection;
-
     class Invocation final : public InvocationBase {
     public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            uassert(ErrorCodes::IllegalOperation,
-                    "_shardsvrDropCollection can only be run on primary shard servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ShardServer);
+            uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
 
-            auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-            auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
-                opCtx,
-                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                "admin",
-                CommandHelpers::appendMajorityWriteConcern(
-                    BSON("_configsvrDropCollection" << ns().toString()), opCtx->getWriteConcern()),
-                Shard::RetryPolicy::kIdempotent));
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << Request::kCommandName
+                                  << " must be called with majority writeConcern, got "
+                                  << opCtx->getWriteConcern().wMode,
+                    opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
 
-            uassertStatusOK(cmdResponse.commandStatus);
+            bool useNewPath = feature_flags::gShardingFullDDLSupport.isEnabled(
+                serverGlobalParams.featureCompatibility);
+
+            if (!useNewPath) {
+                LOGV2_DEBUG(5280951,
+                            1,
+                            "Running legacy drop collection procedure",
+                            "namespace"_attr = ns());
+                dropCollectionLegacy(opCtx, ns());
+                return;
+            }
+
+            LOGV2_DEBUG(
+                5280952, 1, "Running new drop collection procedure", "namespace"_attr = ns());
+
+            // Since this operation is not directly writing locally we need to force its db
+            // profile level increase in order to be logged in "<db>.system.profile"
+            CurOp::get(opCtx)->raiseDbProfileLevel(
+                CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(ns().db()));
+
+            auto coordinatorDoc = DropCollectionCoordinatorDocument();
+            coordinatorDoc.setShardingDDLCoordinatorMetadata(
+                {{ns(), DDLCoordinatorTypeEnum::kDropCollection}});
+            auto service = ShardingDDLCoordinatorService::getService(opCtx);
+            auto dropCollCoordinator = checked_pointer_cast<DropCollectionCoordinator>(
+                service->getOrCreateInstance(opCtx, coordinatorDoc.toBSON()));
+            dropCollCoordinator->getCompletionFuture().get(opCtx);
+        }
+
+    private:
+        NamespaceString ns() const override {
+            return request().getNamespace();
         }
 
         bool supportsWriteConcern() const override {
             return true;
         }
 
-        void doCheckAuthorization(OperationContext*) const override {}
-
-        NamespaceString ns() const override {
-            return request().getNamespace();
+        void doCheckAuthorization(OperationContext* opCtx) const override {
+            uassert(ErrorCodes::Unauthorized,
+                    "Unauthorized",
+                    AuthorizationSession::get(opCtx->getClient())
+                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                           ActionType::internal));
         }
     };
 } sharsvrdDropCollectionCommand;

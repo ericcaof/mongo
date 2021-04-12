@@ -744,7 +744,7 @@ S2Region* buildS2Region(const R2Annulus& sphereBounds) {
     }
 
     // 'kEpsilon' is about 9 times the double-precision roundoff relative error.
-    constexpr double kEpsilon = 1e-15;
+    const double kEpsilon = 1e-15;
 
     // We only need to max bound if this is not a full search of the Earth
     // Using the constant here is important since we use the min of kMaxEarthDistance

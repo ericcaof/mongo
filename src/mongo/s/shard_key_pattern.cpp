@@ -371,6 +371,16 @@ BSONObj ShardKeyPattern::extractShardKeyFromDoc(const BSONObj& doc) const {
     return keyBuilder.obj();
 }
 
+BSONObj ShardKeyPattern::extractShardKeyFromDocThrows(const BSONObj& doc) const {
+    auto shardKey = extractShardKeyFromDoc(doc);
+
+    uassert(ErrorCodes::ShardKeyNotFound,
+            "Shard key cannot contain array values or array descendants.",
+            !shardKey.isEmpty());
+
+    return shardKey;
+}
+
 BSONObj ShardKeyPattern::emplaceMissingShardKeyValuesForDocument(const BSONObj doc) const {
     BSONObjBuilder fullDocBuilder(doc);
     for (const auto& skField : _keyPattern.toBSON()) {
@@ -390,13 +400,14 @@ BSONObj ShardKeyPattern::emplaceMissingShardKeyValuesForDocument(const BSONObj d
 StatusWith<BSONObj> ShardKeyPattern::extractShardKeyFromQuery(OperationContext* opCtx,
                                                               const NamespaceString& nss,
                                                               const BSONObj& basicQuery) const {
-    auto qr = std::make_unique<QueryRequest>(nss);
-    qr->setFilter(basicQuery);
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(basicQuery.getOwned());
 
     const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ =
         CanonicalQuery::canonicalize(opCtx,
-                                     std::move(qr),
+                                     std::move(findCommand),
+                                     false, /* isExplain */
                                      expCtx,
                                      ExtensionsCallbackNoop(),
                                      MatchExpressionParser::kAllowAllSpecialFeatures);
@@ -409,15 +420,16 @@ StatusWith<BSONObj> ShardKeyPattern::extractShardKeyFromQuery(OperationContext* 
 
 StatusWith<BSONObj> ShardKeyPattern::extractShardKeyFromQuery(
     boost::intrusive_ptr<ExpressionContext> expCtx, const BSONObj& basicQuery) const {
-    auto qr = std::make_unique<QueryRequest>(expCtx->ns);
-    qr->setFilter(basicQuery);
+    auto findCommand = std::make_unique<FindCommandRequest>(expCtx->ns);
+    findCommand->setFilter(basicQuery.getOwned());
     if (!expCtx->getCollatorBSON().isEmpty()) {
-        qr->setCollation(expCtx->getCollatorBSON());
+        findCommand->setCollation(expCtx->getCollatorBSON().getOwned());
     }
 
     auto statusWithCQ =
         CanonicalQuery::canonicalize(expCtx->opCtx,
-                                     std::move(qr),
+                                     std::move(findCommand),
+                                     false, /* isExplain */
                                      expCtx,
                                      ExtensionsCallbackNoop(),
                                      MatchExpressionParser::kAllowAllSpecialFeatures);

@@ -1,7 +1,9 @@
 // Verifies mongos returns StaleConfig if it exhausts its allowed stale version retry attempts,
 // using the command read and write modes.
 //
-// @tags: [requires_sharding]
+// @tags: [
+//   requires_sharding,
+// ]
 (function() {
 "use strict";
 

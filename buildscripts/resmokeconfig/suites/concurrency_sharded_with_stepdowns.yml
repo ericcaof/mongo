@@ -11,7 +11,6 @@ selector:
 
   # SERVER-17397 Drops of sharded namespaces may not fully succeed
   - jstests/concurrency/fsm_workloads/create_database.js
-  - jstests/concurrency/fsm_workloads/drop_database.js
   - jstests/concurrency/fsm_workloads/map_reduce_drop.js
 
   # Disabled due to SERVER-33753, '.count() without a predicate can be wrong on sharded
@@ -169,6 +168,9 @@ selector:
   - jstests/concurrency/fsm_workloads/snapshot_read_kill_op_only.js
   - jstests/concurrency/fsm_workloads/snapshot_read_kill_operations.js
 
+  # Time-series collections are not supported on mongos.
+  - jstests/concurrency/fsm_workloads/create_timeseries_collection.js
+
   exclude_with_any_tags:
   - requires_replication
   - requires_non_retryable_writes
@@ -177,6 +179,9 @@ selector:
   - uses_curop_agg_stage
   # mongos has no system.profile collection.
   - requires_profiling
+  # mongos does not support inserts on timeseries collections
+  - requires_timeseries
+  - does_not_support_stepdowns
 
 executor:
   archive:
@@ -196,7 +201,6 @@ executor:
           runningWithAutoSplit: false
           runningWithBalancer: false
           useStepdownPermittedFile: true
-          usingReplicaSetShards: true
   hooks:
   - class: ContinuousStepdown
     config_stepdown: true

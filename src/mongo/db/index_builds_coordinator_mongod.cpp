@@ -35,6 +35,7 @@
 
 #include <algorithm>
 
+#include "mongo/db/audit.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/index_build_entry_gen.h"
 #include "mongo/db/concurrency/locker.h"
@@ -43,6 +44,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index_build_entry_helpers.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/tenant_migration_access_blocker_util.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/resource_consumption_metrics.h"
@@ -58,6 +60,7 @@ namespace mongo {
 
 namespace {
 
+MONGO_FAIL_POINT_DEFINE(hangAfterAcquiringIndexBuildSlot);
 MONGO_FAIL_POINT_DEFINE(hangBeforeInitializingIndexBuild);
 MONGO_FAIL_POINT_DEFINE(hangIndexBuildAfterSignalPrimaryForCommitReadiness);
 
@@ -180,6 +183,11 @@ IndexBuildsCoordinatorMongod::_startIndexBuild(OperationContext* opCtx,
                         replCoord->canAcceptWritesFor(opCtx, nssOrUuid));
             }
 
+            // The check here catches empty index builds and also allows us to stop index
+            // builds before waiting for throttling. It may race with the abort at the start
+            // of migration so we do check again later.
+            uassertStatusOK(tenant_migration_access_blocker::checkIfCanBuildIndex(opCtx, dbName));
+
             stdx::unique_lock<Latch> lk(_throttlingMutex);
             opCtx->waitForConditionOrInterrupt(_indexBuildFinished, lk, [&] {
                 const int maxActiveBuilds = maxNumActiveUserIndexBuilds.load();
@@ -211,6 +219,11 @@ IndexBuildsCoordinatorMongod::_startIndexBuild(OperationContext* opCtx,
         _indexBuildFinished.notify_one();
     });
 
+    if (MONGO_unlikely(hangAfterAcquiringIndexBuildSlot.shouldFail())) {
+        LOGV2(4886201, "Hanging index build due to failpoint 'hangAfterAcquiringIndexBuildSlot'");
+        hangAfterAcquiringIndexBuildSlot.pauseWhileSet();
+    }
+
     if (indexBuildOptions.applicationMode == ApplicationMode::kStartupRepair) {
         // Two phase index build recovery goes though a different set-up procedure because we will
         // either resume the index build or the original index will be dropped first.
@@ -238,6 +251,21 @@ IndexBuildsCoordinatorMongod::_startIndexBuild(OperationContext* opCtx,
             // The requested index (specs) are already built or are being built. Return success
             // early (this is v4.0 behavior compatible).
             return statusWithOptionalResult.getValue().get();
+        }
+
+        if (opCtx->getClient()->isFromUserConnection()) {
+            auto migrationStatus =
+                tenant_migration_access_blocker::checkIfCanBuildIndex(opCtx, dbName);
+            if (!migrationStatus.isOK()) {
+                LOGV2(4886200,
+                      "Aborted index build before start due to tenant migration",
+                      "error"_attr = migrationStatus,
+                      "buildUUID"_attr = buildUUID,
+                      "collectionUUID"_attr = collectionUUID);
+                activeIndexBuilds.unregisterIndexBuild(&_indexBuildsManager,
+                                                       invariant(_getIndexBuild(buildUUID)));
+                return migrationStatus;
+            }
         }
     }
 
@@ -272,6 +300,10 @@ IndexBuildsCoordinatorMongod::_startIndexBuild(OperationContext* opCtx,
 
     auto replState = invariant(_getIndexBuild(buildUUID));
 
+    // Since index builds occur in a separate thread, client attributes that are audited must be
+    // extracted from the client object and passed into the thread separately.
+    audit::ImpersonatedClientAttrs impersonatedClientAttrs(opCtx->getClient());
+
     // The thread pool task will be responsible for signalling the condition variable when the index
     // build thread is done running.
     onScopeExitGuard.dismiss();
@@ -288,7 +320,8 @@ IndexBuildsCoordinatorMongod::_startIndexBuild(OperationContext* opCtx,
         startTimestamp,
         shardVersion,
         dbVersion,
-        resumeInfo
+        resumeInfo,
+        impersonatedClientAttrs = std::move(impersonatedClientAttrs)
     ](auto status) mutable noexcept {
         auto onScopeExitGuard = makeGuard([&] {
             stdx::unique_lock<Latch> lk(_throttlingMutex);
@@ -304,6 +337,13 @@ IndexBuildsCoordinatorMongod::_startIndexBuild(OperationContext* opCtx,
         }
 
         auto opCtx = Client::getCurrent()->makeOperationContext();
+
+        // Load the external client's attributes into this thread's client for auditing.
+        auto authSession = AuthorizationSession::get(Client::getCurrent());
+        if (authSession) {
+            authSession->setImpersonatedUserData(std::move(impersonatedClientAttrs.userNames),
+                                                 std::move(impersonatedClientAttrs.roleNames));
+        }
 
         auto& oss = OperationShardingState::get(opCtx.get());
         oss.initializeClientRoutingVersions(nss, shardVersion, dbVersion);
@@ -645,6 +685,9 @@ void IndexBuildsCoordinatorMongod::_waitForNextIndexBuildActionAndCommit(
               "buildUUID"_attr = replState->buildUUID,
               "action"_attr = indexBuildActionToString(nextAction));
 
+        // Tenant migration abort should have been re-written as primary abort before reaching here.
+        invariant(nextAction != IndexBuildAction::kTenantMigrationAbort);
+
         // If the index build was aborted, this serves as a final interruption point. Since the
         // index builder thread is interrupted before the action is set, this must fail if the build
         // was aborted.
@@ -680,6 +723,7 @@ void IndexBuildsCoordinatorMongod::_waitForNextIndexBuildActionAndCommit(
             case IndexBuildAction::kRollbackAbort:
             case IndexBuildAction::kInitialSyncAbort:
             case IndexBuildAction::kPrimaryAbort:
+            case IndexBuildAction::kTenantMigrationAbort:
                 // The calling thread should have interrupted us before signaling an abort action.
                 LOGV2_FATAL(4698901, "Index build abort should have interrupted this operation");
             case IndexBuildAction::kNoAction:

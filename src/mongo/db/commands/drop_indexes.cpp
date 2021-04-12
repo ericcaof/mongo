@@ -34,6 +34,7 @@
 #include <string>
 #include <vector>
 
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/drop_indexes.h"
@@ -45,11 +46,14 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/drop_indexes_gen.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/durable_catalog.h"
+#include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
+#include "mongo/db/timeseries/timeseries_lookup.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/logv2/log.h"
@@ -58,53 +62,86 @@
 
 namespace mongo {
 
-using std::endl;
-using std::string;
-using std::stringstream;
-using std::vector;
+namespace {
 
 MONGO_FAIL_POINT_DEFINE(reIndexCrashAfterDrop);
 
-/* "dropIndexes" is now the preferred form - "deleteIndexes" deprecated */
-class CmdDropIndexes : public BasicCommand {
-public:
-    const std::set<std::string>& apiVersions() const {
-        return kApiVersions1;
+/**
+ * Returns a DropIndexes for dropping indexes on the bucket collection.
+ *
+ * The 'index' dropIndexes parameter may refer to an index name, or array of names, or "*" for all
+ * indexes, or an index spec key (an object). Only the index spec key has to be translated for the
+ * bucket collection. The other forms of 'index' can be passed along unmodified.
+ *
+ * Returns null if 'origCmd' is not for a time-series collection.
+ */
+std::unique_ptr<DropIndexes> makeTimeseriesDropIndexesCommand(OperationContext* opCtx,
+                                                              const DropIndexes& origCmd) {
+    const auto& origNs = origCmd.getNamespace();
+
+    auto timeseriesOptions = timeseries::getTimeseriesOptions(opCtx, origNs);
+
+    // Return early with null if we are not working with a time-series collection.
+    if (!timeseriesOptions) {
+        return {};
     }
 
+    auto ns = origNs.makeTimeseriesBucketsNamespace();
+
+    const auto& origIndex = origCmd.getIndex();
+    if (auto keyPtr = stdx::get_if<BSONObj>(&origIndex)) {
+        auto bucketsIndexSpecWithStatus =
+            timeseries::createBucketsIndexSpecFromTimeseriesIndexSpec(*timeseriesOptions, *keyPtr);
+
+        uassert(ErrorCodes::IndexNotFound,
+                str::stream() << bucketsIndexSpecWithStatus.getStatus().toString()
+                              << " Command request: " << redact(origCmd.toBSON({})),
+                bucketsIndexSpecWithStatus.isOK());
+
+        return std::make_unique<DropIndexes>(ns, std::move(bucketsIndexSpecWithStatus.getValue()));
+    }
+
+    return std::make_unique<DropIndexes>(ns, origIndex);
+}
+
+class CmdDropIndexes : public DropIndexesCmdVersion1Gen<CmdDropIndexes> {
+public:
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
-    }
-
     bool collectsResourceConsumptionMetrics() const override {
         return true;
     }
-
     std::string help() const override {
         return "drop indexes for a collection";
     }
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {
-        ActionSet actions;
-        actions.addAction(ActionType::dropIndex);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
-    }
+    class Invocation final : public InvocationBaseGen {
+    public:
+        using InvocationBaseGen::InvocationBaseGen;
+        bool supportsWriteConcern() const final {
+            return true;
+        }
+        NamespaceString ns() const final {
+            return request().getNamespace();
+        }
+        void doCheckAuthorization(OperationContext* opCtx) const final {
+            uassert(ErrorCodes::Unauthorized,
+                    str::stream() << "Not authorized to drop index(es) on collection"
+                                  << request().getNamespace(),
+                    AuthorizationSession::get(opCtx->getClient())
+                        ->isAuthorizedForActionsOnNamespace(request().getNamespace(),
+                                                            ActionType::dropIndex));
+        }
+        Reply typedRun(OperationContext* opCtx) final {
+            // If the request namespace refers to a time-series collection, transform the user
+            // time-series index request to one on the underlying bucket.
+            if (auto timeseriesCmd = makeTimeseriesDropIndexesCommand(opCtx, request())) {
+                return dropIndexes(opCtx, timeseriesCmd->getNamespace(), timeseriesCmd->getIndex());
+            }
 
-    CmdDropIndexes() : BasicCommand("dropIndexes", "deleteIndexes") {}
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& jsobj,
-             BSONObjBuilder& result) {
-        const NamespaceString nss = CommandHelpers::parseNsCollectionRequired(dbname, jsobj);
-        uassertStatusOK(dropIndexes(opCtx, nss, jsobj, &result));
-        return true;
-    }
-
+            return dropIndexes(opCtx, request().getNamespace(), request().getIndex());
+        }
+    };
 } cmdDropIndexes;
 
 class CmdReIndex : public ErrmsgCommandDeprecated {
@@ -131,9 +168,9 @@ public:
     CmdReIndex() : ErrmsgCommandDeprecated("reIndex") {}
 
     bool errmsgRun(OperationContext* opCtx,
-                   const string& dbname,
+                   const std::string& dbname,
                    const BSONObj& jsobj,
-                   string& errmsg,
+                   std::string& errmsg,
                    BSONObjBuilder& result) {
 
         const NamespaceString toReIndexNss =
@@ -168,9 +205,9 @@ public:
 
         const auto defaultIndexVersion = IndexDescriptor::getDefaultIndexVersion();
 
-        vector<BSONObj> all;
+        std::vector<BSONObj> all;
         {
-            vector<string> indexNames;
+            std::vector<std::string> indexNames;
             writeConflictRetry(opCtx, "listIndexes", toReIndexNss.ns(), [&] {
                 indexNames.clear();
                 DurableCatalog::get(opCtx)->getAllIndexes(
@@ -180,7 +217,7 @@ public:
             all.reserve(indexNames.size());
 
             for (size_t i = 0; i < indexNames.size(); i++) {
-                const string& name = indexNames[i];
+                const std::string& name = indexNames[i];
                 BSONObj spec = writeConflictRetry(opCtx, "getIndexSpec", toReIndexNss.ns(), [&] {
                     return DurableCatalog::get(opCtx)->getIndexSpec(
                         opCtx, collection->getCatalogId(), name);
@@ -216,7 +253,7 @@ public:
             }
         }
 
-        result.appendNumber("nIndexesWas", all.size());
+        result.appendNumber("nIndexesWas", static_cast<long long>(all.size()));
 
         std::unique_ptr<MultiIndexBlock> indexer = std::make_unique<MultiIndexBlock>();
         indexer->setIndexBuildMethod(IndexBuildMethod::kForeground);
@@ -264,4 +301,6 @@ public:
         return true;
     }
 } cmdReIndex;
+
+}  // namespace
 }  // namespace mongo

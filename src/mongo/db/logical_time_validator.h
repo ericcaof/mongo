@@ -31,6 +31,7 @@
 
 #include <memory>
 
+#include "mongo/db/keys_collection_document_gen.h"
 #include "mongo/db/signed_logical_time.h"
 #include "mongo/db/time_proof_service.h"
 #include "mongo/platform/mutex.h"
@@ -107,6 +108,11 @@ public:
      * replica set to use old keys with sharded cluster.
      */
     void stopKeyManager();
+
+    /**
+     * Load the given external key into the key manager's keys cache.
+     */
+    void cacheExternalKey(ExternalKeysCollectionDocument key);
 
     /**
      * Reset the key manager cache of keys.

@@ -26,6 +26,7 @@ selector:
   - jstests/core/wildcard_index_collation.js
   - jstests/core/wildcard_index_hint.js
   - jstests/core/wildcard_index_return_key.js
+  - jstests/core/wildcard_index_projection.js
   - jstests/core/update_array_offset_positional.js
   - jstests/core/update_arraymatch6.js
   - jstests/core/update_arraymatch8.js
@@ -134,6 +135,7 @@ selector:
   - jstests/core/explain_find_and_modify.js
   - jstests/core/explain_large_bounds.js
   - jstests/core/explain_multi_plan.js
+  - jstests/core/explain_server_params.js
   - jstests/core/explain_shell_helpers.js
   - jstests/core/explain_sort_type.js
   - jstests/core/explain_winning_plan.js
@@ -391,6 +393,7 @@ selector:
   - jstests/core/sparse_index_supports_ne_null.js
   - jstests/core/stages_and_hash.js
   - jstests/core/stages_collection_scan.js
+  - jstests/core/timeseries/timeseries_idle_buckets.js
   - jstests/core/top.js
   - jstests/core/txns/abort_prepared_transaction.js
   - jstests/core/txns/aggregation_in_transaction.js
@@ -786,6 +789,12 @@ selector:
   # Timeseries collection expireAfterSeconds option requires the TTL Monitor,
   # which is disabled in this test configuration.
   - jstests/core/timeseries/timeseries_expire.js
+
+  # TODO SERVER-54042 Time-series collection queries
+  - jstests/core/timeseries/timeseries_bucket_limit_count.js
+  - jstests/core/timeseries/timeseries_min_max.js
+  - jstests/core/timeseries/timeseries_simple.js
+  - jstests/core/timeseries/timeseries_sparse.js
 
 executor:
   archive:

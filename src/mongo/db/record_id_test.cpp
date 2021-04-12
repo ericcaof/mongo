@@ -31,6 +31,8 @@
 
 #include "mongo/db/record_id.h"
 
+#include "mongo/db/record_id_helpers.h"
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -38,6 +40,15 @@ namespace {
 
 TEST(RecordId, HashEqual) {
     RecordId locA(1, 2);
+    RecordId locB;
+    locB = locA;
+    ASSERT_EQUALS(locA, locB);
+    RecordId::Hasher hasher;
+    ASSERT_EQUALS(hasher(locA), hasher(locB));
+}
+
+TEST(RecordId, HashEqualOid) {
+    RecordId locA(record_id_helpers::keyForOID(OID::gen()));
     RecordId locB;
     locB = locA;
     ASSERT_EQUALS(locA, locB);
@@ -63,6 +74,131 @@ TEST(RecordId, HashNotEqual) {
     ASSERT_NOT_EQUALS(hasher(original), hasher(diffOfs));
     ASSERT_NOT_EQUALS(hasher(original), hasher(diffBoth));
     ASSERT_NOT_EQUALS(hasher(original), hasher(reversed));
+}
+
+TEST(RecordId, HashNotEqualOid) {
+    RecordId loc1(record_id_helpers::keyForOID(OID::gen()));
+    RecordId loc2(record_id_helpers::keyForOID(OID::gen()));
+    RecordId loc3(record_id_helpers::keyForOID(OID::gen()));
+    ASSERT_NOT_EQUALS(loc1, loc2);
+    ASSERT_NOT_EQUALS(loc1, loc3);
+    ASSERT_NOT_EQUALS(loc2, loc3);
+
+    // Unequal DiskLocs need not produce unequal hashes.  But unequal hashes are likely, and
+    // assumed here for sanity checking of the custom hash implementation.
+    RecordId::Hasher hasher;
+    ASSERT_NOT_EQUALS(hasher(loc1), hasher(loc2));
+    ASSERT_NOT_EQUALS(hasher(loc1), hasher(loc3));
+    ASSERT_NOT_EQUALS(hasher(loc2), hasher(loc3));
+}
+
+TEST(RecordId, KeyStringTest) {
+    RecordId ridNull;
+    ASSERT(ridNull.isNull());
+    ASSERT(!ridNull.isValid());
+
+    RecordId null2;
+    ASSERT(null2 == ridNull);
+
+    OID oid1 = OID::gen();
+    RecordId rid1(record_id_helpers::keyForOID(oid1));
+    ASSERT(rid1.isValid());
+    auto obj = record_id_helpers::toBSONAs(rid1, "");
+    ASSERT_EQ(oid1, obj.firstElement().OID());
+    ASSERT_GT(rid1, ridNull);
+    ASSERT_LT(ridNull, rid1);
+}
+
+TEST(RecordId, NullTest) {
+    // The int64 format should be considered null if its value is 0. Likewise, the value should be
+    // interpreted as int64_t(0) if it is null.
+    RecordId rid0(0);
+    ASSERT(rid0.isNull());
+
+    RecordId nullRid;
+    ASSERT(nullRid.isNull());
+    ASSERT_EQ(0, nullRid.getLong());
+    ASSERT_NE(rid0, nullRid);
+}
+
+TEST(RecordId, OidTestCompare) {
+    RecordId ridNull;
+    RecordId rid0 = record_id_helpers::keyForOID(OID::createFromString("000000000000000000000000"));
+    ASSERT_GT(rid0, ridNull);
+
+    RecordId rid1 = record_id_helpers::keyForOID(OID::createFromString("000000000000000000000001"));
+    ASSERT_GT(rid1, rid0);
+    RecordId oidMin = record_id_helpers::keyForOID(OID());
+    ASSERT_EQ(oidMin, rid0);
+    ASSERT_GT(oidMin, ridNull);
+
+    RecordId rid2 = record_id_helpers::keyForOID(OID::createFromString("000000000000000000000002"));
+    ASSERT_GT(rid2, rid1);
+    RecordId rid3 = record_id_helpers::keyForOID(OID::createFromString("ffffffffffffffffffffffff"));
+    ASSERT_GT(rid3, rid2);
+    ASSERT_GT(rid3, rid0);
+
+    RecordId oidMax = record_id_helpers::keyForOID(OID::max());
+    ASSERT_EQ(oidMax, rid3);
+    ASSERT_GT(oidMax, rid0);
+}
+
+TEST(RecordId, Reservations) {
+    // It's important that reserved IDs like this never change.
+    RecordId ridReserved(RecordId::kMaxRepr - (1024 * 1024));
+    ASSERT_EQ(ridReserved,
+              RecordIdReservations::reservedIdFor(ReservationId::kWildcardMultikeyMetadataId));
+    ASSERT(RecordIdReservations::isReserved(ridReserved));
+    ASSERT(ridReserved.isValid());
+}
+
+TEST(RecordId, RoundTripSerialize) {
+    {
+        RecordId id(1);
+        BSONObjBuilder builder;
+        id.serializeToken("rid", &builder);
+        BSONObj obj = builder.done();
+        ASSERT_EQ(id, RecordId::deserializeToken(obj["rid"]));
+    }
+
+    {
+        RecordId id(4611686018427387904);
+        BSONObjBuilder builder;
+        id.serializeToken("rid", &builder);
+        BSONObj obj = builder.done();
+        ASSERT_EQ(id, RecordId::deserializeToken(obj["rid"]));
+    }
+
+    {
+        RecordId id;
+        BSONObjBuilder builder;
+        id.serializeToken("rid", &builder);
+        BSONObj obj = builder.done();
+        ASSERT_EQ(id, RecordId::deserializeToken(obj["rid"]));
+    }
+
+    {
+        RecordId id(record_id_helpers::keyForOID(OID::gen()));
+        BSONObjBuilder builder;
+        id.serializeToken("rid", &builder);
+        BSONObj obj = builder.done();
+        ASSERT_EQ(id, RecordId::deserializeToken(obj["rid"]));
+    }
+
+    {
+        BSONObjBuilder builder;
+        builder.append("rid", OID::gen());
+        BSONObj obj = builder.done();
+        ASSERT_THROWS_CODE(
+            RecordId::deserializeToken(obj["rid"]), DBException, ErrorCodes::BadValue);
+    }
+}
+
+// RecordIds of different formats may not be compared.
+DEATH_TEST(RecordId, UnsafeComparison, "Invariant failure") {
+    RecordId rid1(1);
+    RecordId rid2 = record_id_helpers::keyForOID(OID::createFromString("000000000000000000000001"));
+    ASSERT_NOT_EQUALS(rid1, rid2);
 }
 
 }  // namespace

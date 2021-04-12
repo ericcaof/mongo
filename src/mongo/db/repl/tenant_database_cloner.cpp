@@ -38,6 +38,7 @@
 #include "mongo/db/repl/database_cloner_gen.h"
 #include "mongo/db/repl/tenant_collection_cloner.h"
 #include "mongo/db/repl/tenant_database_cloner.h"
+#include "mongo/db/repl/tenant_migration_decoration.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/assert_util.h"
@@ -140,7 +141,7 @@ BaseCloner::AfterStageBehavior TenantDatabaseCloner::listCollectionsStage() {
                     .reason());
         }
         NamespaceString collectionNamespace(_dbName, result.getName());
-        if (collectionNamespace.isSystem() && !collectionNamespace.isLegalClientSystemNS()) {
+        if (collectionNamespace.isSystem() && !collectionNamespace.isReplicated()) {
             LOGV2_DEBUG(4881602,
                         1,
                         "Database cloner skipping 'system' collection",
@@ -174,6 +175,8 @@ BaseCloner::AfterStageBehavior TenantDatabaseCloner::listCollectionsStage() {
 BaseCloner::AfterStageBehavior TenantDatabaseCloner::listExistingCollectionsStage() {
     auto opCtx = cc().makeOperationContext();
     DBDirectClient client(opCtx.get());
+    tenantMigrationRecipientInfo(opCtx.get()) =
+        boost::make_optional<TenantMigrationRecipientInfo>(getSharedData()->getMigrationId());
 
     std::vector<UUID> clonedCollectionUUIDs;
     auto collectionInfos =
@@ -191,7 +194,7 @@ BaseCloner::AfterStageBehavior TenantDatabaseCloner::listExistingCollectionsStag
                     .reason());
         }
         NamespaceString collectionNamespace(_dbName, result.getName());
-        if (collectionNamespace.isSystem() && !collectionNamespace.isLegalClientSystemNS()) {
+        if (collectionNamespace.isSystem() && !collectionNamespace.isReplicated()) {
             LOGV2_DEBUG(5271600,
                         1,
                         "Tenant database cloner skipping 'system' collection",
@@ -220,6 +223,15 @@ BaseCloner::AfterStageBehavior TenantDatabaseCloner::listExistingCollectionsStag
             _collections.end(),
             lastClonedCollectionUUID,
             [](const auto& collection, const auto& uuid) { return collection.second.uuid < uuid; });
+        {
+            stdx::lock_guard<Latch> lk(_mutex);
+            if (startingCollection != _collections.end() &&
+                startingCollection->second.uuid == lastClonedCollectionUUID) {
+                _stats.clonedCollectionsBeforeFailover = clonedCollectionUUIDs.size() - 1;
+            } else {
+                _stats.clonedCollectionsBeforeFailover = clonedCollectionUUIDs.size();
+            }
+        }
         _collections.erase(_collections.begin(), startingCollection);
         if (!_collections.empty()) {
             LOGV2(5271601,
@@ -290,6 +302,8 @@ void TenantDatabaseCloner::postStage() {
         {
             stdx::lock_guard<Latch> lk(_mutex);
             _stats.collectionStats[_stats.clonedCollections] = _currentCollectionCloner->getStats();
+            _stats.approxTotalBytesCopied +=
+                _stats.collectionStats[_stats.clonedCollections].approxTotalBytesCopied;
             _currentCollectionCloner = nullptr;
             // Abort the tenant database cloner if the collection clone failed.
             if (!collStatus.isOK())
@@ -306,6 +320,8 @@ TenantDatabaseCloner::Stats TenantDatabaseCloner::getStats() const {
     TenantDatabaseCloner::Stats stats = _stats;
     if (_currentCollectionCloner) {
         stats.collectionStats[_stats.clonedCollections] = _currentCollectionCloner->getStats();
+        stats.approxTotalBytesCopied +=
+            stats.collectionStats[stats.clonedCollections].approxTotalBytesCopied;
     }
     return stats;
 }
@@ -322,8 +338,10 @@ BSONObj TenantDatabaseCloner::Stats::toBSON() const {
 }
 
 void TenantDatabaseCloner::Stats::append(BSONObjBuilder* builder) const {
-    builder->appendNumber("collections", collections);
-    builder->appendNumber("clonedCollections", clonedCollections);
+    builder->appendNumber("clonedCollectionsBeforeFailover",
+                          static_cast<long long>(clonedCollectionsBeforeFailover));
+    builder->appendNumber("collections", static_cast<long long>(collections));
+    builder->appendNumber("clonedCollections", static_cast<long long>(clonedCollections));
     if (start != Date_t()) {
         builder->appendDate("start", start);
         if (end != Date_t()) {

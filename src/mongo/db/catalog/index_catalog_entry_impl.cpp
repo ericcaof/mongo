@@ -71,9 +71,7 @@ IndexCatalogEntryImpl::IndexCatalogEntryImpl(OperationContext* const opCtx,
       _ordering(Ordering::make(_descriptor->keyPattern())),
       _isReady(false),
       _isFrozen(isFrozen),
-      _isDropped(false),
-      _prefix(
-          DurableCatalog::get(opCtx)->getIndexPrefix(opCtx, _catalogId, _descriptor->indexName())) {
+      _isDropped(false) {
 
     _descriptor->_entry = this;
     _isReady = isReadyInMySnapshot(opCtx);
@@ -255,6 +253,36 @@ void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
     }
 }
 
+void IndexCatalogEntryImpl::forceSetMultikey(OperationContext* const opCtx,
+                                             const CollectionPtr& coll,
+                                             bool isMultikey,
+                                             const MultikeyPaths& multikeyPaths) {
+    invariant(opCtx->lockState()->isCollectionLockedForMode(coll->ns(), MODE_X));
+
+    // Don't check _indexTracksMultikeyPathsInCatalog because the caller may be intentionally trying
+    // to bypass this check. That is, pre-3.4 indexes may be 'stuck' in a state where they are not
+    // tracking multikey paths in the catalog (i.e. the multikeyPaths field is absent), but the
+    // caller wants to upgrade this index because it knows exactly which paths are multikey. We rely
+    // on the following function to make sure this upgrade only takes place on index types that
+    // currently support path-level multikey path tracking.
+    DurableCatalog::get(opCtx)->forceSetIndexIsMultikey(
+        opCtx, _catalogId, _descriptor.get(), isMultikey, multikeyPaths);
+
+    // The prior call to set the multikey metadata in the catalog does some validation and clean up
+    // based on the inputs, so reset the multikey variables based on what is actually in the durable
+    // catalog entry.
+    {
+        stdx::lock_guard<Latch> lk(_indexMultikeyPathsMutex);
+        const bool isMultikey = _catalogIsMultikey(opCtx, &_indexMultikeyPaths);
+        _isMultikeyForRead.store(isMultikey);
+        _isMultikeyForWrite.store(isMultikey);
+        _indexTracksMultikeyPathsInCatalog = !_indexMultikeyPaths.empty();
+    }
+
+    // Since multikey metadata has changed, invalidate the query cache.
+    CollectionQueryInfo::get(coll).clearQueryCacheForSetMultikey(coll);
+}
+
 Status IndexCatalogEntryImpl::_setMultikeyInMultiDocumentTransaction(
     OperationContext* opCtx, const CollectionPtr& collection, const MultikeyPaths& multikeyPaths) {
     // If we are inside a multi-document transaction, we write the on-disk multikey update in a
@@ -287,17 +315,16 @@ Status IndexCatalogEntryImpl::_setMultikeyInMultiDocumentTransaction(
             auto recoveryPrepareOpTime = txnParticipant.getPrepareOpTimeForRecovery();
             if (!recoveryPrepareOpTime.isNull()) {
                 // We might replay a prepared transaction behind the oldest timestamp during initial
-                // sync. So round up to the oldest timestamp for the multikey write if the prepare
-                // timestamp is behind the oldest timestamp.
-                auto status = opCtx->recoveryUnit()->setTimestamp(
-                    std::max(opCtx->getServiceContext()->getStorageEngine()->getOldestTimestamp(),
-                             recoveryPrepareOpTime.getTimestamp()));
-                if (status.code() == ErrorCodes::BadValue) {
-                    LOGV2(20352,
-                          "Temporarily could not timestamp the multikey catalog write, retrying",
-                          "reason"_attr = status.reason());
-                    throw WriteConflictException();
-                }
+                // sync or behind the stable timestamp during rollback. During initial sync, we
+                // may not have a stable timestamp. Therefore, we need to round up
+                // the multi-key write timestamp to the max of the three so that we don't write
+                // behind the oldest/stable timestamp. This code path is only hit during initial
+                // sync/recovery when reconstructing prepared transactions and so we don't expect
+                // the oldest/stable timestamp to advance concurrently.
+                auto status = opCtx->recoveryUnit()->setTimestamp(std::max(
+                    {recoveryPrepareOpTime.getTimestamp(),
+                     opCtx->getServiceContext()->getStorageEngine()->getOldestTimestamp(),
+                     opCtx->getServiceContext()->getStorageEngine()->getStableTimestamp()}));
                 fassert(31164, status);
             } else {
                 // If there is no recovery prepare OpTime, then this node must be a primary. We
@@ -383,10 +410,6 @@ void IndexCatalogEntryImpl::_catalogSetMultikey(OperationContext* opCtx,
         // flipping multikey.
         _isMultikeyForWrite.store(true);
     });
-}
-
-KVPrefix IndexCatalogEntryImpl::_catalogGetPrefix(OperationContext* opCtx) const {
-    return DurableCatalog::get(opCtx)->getIndexPrefix(opCtx, _catalogId, _descriptor->indexName());
 }
 
 }  // namespace mongo

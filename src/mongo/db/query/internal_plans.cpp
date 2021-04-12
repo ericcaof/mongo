@@ -50,38 +50,30 @@ namespace mongo {
 
 std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::collectionScan(
     OperationContext* opCtx,
-    StringData ns,
     const CollectionPtr* coll,
     PlanYieldPolicy::YieldPolicy yieldPolicy,
     const Direction direction,
-    boost::optional<RecordId> resumeAfterRecordId) {
+    boost::optional<RecordId> resumeAfterRecordId,
+    boost::optional<RecordId> minRecord,
+    boost::optional<RecordId> maxRecord) {
     const auto& collection = *coll;
+    invariant(collection);
 
     std::unique_ptr<WorkingSet> ws = std::make_unique<WorkingSet>();
 
     auto expCtx = make_intrusive<ExpressionContext>(
-        opCtx, std::unique_ptr<CollatorInterface>(nullptr), NamespaceString(ns));
-
-    if (!collection) {
-        auto eof = std::make_unique<EOFStage>(expCtx.get());
-        // Takes ownership of 'ws' and 'eof'.
-        auto statusWithPlanExecutor = plan_executor_factory::make(expCtx,
-                                                                  std::move(ws),
-                                                                  std::move(eof),
-                                                                  &CollectionPtr::null,
-                                                                  yieldPolicy,
-                                                                  NamespaceString(ns));
-        invariant(statusWithPlanExecutor.isOK());
-        return std::move(statusWithPlanExecutor.getValue());
-    }
-
-    invariant(ns == collection->ns().ns());
-
-    auto cs = _collectionScan(expCtx, ws.get(), &collection, direction, resumeAfterRecordId);
+        opCtx, std::unique_ptr<CollatorInterface>(nullptr), collection->ns());
+    auto cs = _collectionScan(
+        expCtx, ws.get(), &collection, direction, resumeAfterRecordId, minRecord, maxRecord);
 
     // Takes ownership of 'ws' and 'cs'.
     auto statusWithPlanExecutor =
-        plan_executor_factory::make(expCtx, std::move(ws), std::move(cs), &collection, yieldPolicy);
+        plan_executor_factory::make(expCtx,
+                                    std::move(ws),
+                                    std::move(cs),
+                                    &collection,
+                                    yieldPolicy,
+                                    false /* whether owned BSON must be returned */);
     invariant(statusWithPlanExecutor.isOK());
     return std::move(statusWithPlanExecutor.getValue());
 }
@@ -91,7 +83,9 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::deleteWith
     const CollectionPtr* coll,
     std::unique_ptr<DeleteStageParams> params,
     PlanYieldPolicy::YieldPolicy yieldPolicy,
-    Direction direction) {
+    Direction direction,
+    boost::optional<RecordId> minRecord,
+    boost::optional<RecordId> maxRecord) {
     const auto& collection = *coll;
     invariant(collection);
     auto ws = std::make_unique<WorkingSet>();
@@ -99,17 +93,22 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::deleteWith
     auto expCtx = make_intrusive<ExpressionContext>(
         opCtx, std::unique_ptr<CollatorInterface>(nullptr), collection->ns());
 
-    auto root = _collectionScan(expCtx, ws.get(), &collection, direction);
+    auto root = _collectionScan(
+        expCtx, ws.get(), &collection, direction, boost::none, minRecord, maxRecord);
 
     root = std::make_unique<DeleteStage>(
         expCtx.get(), std::move(params), ws.get(), collection, root.release());
 
-    auto executor = plan_executor_factory::make(
-        expCtx, std::move(ws), std::move(root), &collection, yieldPolicy);
+    auto executor = plan_executor_factory::make(expCtx,
+                                                std::move(ws),
+                                                std::move(root),
+                                                &collection,
+                                                yieldPolicy,
+                                                false /* whether owned BSON must be returned */
+    );
     invariant(executor.getStatus());
     return std::move(executor.getValue());
 }
-
 
 std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::indexScan(
     OperationContext* opCtx,
@@ -137,8 +136,13 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::indexScan(
                                                  direction,
                                                  options);
 
-    auto executor = plan_executor_factory::make(
-        expCtx, std::move(ws), std::move(root), &collection, yieldPolicy);
+    auto executor = plan_executor_factory::make(expCtx,
+                                                std::move(ws),
+                                                std::move(root),
+                                                &collection,
+                                                yieldPolicy,
+                                                false /* whether owned BSON must be returned */
+    );
     invariant(executor.getStatus());
     return std::move(executor.getValue());
 }
@@ -173,8 +177,13 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::deleteWith
     root = std::make_unique<DeleteStage>(
         expCtx.get(), std::move(params), ws.get(), collection, root.release());
 
-    auto executor = plan_executor_factory::make(
-        expCtx, std::move(ws), std::move(root), &collection, yieldPolicy);
+    auto executor = plan_executor_factory::make(expCtx,
+                                                std::move(ws),
+                                                std::move(root),
+                                                &collection,
+                                                yieldPolicy,
+                                                false /* whether owned BSON must be returned */
+    );
     invariant(executor.getStatus());
     return std::move(executor.getValue());
 }
@@ -202,8 +211,13 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::updateWith
                           : std::make_unique<UpdateStage>(
                                 expCtx.get(), params, ws.get(), collection, idHackStage.release()));
 
-    auto executor = plan_executor_factory::make(
-        expCtx, std::move(ws), std::move(root), &collection, yieldPolicy);
+    auto executor = plan_executor_factory::make(expCtx,
+                                                std::move(ws),
+                                                std::move(root),
+                                                &collection,
+                                                yieldPolicy,
+                                                false /* whether owned BSON must be returned */
+    );
     invariant(executor.getStatus());
     return std::move(executor.getValue());
 }
@@ -213,7 +227,10 @@ std::unique_ptr<PlanStage> InternalPlanner::_collectionScan(
     WorkingSet* ws,
     const CollectionPtr* coll,
     Direction direction,
-    boost::optional<RecordId> resumeAfterRecordId) {
+    boost::optional<RecordId> resumeAfterRecordId,
+    boost::optional<RecordId> minRecord,
+    boost::optional<RecordId> maxRecord) {
+
     const auto& collection = *coll;
     invariant(collection);
 
@@ -221,6 +238,8 @@ std::unique_ptr<PlanStage> InternalPlanner::_collectionScan(
     params.shouldWaitForOplogVisibility =
         shouldWaitForOplogVisibility(expCtx->opCtx, collection, false);
     params.resumeAfterRecordId = resumeAfterRecordId;
+    params.minRecord = minRecord;
+    params.maxRecord = maxRecord;
 
     if (FORWARD == direction) {
         params.direction = CollectionScanParams::FORWARD;

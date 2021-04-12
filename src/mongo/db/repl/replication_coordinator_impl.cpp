@@ -83,7 +83,8 @@
 #include "mongo/db/repl/replication_metrics.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/db/repl/tenant_migration_donor_util.h"
+#include "mongo/db/repl/tenant_migration_access_blocker_util.h"
+#include "mongo/db/repl/tenant_migration_decoration.h"
 #include "mongo/db/repl/transaction_oplog_application.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/repl/vote_requester.h"
@@ -496,7 +497,7 @@ bool ReplicationCoordinatorImpl::_startLoadLocalConfig(
             "for information on how to recover from this. Got \"{error}\" while parsing "
             "{config}",
             "Locally stored replica set configuration does not parse; See "
-            "hhttp://www.mongodb.org/dochub/core/recover-replica-set-from-invalid-config "
+            "http://www.mongodb.org/dochub/core/recover-replica-set-from-invalid-config "
             "for information on how to recover from this",
             "error"_attr = status,
             "config"_attr = cfg.getValue());
@@ -510,7 +511,7 @@ bool ReplicationCoordinatorImpl::_startLoadLocalConfig(
     LOGV2_DEBUG(4280505,
                 1,
                 "Creating any necessary TenantMigrationAccessBlockers for unfinished migrations");
-    tenant_migration_donor::recoverTenantMigrationAccessBlockers(opCtx);
+    tenant_migration_access_blocker::recoverTenantMigrationAccessBlockers(opCtx);
     LOGV2_DEBUG(4280506, 1, "Reconstructing prepared transactions");
     reconstructPreparedTransactions(opCtx, OplogApplication::Mode::kRecovering);
 
@@ -1041,7 +1042,7 @@ Seconds ReplicationCoordinatorImpl::getSecondaryDelaySecs() const {
         // queue of work.
         return Seconds(0);
     }
-    return _rsConfig.getMemberAt(_selfIndex).getSlaveDelay();
+    return _rsConfig.getMemberAt(_selfIndex).getSecondaryDelay();
 }
 
 void ReplicationCoordinatorImpl::clearSyncSourceBlacklist() {
@@ -1186,7 +1187,9 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
                 return ReplSetConfig(std::move(config));
             };
             LOGV2(4508103, "Increment the config term via reconfig");
-            auto reconfigStatus = doReplSetReconfig(opCtx, getNewConfig, true /* force */);
+            // Since we are only bumping the config term, we can skip the config replication and
+            // quorum checks in reconfig.
+            auto reconfigStatus = doOptimizedReconfig(opCtx, getNewConfig);
             if (!reconfigStatus.isOK()) {
                 LOGV2(4508100,
                       "Automatic reconfig to increment the config term on stepup failed",
@@ -1957,6 +1960,19 @@ ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorImpl::awaitRepli
     return {std::move(status), duration_cast<Milliseconds>(timer.elapsed())};
 }
 
+SharedSemiFuture<void> ReplicationCoordinatorImpl::awaitReplicationAsyncNoWTimeout(
+    const OpTime& opTime, const WriteConcernOptions& writeConcern) {
+    WriteConcernOptions fixedWriteConcern = populateUnsetWriteConcernOptionsSyncMode(writeConcern);
+
+    // The returned future won't account for wTimeout or wDeadline, so reject any write concerns
+    // with either option to avoid misuse.
+    invariant(fixedWriteConcern.wDeadline == Date_t::max());
+    invariant(fixedWriteConcern.wTimeout == WriteConcernOptions::kNoTimeout);
+
+    stdx::lock_guard lg(_mutex);
+    return _startWaitingForReplication(lg, opTime, fixedWriteConcern);
+}
+
 BSONObj ReplicationCoordinatorImpl::_getReplicationProgress(WithLock wl) const {
     BSONObjBuilder progress;
 
@@ -2139,6 +2155,10 @@ std::shared_ptr<HelloResponse> ReplicationCoordinatorImpl::_makeHelloResponse(
         // Report that we are secondary and not accepting writes until drain completes.
         response->setIsWritablePrimary(false);
         response->setIsSecondary(true);
+    }
+
+    if (_waitingForRSTLAtStepDown) {
+        response->setIsWritablePrimary(false);
     }
 
     if (_inShutdown) {
@@ -2539,8 +2559,26 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
             "not primary so can't step down",
             getMemberState().primary());
 
+    // This makes us tell the 'hello' command we can't accept writes (though in fact we can,
+    // it is not valid to disable writes until we actually acquire the RSTL).
+    {
+        stdx::lock_guard lk(_mutex);
+        _waitingForRSTLAtStepDown++;
+        _fulfillTopologyChangePromise(lk);
+    }
+    auto clearStepDownFlag = makeGuard([&] {
+        stdx::lock_guard lk(_mutex);
+        _waitingForRSTLAtStepDown--;
+        _fulfillTopologyChangePromise(lk);
+    });
+
     CurOpFailpointHelpers::waitWhileFailPointEnabled(
         &stepdownHangBeforeRSTLEnqueue, opCtx, "stepdownHangBeforeRSTLEnqueue");
+
+    // To prevent a deadlock between session checkout and RSTL lock taking, disallow new sessions
+    // from being checked out. Existing sessions currently checked out will be killed by the
+    // killOpThread.
+    ScopedBlockSessionCheckouts blockSessions(opCtx);
 
     // Using 'force' sets the default for the wait time to zero, which means the stepdown will
     // fail if it does not acquire the lock immediately. In such a scenario, we use the
@@ -2567,6 +2605,11 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
     auto action = _updateMemberStateFromTopologyCoordinator(lk);
     invariant(action == PostMemberStateUpdateAction::kActionNone);
     invariant(!_readWriteAbility->canAcceptNonLocalWrites(lk));
+
+    // We truly cannot accept writes now, and we've updated the topology version to say so, so
+    // no need for this flag any more, nor to increment the topology version again.
+    _waitingForRSTLAtStepDown--;
+    clearStepDownFlag.dismiss();
 
     auto updateMemberState = [&] {
         invariant(lk.owns_lock());
@@ -2915,7 +2958,8 @@ bool ReplicationCoordinatorImpl::isInPrimaryOrSecondaryState_UNSAFE() const {
 
 bool ReplicationCoordinatorImpl::shouldRelaxIndexConstraints(OperationContext* opCtx,
                                                              const NamespaceString& ns) {
-    if (ReplSettings::shouldRecoverFromOplogAsStandalone()) {
+    if (ReplSettings::shouldRecoverFromOplogAsStandalone() || !recoverToOplogTimestamp.empty() ||
+        tenantMigrationRecipientInfo(opCtx)) {
         return true;
     }
     return !canAcceptWritesFor(opCtx, ns);
@@ -3276,9 +3320,21 @@ Status ReplicationCoordinatorImpl::processReplSetReconfig(OperationContext* opCt
     return doReplSetReconfig(opCtx, getNewConfig, args.force);
 }
 
+Status ReplicationCoordinatorImpl::doOptimizedReconfig(OperationContext* opCtx,
+                                                       GetNewConfigFn getNewConfig) {
+    return _doReplSetReconfig(opCtx, getNewConfig, false /* force */, true /* skipSafetyChecks*/);
+}
+
 Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
                                                      GetNewConfigFn getNewConfig,
                                                      bool force) {
+    return _doReplSetReconfig(opCtx, getNewConfig, force, false /* skipSafetyChecks*/);
+}
+
+Status ReplicationCoordinatorImpl::_doReplSetReconfig(OperationContext* opCtx,
+                                                      GetNewConfigFn getNewConfig,
+                                                      bool force,
+                                                      bool skipSafetyChecks) {
     stdx::unique_lock<Latch> lk(_mutex);
 
     while (_rsConfigState == kConfigPreStart || _rsConfigState == kConfigStartingUp) {
@@ -3309,7 +3365,7 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
 
     invariant(_rsConfig.isInitialized());
 
-    if (!force && !_readWriteAbility->canAcceptNonLocalWrites(lk)) {
+    if (!force && !_readWriteAbility->canAcceptNonLocalWrites(lk) && !skipSafetyChecks) {
         return Status(
             ErrorCodes::NotWritablePrimary,
             str::stream()
@@ -3318,7 +3374,7 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
     }
     auto topCoordTerm = _topCoord->getTerm();
 
-    if (!force) {
+    if (!force && !skipSafetyChecks) {
         // For safety of reconfig, since we must commit a config in our own term before executing a
         // reconfig, so we should never have a config in an older term. If the current config was
         // installed via a force reconfig, we aren't concerned about this safety guarantee.
@@ -3330,7 +3386,7 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
     // Construct a fake OpTime that can be accepted but isn't used.
     OpTime fakeOpTime(Timestamp(1, 1), topCoordTerm);
 
-    if (!force) {
+    if (!force && !skipSafetyChecks) {
         if (!_doneWaitingForReplication_inlock(fakeOpTime, configWriteConcern)) {
             return Status(ErrorCodes::CurrentConfigNotCommittedYet,
                           str::stream()
@@ -3378,7 +3434,7 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
     // So, acquire FCV mutex lock in shared mode to block writers from modifying the fcv document
     // to make sure fcv is not changed between getNewConfig() and storing the new config
     // document locally.
-    FixedFCVRegion fixedFcvRegion(opCtx);
+    boost::optional<FixedFCVRegion> fixedFcvRegion(opCtx);
 
     // Call the callback to get the new config given the old one.
     auto newConfigStatus = getNewConfig(oldConfig, topCoordTerm);
@@ -3391,7 +3447,24 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
     BSONObj newConfigObj = newConfig.toBSON();
     audit::logReplSetReconfig(opCtx->getClient(), &oldConfigObj, &newConfigObj);
 
-    Status validateStatus = validateConfigForReconfig(oldConfig, newConfig, force);
+    // Stepdown can interrupt the setFeatureCompatibilityVersion command after we've transitioned
+    // to the intermediary kUpgrading/kDowngrading state but before the reconfig to change the
+    // 'secondaryDelaySecs' field name. During a subsequent stepup's automatic reconfig, the config
+    // could have an incompatible field name based on the intermediate FCV, but since we must retry
+    // setFeatureCompatibilityVersion until we complete the upgrade/downgrade procedure, the
+    // reconfig to change the delay field name to the correct value will eventually succeed.
+    // Therefore, it is safe for us to skip the FCV compatibility check during the stepup reconfig
+    // to avoid crashing.
+    //
+    // (Generic FCV reference): feature flag support
+    // TODO (SERVER-53354): Remove this check once 5.0 becomes 'lastLTS'.
+    bool skipFCVCompatibilityCheck =
+        serverGlobalParams.featureCompatibility.isUpgradingOrDowngrading() && skipSafetyChecks;
+
+    bool allowSplitHorizonIP = !opCtx->getClient()->hasRemote();
+
+    Status validateStatus = validateConfigForReconfig(
+        oldConfig, newConfig, force, allowSplitHorizonIP, skipFCVCompatibilityCheck);
     if (!validateStatus.isOK()) {
         LOGV2_ERROR(21420,
                     "replSetReconfig got {error} while validating {newConfig}",
@@ -3432,7 +3505,7 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
     // 2) For fcv 4.7+, only if the current config doesn't contain the 'newlyAdded' field but the
     // new config got mutated to append 'newlyAdded' field.
     if (force || !needsFcvLock()) {
-        fixedFcvRegion.release();
+        fixedFcvRegion.reset();
     }
 
     if (MONGO_unlikely(ReconfigHangBeforeConfigValidationCheck.shouldFail())) {
@@ -3466,7 +3539,7 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
           "replSetReconfig config object parses ok",
           "numMembers"_attr = newConfig.getNumMembers());
 
-    if (!force && !MONGO_unlikely(omitConfigQuorumCheck.shouldFail())) {
+    if (!force && !skipSafetyChecks && !MONGO_unlikely(omitConfigQuorumCheck.shouldFail())) {
         LOGV2(4509600, "Executing quorum check for reconfig");
         status =
             checkQuorumForReconfig(_replExecutor.get(), newConfig, myIndex, _topCoord->getTerm());
@@ -3482,14 +3555,20 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
     LOGV2(51814, "Persisting new config to disk");
     {
         Lock::GlobalLock globalLock(opCtx, LockMode::MODE_IX);
-        if (!force && !_readWriteAbility->canAcceptNonLocalWrites(opCtx)) {
+        if (!force && !_readWriteAbility->canAcceptNonLocalWrites(opCtx) && !skipSafetyChecks) {
             return {ErrorCodes::NotWritablePrimary, "Stepped down when persisting new config"};
         }
 
         // Don't write no-op for internal and external force reconfig.
-        // For non-force reconfig, we are guaranteed the node is a writable primary.
+        // For non-force reconfigs with 'skipSafetyChecks' set to false, we are guaranteed that the
+        // node is a writable primary.
+        // When 'skipSafetyChecks' is true, it is possible the node is not yet a writable primary
+        // (eg. in the case where reconfig is called during stepup). In all other cases, we should
+        // still do the no-op write when possible.
         status = _externalState->storeLocalConfigDocument(
-            opCtx, newConfig.toBSON(), !force /* writeOplog */);
+            opCtx,
+            newConfig.toBSON(),
+            !force && _readWriteAbility->canAcceptNonLocalWrites(opCtx) /* writeOplog */);
         if (!status.isOK()) {
             LOGV2_ERROR(21422,
                         "replSetReconfig failed to store config document; {error}",
@@ -3537,6 +3616,11 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
     if (isForceReconfig && _shouldStepDownOnReconfig(lk, newConfig, myIndex)) {
         _topCoord->prepareForUnconditionalStepDown();
         lk.unlock();
+
+        // To prevent a deadlock between session checkout and RSTL lock taking, disallow new
+        // sessions from being checked out. Existing sessions currently checked out will be killed
+        // by the killOpThread.
+        ScopedBlockSessionCheckouts blockSessions(opCtx);
 
         // Primary node won't be electable or removed after the configuration change.
         // So, finish the reconfig under RSTL, so that the step down occurs safely.
@@ -3798,6 +3882,9 @@ Status ReplicationCoordinatorImpl::processReplSetInitiate(OperationContext* opCt
 
     lk.unlock();
 
+    // Initiate FCV in local storage. This will propagate to other nodes via initial sync.
+    FeatureCompatibilityVersion::setIfCleanStartup(opCtx, _storage);
+
     ReplSetConfig newConfig;
     try {
         newConfig = ReplSetConfig::parseForInitiate(configObj, OID::gen());
@@ -4016,9 +4103,11 @@ ReplicationCoordinatorImpl::PostMemberStateUpdateAction
 ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator(WithLock lk) {
     // We want to respond to any waiting hellos even if our current and target state are the
     // same as it is possible writes have been disabled during a stepDown but the primary has yet
-    // to transition to SECONDARY state.
+    // to transition to SECONDARY state.  We do not do so when _waitingForRSTLAtStepDown is true
+    // because in that case we have already said we cannot accept writes in the hello response
+    // and explictly incremented the toplogy version.
     ON_BLOCK_EXIT([&] {
-        if (_rsConfig.isInitialized()) {
+        if (_rsConfig.isInitialized() && !_waitingForRSTLAtStepDown) {
             _fulfillTopologyChangePromise(lk);
         }
     });

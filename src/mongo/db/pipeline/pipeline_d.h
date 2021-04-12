@@ -38,6 +38,8 @@
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
 #include "mongo/db/pipeline/document_source_group.h"
+#include "mongo/db/pipeline/document_source_internal_unpack_bucket.h"
+#include "mongo/db/pipeline/document_source_sample.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/plan_executor.h"
 
@@ -92,7 +94,7 @@ public:
     static std::pair<AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
     buildInnerQueryExecutor(const CollectionPtr& collection,
                             const NamespaceString& nss,
-                            const AggregateCommand* aggRequest,
+                            const AggregateCommandRequest* aggRequest,
                             Pipeline* pipeline);
 
     /**
@@ -114,12 +116,19 @@ public:
      * used when the executor attachment phase doesn't need to be deferred and the $cursor stage
      * can be created right after buiding the executor.
      */
-    static void buildAndAttachInnerQueryExecutorToPipeline(const CollectionPtr& collection,
-                                                           const NamespaceString& nss,
-                                                           const AggregateCommand* aggRequest,
-                                                           Pipeline* pipeline);
+    static void buildAndAttachInnerQueryExecutorToPipeline(
+        const CollectionPtr& collection,
+        const NamespaceString& nss,
+        const AggregateCommandRequest* aggRequest,
+        Pipeline* pipeline);
 
     static Timestamp getLatestOplogTimestamp(const Pipeline* pipeline);
+
+    /**
+     * Retrieves postBatchResumeToken from the 'pipeline' if it is available. Returns an empty
+     * object otherwise.
+     */
+    static BSONObj getPostBatchResumeToken(const Pipeline* pipeline);
 
     /**
      * Resolves the collator to either the user-specified collation or, if none was specified, to
@@ -148,7 +157,7 @@ private:
     static std::pair<AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
     buildInnerQueryExecutorGeneric(const CollectionPtr& collection,
                                    const NamespaceString& nss,
-                                   const AggregateCommand* aggRequest,
+                                   const AggregateCommandRequest* aggRequest,
                                    Pipeline* pipeline);
 
     /**
@@ -159,8 +168,21 @@ private:
     static std::pair<AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
     buildInnerQueryExecutorGeoNear(const CollectionPtr& collection,
                                    const NamespaceString& nss,
-                                   const AggregateCommand* aggRequest,
+                                   const AggregateCommandRequest* aggRequest,
                                    Pipeline* pipeline);
+
+    /**
+     * Build a PlanExecutor and prepare a callback to create a special DocumentSourceSample or a
+     * DocumentSourceInternalUnpackBucket stage that has been rewritten to sample buckets using a
+     * storage engine supplied random cursor if the heuristics used for the optimization allows. If
+     * the optimized $sample plan cannot or should not be produced, returns a null PlanExecutor
+     * pointer.
+     */
+    static std::pair<AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
+    buildInnerQueryExecutorSample(DocumentSourceSample* sampleStage,
+                                  DocumentSourceInternalUnpackBucket* unpackBucketStage,
+                                  const CollectionPtr& collection,
+                                  Pipeline* pipeline);
 
     /**
      * Creates a PlanExecutor to be used in the initial cursor source. This function will try to
@@ -184,7 +206,7 @@ private:
         QueryMetadataBitSet metadataAvailable,
         const BSONObj& queryObj,
         SkipThenLimit skipThenLimit,
-        const AggregateCommand* aggRequest,
+        const AggregateCommandRequest* aggRequest,
         const MatchExpressionParser::AllowedFeatureSet& matcherFeatures,
         bool* hasNoRequirements);
 };

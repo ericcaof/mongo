@@ -31,8 +31,6 @@
 
 #include "mongo/platform/basic.h"
 
-#include <set>
-
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
@@ -43,9 +41,6 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
-#include "mongo/db/s/dist_lock_manager.h"
-#include "mongo/s/catalog/type_database.h"
-#include "mongo/s/catalog_cache.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/scopeguard.h"
 
@@ -113,35 +108,19 @@ public:
         const std::string dbname = parseNs("", cmdObj);
 
         auto shardElem = cmdObj[kShardNameField];
-        ShardId shardId = shardElem.ok() ? ShardId(shardElem.String()) : ShardId();
+        ShardingCatalogManager::get(opCtx)->createDatabase(
+            opCtx,
+            dbname,
+            shardElem.ok() ? boost::optional<ShardId>(shardElem.String())
+                           : boost::optional<ShardId>(),
+            true);
 
-        // If assigned, check that the shardId is valid
-        uassert(ErrorCodes::BadValue,
-                str::stream() << "invalid shard name: " << shardId,
-                !shardElem.ok() || shardId.isValid());
-
-        uassert(
-            ErrorCodes::InvalidNamespace,
-            str::stream() << "invalid db name specified: " << dbname,
-            NamespaceString::validDBName(dbname, NamespaceString::DollarInDbNameBehavior::Allow));
-
-        if (dbname == NamespaceString::kAdminDb || dbname == NamespaceString::kLocalDb) {
-            uasserted(ErrorCodes::InvalidOptions,
-                      str::stream() << "can't shard " + dbname + " database");
-        }
-
-        // Make sure to force update of any stale metadata
-        ON_BLOCK_EXIT([opCtx, dbname] { Grid::get(opCtx)->catalogCache()->purgeDatabase(dbname); });
-
-        auto dbDistLock = uassertStatusOK(DistLockManager::get(opCtx)->lock(
-            opCtx, dbname, "enableSharding", DistLockManager::kDefaultLockTimeout));
-
-        ShardingCatalogManager::get(opCtx)->enableSharding(opCtx, dbname, shardId);
-        audit::logEnableSharding(Client::getCurrent(), dbname);
+        audit::logEnableSharding(opCtx->getClient(), dbname);
 
         return true;
     }
 
 } configsvrEnableShardingCmd;
+
 }  // namespace
 }  // namespace mongo

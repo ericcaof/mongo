@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2020 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -216,8 +216,10 @@ __rec_need_save_upd(
     if (F_ISSET(r, WT_REC_CHECKPOINT) && upd_select->upd == NULL)
         return (false);
 
-    return (!__wt_txn_tw_stop_visible_all(session, &upd_select->tw) &&
-      !__wt_txn_tw_start_visible_all(session, &upd_select->tw));
+    if (WT_TIME_WINDOW_HAS_STOP(&upd_select->tw))
+        return (!__wt_txn_tw_stop_visible_all(session, &upd_select->tw));
+    else
+        return (!__wt_txn_tw_start_visible_all(session, &upd_select->tw));
 }
 
 /*

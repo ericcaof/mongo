@@ -405,46 +405,6 @@ private:
     std::unique_ptr<QuerySolutionNode> _root;
 };
 
-struct TextNode : public QuerySolutionNodeWithSortSet {
-    TextNode(IndexEntry index) : index(std::move(index)) {}
-
-    virtual ~TextNode() {}
-
-    virtual StageType getType() const {
-        return STAGE_TEXT;
-    }
-
-    virtual void appendToString(str::stream* ss, int indent) const;
-
-    // Text's return is LOC_AND_OBJ so it's fetched and has all fields.
-    bool fetched() const {
-        return true;
-    }
-    FieldAvailability getFieldAvailability(const std::string& field) const {
-        return FieldAvailability::kFullyProvided;
-    }
-    bool sortedByDiskLoc() const {
-        return false;
-    }
-
-    QuerySolutionNode* clone() const;
-
-    IndexEntry index;
-    std::unique_ptr<fts::FTSQuery> ftsQuery;
-
-    // The number of fields in the prefix of the text index. For example, if the key pattern is
-    //
-    //   { a: 1, b: 1, _fts: "text", _ftsx: 1, c: 1 }
-    //
-    // then the number of prefix fields is 2, because of "a" and "b".
-    size_t numPrefixFields = 0u;
-
-    // "Prefix" fields of a text index can handle equality predicates.  We group them with the
-    // text node while creating the text leaf node and convert them into a BSONObj index prefix
-    // when we finish the text leaf node.
-    BSONObj indexPrefix;
-};
-
 struct CollectionScanNode : public QuerySolutionNodeWithSortSet {
     CollectionScanNode();
     virtual ~CollectionScanNode() {}
@@ -470,23 +430,20 @@ struct CollectionScanNode : public QuerySolutionNodeWithSortSet {
     // Name of the namespace.
     std::string name;
 
-    // If present, the collection scan will seek directly to the RecordId of an oplog entry as
-    // close to 'minTs' as possible without going higher. Should only be set on forward oplog scans.
-    // This field cannot be used in conjunction with 'resumeAfterRecordId'.
-    boost::optional<Timestamp> minTs;
+    // If present, this parameter sets the start point of a forward scan or the end point of a
+    // reverse scan.
+    boost::optional<RecordId> minRecord;
 
-    // If present the collection scan will stop and return EOF the first time it sees a document
-    // that does not pass the filter and has 'ts' greater than 'maxTs'. Should only be set on
-    // forward oplog scans.
-    // This field cannot be used in conjunction with 'resumeAfterRecordId'.
-    boost::optional<Timestamp> maxTs;
+    // If present, this parameter sets the start point of a reverse scan or the end point of a
+    // forward scan.
+    boost::optional<RecordId> maxRecord;
 
     // If true, the collection scan will return a token that can be used to resume the scan.
     bool requestResumeToken = false;
 
     // If present, the collection scan will seek to the exact RecordId, or return KeyNotFound if it
     // does not exist. Must only be set on forward collection scans.
-    // This field cannot be used in conjunction with 'minTs' or 'maxTs'.
+    // This field cannot be used in conjunction with 'minRecord' or 'maxRecord'.
     boost::optional<RecordId> resumeAfterRecordId;
 
     // Should we make a tailable cursor?
@@ -497,8 +454,8 @@ struct CollectionScanNode : public QuerySolutionNodeWithSortSet {
     // across a sharded cluster.
     bool shouldTrackLatestOplogTimestamp = false;
 
-    // Should we assert that the specified minTS has not fallen off the oplog?
-    bool assertMinTsHasNotFallenOffOplog = false;
+    // Assert that the specified timestamp has not fallen off the oplog.
+    boost::optional<Timestamp> assertTsHasNotFallenOffOplog = boost::none;
 
     int direction{1};
 
@@ -515,8 +472,12 @@ struct CollectionScanNode : public QuerySolutionNodeWithSortSet {
  * collection or an index scan in memory by using a backing vector of BSONArray.
  */
 struct VirtualScanNode : public QuerySolutionNodeWithSortSet {
-    VirtualScanNode(std::vector<BSONArray> docs, bool hasRecordId);
-    virtual ~VirtualScanNode() {}
+    enum class ScanType { kCollScan, kIxscan };
+
+    VirtualScanNode(std::vector<BSONArray> docs,
+                    ScanType scanType,
+                    bool hasRecordId,
+                    BSONObj indexKeyPattern = {});
 
     virtual StageType getType() const {
         return STAGE_VIRTUAL_SCAN;
@@ -525,10 +486,15 @@ struct VirtualScanNode : public QuerySolutionNodeWithSortSet {
     virtual void appendToString(str::stream* ss, int indent) const;
 
     bool fetched() const {
-        return true;
+        return scanType == ScanType::kCollScan;
     }
     FieldAvailability getFieldAvailability(const std::string& field) const {
-        return FieldAvailability::kFullyProvided;
+        if (scanType == ScanType::kCollScan) {
+            return FieldAvailability::kFullyProvided;
+        } else {
+            return indexKeyPattern.hasField(field) ? FieldAvailability::kFullyProvided
+                                                   : FieldAvailability::kNotProvided;
+        }
     }
     bool sortedByDiskLoc() const {
         return false;
@@ -547,11 +513,17 @@ struct VirtualScanNode : public QuerySolutionNodeWithSortSet {
     // BSONObj in the first position of the array.
     std::vector<BSONArray> docs;
 
+    // Indicates whether the scan is mimicking a collection scan or index scan.
+    const ScanType scanType;
+
     // A flag to indicate the format of the BSONArray document payload in the above vector, docs. If
     // hasRecordId is set to true, then both a RecordId and a BSONObj document are stored in that
     // order for every BSONArray in docs. Otherwise, the RecordId is omitted and the BSONArray will
     // only carry a BSONObj document.
     bool hasRecordId;
+
+    // Set when 'scanType' is 'kIxscan'.
+    BSONObj indexKeyPattern;
 };
 
 struct AndHashNode : public QuerySolutionNode {
@@ -648,7 +620,8 @@ struct MergeSortNode : public QuerySolutionNodeWithSortSet {
 };
 
 struct FetchNode : public QuerySolutionNode {
-    FetchNode();
+    FetchNode() {}
+    FetchNode(std::unique_ptr<QuerySolutionNode> child) : QuerySolutionNode(std::move(child)) {}
     virtual ~FetchNode() {}
 
     virtual StageType getType() const {
@@ -1266,4 +1239,58 @@ struct EofNode : public QuerySolutionNodeWithSortSet {
 
     QuerySolutionNode* clone() const;
 };
+
+struct TextOrNode : public OrNode {
+    TextOrNode() {}
+
+    StageType getType() const override {
+        return STAGE_TEXT_OR;
+    }
+
+    void appendToString(str::stream* ss, int indent) const override;
+    QuerySolutionNode* clone() const override;
+};
+
+struct TextMatchNode : public QuerySolutionNodeWithSortSet {
+    TextMatchNode(IndexEntry index, std::unique_ptr<fts::FTSQuery> ftsQuery, bool wantTextScore)
+        : index(std::move(index)), ftsQuery(std::move(ftsQuery)), wantTextScore(wantTextScore) {}
+
+    StageType getType() const override {
+        return STAGE_TEXT_MATCH;
+    }
+
+    void appendToString(str::stream* ss, int indent) const override;
+
+    // Text's return is LOC_AND_OBJ so it's fetched and has all fields.
+    bool fetched() const {
+        return true;
+    }
+    FieldAvailability getFieldAvailability(const std::string& field) const {
+        return FieldAvailability::kFullyProvided;
+    }
+    bool sortedByDiskLoc() const override {
+        return false;
+    }
+
+    QuerySolutionNode* clone() const override;
+
+    IndexEntry index;
+    std::unique_ptr<fts::FTSQuery> ftsQuery;
+
+    // The number of fields in the prefix of the text index. For example, if the key pattern is
+    //
+    //   { a: 1, b: 1, _fts: "text", _ftsx: 1, c: 1 }
+    //
+    // then the number of prefix fields is 2, because of "a" and "b".
+    size_t numPrefixFields = 0u;
+
+    // "Prefix" fields of a text index can handle equality predicates.  We group them with the
+    // text node while creating the text leaf node and convert them into a BSONObj index prefix
+    // when we finish the text leaf node.
+    BSONObj indexPrefix;
+
+    // True, if we need to compute text scores.
+    bool wantTextScore;
+};
+
 }  // namespace mongo

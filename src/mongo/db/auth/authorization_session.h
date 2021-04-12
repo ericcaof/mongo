@@ -43,12 +43,11 @@
 #include "mongo/db/auth/user_set.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/ops/write_ops_parsers.h"
-#include "mongo/db/pipeline/aggregate_command_gen.h"
 
 namespace mongo {
 
 class Client;
+class AuthorizationContract;
 
 /**
  * Contains all the authorization logic for a single client connection.  It contains a set of
@@ -138,6 +137,11 @@ public:
     virtual void startRequest(OperationContext* opCtx) = 0;
 
     /**
+     * Start tracking permissions and privileges in the authorization contract.
+     */
+    virtual void startContractTracking() = 0;
+
+    /**
      * Adds the User identified by "UserName" to the authorization session, acquiring privileges
      * for it in the process.
      */
@@ -153,6 +157,9 @@ public:
     // multiple users are authenticated, this method will throw an exception.
     virtual User* getSingleUser() = 0;
 
+    // Is auth disabled? Returns true if auth is disabled.
+    virtual bool shouldIgnoreAuthChecks() = 0;
+
     // Is authenticated as at least one user.
     virtual bool isAuthenticated() = 0;
 
@@ -162,83 +169,20 @@ public:
     // Gets an iterator over the roles of all authenticated users stored in this manager.
     virtual RoleNameIterator getAuthenticatedRoleNames() = 0;
 
+    // Removes any authenticated principals and revokes any privileges that were granted via those
+    // principals. This function modifies state. Synchronizes with the Client lock.
+    virtual void logoutAllDatabases(Client* client, StringData reason) = 0;
+
     // Removes any authenticated principals whose authorization credentials came from the given
     // database, and revokes any privileges that were granted via that principal. This function
     // modifies state. Synchronizes with the Client lock.
-    virtual void logoutDatabase(OperationContext* opCtx, StringData dbname) = 0;
+    virtual void logoutDatabase(Client* client, StringData dbname, StringData reason) = 0;
 
     // Adds the internalSecurity user to the set of authenticated users.
     // Used to grant internal threads full access. Takes in the Client
     // as a parameter so it can take out a lock on the client.
     virtual void grantInternalAuthorization(Client* client) = 0;
     virtual void grantInternalAuthorization(OperationContext* opCtx) = 0;
-
-    // Generates a vector of default privileges that are granted to any user,
-    // regardless of which roles that user does or does not possess.
-    // If localhost exception is active, the permissions include the ability to create
-    // the first user and the ability to run the commands needed to bootstrap the system
-    // into a state where the first user can be created.
-    virtual PrivilegeVector getDefaultPrivileges() = 0;
-
-    // Checks if this connection has the privileges necessary to perform a find operation
-    // on the supplied namespace identifier.
-    virtual Status checkAuthForFind(const NamespaceString& ns, bool hasTerm) = 0;
-
-    // Checks if this connection has the privileges necessary to perform a getMore operation on
-    // the identified cursor, supposing that cursor is associated with the supplied namespace
-    // identifier.
-    virtual Status checkAuthForGetMore(const NamespaceString& ns,
-                                       long long cursorID,
-                                       bool hasTerm) = 0;
-
-    // Checks if this connection has the privileges necessary to perform the given update on the
-    // given namespace.
-    virtual Status checkAuthForUpdate(OperationContext* opCtx,
-                                      const NamespaceString& ns,
-                                      const BSONObj& query,
-                                      const write_ops::UpdateModification& update,
-                                      bool upsert) = 0;
-
-    // Checks if this connection has the privileges necessary to insert to the given namespace.
-    virtual Status checkAuthForInsert(OperationContext* opCtx, const NamespaceString& ns) = 0;
-
-    // Checks if this connection has the privileges necessary to perform a delete on the given
-    // namespace.
-    virtual Status checkAuthForDelete(OperationContext* opCtx,
-                                      const NamespaceString& ns,
-                                      const BSONObj& query) = 0;
-
-    // Checks if this connection has the privileges necessary to perform a killCursor on
-    // the identified cursor, supposing that cursor is associated with the supplied namespace
-    // identifier.
-    virtual Status checkAuthForKillCursors(const NamespaceString& cursorNss,
-                                           UserNameIterator cursorOwner) = 0;
-
-    // Attempts to get the privileges necessary to run the aggregation pipeline specified in
-    // 'request' on the namespace 'ns' either directly on mongoD or via mongoS.
-    virtual StatusWith<PrivilegeVector> getPrivilegesForAggregate(const NamespaceString& ns,
-                                                                  const AggregateCommand& request,
-                                                                  bool isMongos) = 0;
-
-    // Checks if this connection has the privileges necessary to create 'ns' with the options
-    // supplied in 'cmdObj' either directly on mongoD or via mongoS.
-    virtual Status checkAuthForCreate(const NamespaceString& ns,
-                                      const BSONObj& cmdObj,
-                                      bool isMongos) = 0;
-
-    // Checks if this connection has the privileges necessary to modify 'ns' with the options
-    // supplied in 'cmdObj' either directly on mongoD or via mongoS.
-    virtual Status checkAuthForCollMod(const NamespaceString& ns,
-                                       const BSONObj& cmdObj,
-                                       bool isMongos) = 0;
-
-    // Checks if this connection has the privileges necessary to grant the given privilege
-    // to a role.
-    virtual Status checkAuthorizedToGrantPrivilege(const Privilege& privilege) = 0;
-
-    // Checks if this connection has the privileges necessary to revoke the given privilege
-    // from a role.
-    virtual Status checkAuthorizedToRevokePrivilege(const Privilege& privilege) = 0;
 
     // Checks if the current session is authorized to list the collections in the given
     // database. If it is, return a privilegeVector containing the privileges used to authorize
@@ -253,28 +197,16 @@ public:
     // given BSONElement.
     virtual bool isAuthorizedToParseNamespaceElement(const BSONElement& elem) = 0;
 
+    // Checks if this connection has the privileges necessary to parse a namespace from a
+    // given NamespaceOrUUID object.
+    virtual bool isAuthorizedToParseNamespaceElement(const NamespaceStringOrUUID& nss) = 0;
+
     // Checks if this connection has the privileges necessary to create a new role
     virtual bool isAuthorizedToCreateRole(const RoleName& roleName) = 0;
-
-    // Utility function for isAuthorizedForActionsOnResource(
-    //         ResourcePattern::forDatabaseName(role.getDB()), ActionType::grantAnyRole)
-    virtual bool isAuthorizedToGrantRole(const RoleName& role) = 0;
-
-    // Utility function for isAuthorizedForActionsOnResource(
-    //         ResourcePattern::forDatabaseName(role.getDB()), ActionType::grantAnyRole)
-    virtual bool isAuthorizedToRevokeRole(const RoleName& role) = 0;
 
     // Utility function for isAuthorizedToChangeOwnPasswordAsUser and
     // isAuthorizedToChangeOwnCustomDataAsUser
     virtual bool isAuthorizedToChangeAsUser(const UserName& userName, ActionType actionType) = 0;
-
-    // Returns true if the current session is authenticated as the given user and that user
-    // is allowed to change his/her own password
-    virtual bool isAuthorizedToChangeOwnPasswordAsUser(const UserName& userName) = 0;
-
-    // Returns true if the current session is authenticated as the given user and that user
-    // is allowed to change his/her own customData.
-    virtual bool isAuthorizedToChangeOwnCustomDataAsUser(const UserName& userName) = 0;
 
     // Returns true if any of the authenticated users on this session have the given role.
     // NOTE: this does not refresh any of the users even if they are marked as invalid.
@@ -317,8 +249,8 @@ public:
 
     // Replaces the data for users that a system user is impersonating with new data.
     // The auditing system adds these users and their roles to each audit record in the log.
-    virtual void setImpersonatedUserData(std::vector<UserName> usernames,
-                                         std::vector<RoleName> roles) = 0;
+    virtual void setImpersonatedUserData(const std::vector<UserName>& usernames,
+                                         const std::vector<RoleName>& roles) = 0;
 
     // Gets an iterator over the names of all users that the system user is impersonating.
     virtual UserNameIterator getImpersonatedUserNames() = 0;
@@ -356,6 +288,9 @@ public:
     // nature of session inaccessibility when the session is not accessible.
     virtual Status checkCursorSessionPrivilege(
         OperationContext* const opCtx, boost::optional<LogicalSessionId> cursorSessionId) = 0;
+
+    // Verify the authorization contract. If contract == nullptr, no check is performed.
+    virtual void verifyContract(const AuthorizationContract* contract) const = 0;
 
 protected:
     virtual std::tuple<std::vector<UserName>*, std::vector<RoleName>*> _getImpersonations() = 0;

@@ -1,11 +1,11 @@
 // Test parsing of readConcern level 'snapshot' and the presence of the 'atClusterTime' field in
 // snapshot cursor responses on mongos.
 // @tags: [
-//    requires_persistence,
-//    requires_replication,
-//    requires_sharding,
-//    uses_atclustertime,
-//    uses_transactions,
+//   requires_persistence,
+//   requires_replication,
+//   requires_sharding,
+//   uses_atclustertime,
+//   uses_transactions,
 // ]
 (function() {
 "use strict";

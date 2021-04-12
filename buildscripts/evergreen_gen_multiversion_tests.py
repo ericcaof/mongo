@@ -16,8 +16,8 @@ import requests
 import click
 import structlog
 
-from evergreen.api import RetryingEvergreenApi, EvergreenApi
 from shrub.v2 import ShrubProject, FunctionCall, Task, TaskDependency, BuildVariant, ExistingTask
+from evergreen.api import RetryingEvergreenApi, EvergreenApi
 
 from buildscripts.resmokelib.multiversionconstants import (LAST_LTS_MONGO_BINARY, REQUIRES_FCV_TAG)
 import buildscripts.util.taskname as taskname
@@ -93,7 +93,6 @@ def get_backports_required_last_lts_hash(task_path_suffix: str):
     """Parse the last-lts shell binary to get the commit hash."""
     last_lts_shell_exec = os.path.join(task_path_suffix, LAST_LTS_MONGO_BINARY)
     shell_version = check_output([last_lts_shell_exec, "--version"]).decode('utf-8')
-    last_lts_commit_hash = ""
     for line in shell_version.splitlines():
         if "gitVersion" in line:
             version_line = line.split(':')[1]
@@ -183,7 +182,7 @@ class EvergreenMultiversionConfigGenerator(object):
             FunctionCall("run generated tests", run_tests_vars),
         ]
 
-        return Task(sub_task_name, commands, {TaskDependency("compile")})
+        return Task(sub_task_name, commands, {TaskDependency("archive_dist_test_debug")})
 
     def _generate_burn_in_execution_tasks(self, version_configs: List[str], suites: List[Suite],
                                           burn_in_test: str, burn_in_idx: int,

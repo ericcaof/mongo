@@ -36,6 +36,8 @@
 #include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/window_function/window_function_expression.h"
+#include "mongo/db/pipeline/window_function/window_function_stddev.h"
 
 namespace mongo {
 using boost::intrusive_ptr;
@@ -44,6 +46,8 @@ REGISTER_ACCUMULATOR(stdDevPop, genericParseSingleExpressionAccumulator<Accumula
 REGISTER_ACCUMULATOR(stdDevSamp, genericParseSingleExpressionAccumulator<AccumulatorStdDevSamp>);
 REGISTER_EXPRESSION(stdDevPop, ExpressionFromAccumulator<AccumulatorStdDevPop>::parse);
 REGISTER_EXPRESSION(stdDevSamp, ExpressionFromAccumulator<AccumulatorStdDevSamp>::parse);
+REGISTER_REMOVABLE_WINDOW_FUNCTION(stdDevPop, AccumulatorStdDevPop, WindowFunctionStdDevPop);
+REGISTER_REMOVABLE_WINDOW_FUNCTION(stdDevSamp, AccumulatorStdDevSamp, WindowFunctionStdDevSamp);
 
 const char* AccumulatorStdDev::getOpName() const {
     return (_isSamp ? "$stdDevSamp" : "$stdDevPop");
@@ -58,7 +62,7 @@ void AccumulatorStdDev::processInternal(const Value& input, bool merging) {
         const double val = input.getDouble();
 
         // This is an implementation of the following algorithm:
-        // http://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Online_algorithm
+        // https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_online_algorithm
         _count += 1;
         const double delta = val - _mean;
         if (delta != 0.0) {

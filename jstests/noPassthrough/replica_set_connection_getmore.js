@@ -1,7 +1,9 @@
 /**
  * Tests the behavior of how getMore operations are routed by the mongo shell when using a replica
  * set connection and cursors are established on a secondary.
- * @tags: [requires_replication]
+ * @tags: [
+ *   requires_replication,
+ * ]
  */
 (function() {
 "use strict";

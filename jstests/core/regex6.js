@@ -3,7 +3,6 @@
 // change depending on whether/how many documents are filtered out by the SHARDING_FILTER stage.
 // @tags: [
 //   assumes_unsharded_collection,
-//   sbe_incompatible,
 // ]
 t = db.regex6;
 t.drop();

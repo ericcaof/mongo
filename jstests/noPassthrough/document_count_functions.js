@@ -1,5 +1,7 @@
 /**
- * @tags: [requires_fastcount]
+ * @tags: [
+ *   requires_fastcount,
+ * ]
  * Tests the countDocuments and estimatedDocumentCount commands.
  */
 (function() {

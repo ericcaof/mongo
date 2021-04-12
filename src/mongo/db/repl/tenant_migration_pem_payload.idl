@@ -37,14 +37,15 @@ structs:
     TenantMigrationPEMPayload:
         description: "Contains SSL certificate and private key PEM blobs for a replica set."
         strict: true
+        generate_comparison_operators: true
         fields:
             certificate:
                 type: string
                 description: "Certificate PEM blob."
                 validator:
-                    callback: "validateCertificatePEMPayload"
+                    callback: "tenant_migration_util::validateCertificatePEMPayload"
             privateKey:
                 type: string
                 description: "Private key PEM blob."
                 validator:
-                    callback: "validatePrivateKeyPEMPayload"
+                    callback: "tenant_migration_util::validatePrivateKeyPEMPayload"

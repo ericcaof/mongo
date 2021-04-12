@@ -1,7 +1,9 @@
 /**
  * Confirms that background index builds on a primary are aborted when the node steps down between
  * scheduling on the thread pool and initialization.
- * @tags: [requires_replication]
+ * @tags: [
+ *   requires_replication,
+ * ]
  */
 (function() {
 "use strict";

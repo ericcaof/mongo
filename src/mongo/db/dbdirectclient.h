@@ -33,6 +33,7 @@
 #include "mongo/config.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/db/ops/write_ops.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
@@ -46,18 +47,13 @@ class OperationContext;
  *
  * All operations are performed within the scope of a passed-in OperationContext (except when
  * using the deprecated constructor). You must ensure that the OperationContext is valid when
- * calling into any function. If you ever need to change the OperationContext, that can be done
- * without the overhead of creating a new DBDirectClient by calling setOpCtx(), after which all
- * operations will use the new OperationContext.
+ * calling into any function.
  */
 class DBDirectClient : public DBClientBase {
 public:
     DBDirectClient(OperationContext* opCtx);
 
     using DBClientBase::query;
-
-    // XXX: is this valid or useful?
-    void setOpCtx(OperationContext* opCtx);
 
     virtual std::unique_ptr<DBClientCursor> query(
         const NamespaceStringOrUUID& nsOrUuid,
@@ -68,6 +64,9 @@ public:
         int queryOptions = 0,
         int batchSize = 0,
         boost::optional<BSONObj> readConcernObj = boost::none);
+
+    write_ops::FindAndModifyCommandReply findAndModify(
+        const write_ops::FindAndModifyCommandRequest& findAndModify);
 
     virtual bool isFailed() const;
 

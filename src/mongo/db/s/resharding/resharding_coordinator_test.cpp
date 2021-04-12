@@ -85,13 +85,12 @@ protected:
     ReshardingCoordinatorDocument makeCoordinatorDoc(
         CoordinatorStateEnum state, boost::optional<Timestamp> fetchTimestamp = boost::none) {
         CommonReshardingMetadata meta(
-            _reshardingUUID, _originalNss, UUID::gen(), _newShardKey.toBSON());
-        ReshardingCoordinatorDocument doc(_tempNss,
-                                          state,
-                                          {DonorShardEntry(ShardId("shard0000"))},
-                                          {RecipientShardEntry(ShardId("shard0001"))});
+            _reshardingUUID, _originalNss, UUID::gen(), _tempNss, _newShardKey.toBSON());
+        ReshardingCoordinatorDocument doc(state,
+                                          {DonorShardEntry(ShardId("shard0000"), {})},
+                                          {RecipientShardEntry(ShardId("shard0001"), {})});
         doc.setCommonReshardingMetadata(meta);
-        emplaceFetchTimestampIfExists(doc, std::move(fetchTimestamp));
+        emplaceCloneTimestampIfExists(doc, std::move(fetchTimestamp));
         return doc;
     }
 
@@ -102,7 +101,7 @@ protected:
         Date_t lastUpdated) {
         UUID uuid = UUID::gen();
         BSONObj shardKey;
-        if (coordinatorDoc.getState() >= CoordinatorStateEnum::kCommitted &&
+        if (coordinatorDoc.getState() >= CoordinatorStateEnum::kDecisionPersisted &&
             coordinatorDoc.getState() != CoordinatorStateEnum::kError) {
             uuid = _reshardingUUID;
             shardKey = _newShardKey.toBSON();
@@ -112,7 +111,7 @@ protected:
         }
 
         CollectionType collType(
-            coordinatorDoc.getNss(), std::move(epoch), lastUpdated, std::move(uuid));
+            coordinatorDoc.getSourceNss(), std::move(epoch), lastUpdated, std::move(uuid));
         collType.setKeyPattern(shardKey);
         collType.setUnique(false);
         if (reshardingFields)
@@ -138,7 +137,7 @@ protected:
         // Only the chunk corresponding to shard0000 is stored as a donor in the coordinator state
         // document constructed.
         auto donorChunk = chunks[0];
-        insertChunkAndZoneEntries({donorChunk}, {});
+        insertChunkAndZoneEntries(chunks, {});
         return donorChunk;
     }
 
@@ -167,6 +166,7 @@ protected:
         ChunkVersion version(1, 0, epoch, boost::none /* timestamp */);
         ChunkType chunk1(nss, chunkRanges[0], version, ShardId("shard0000"));
         chunk1.setName(ids[0]);
+        version.incMinor();
         ChunkType chunk2(nss, chunkRanges[1], version, ShardId("shard0001"));
         chunk2.setName(ids[1]);
 
@@ -195,10 +195,12 @@ protected:
         client.insert(NamespaceString::kConfigReshardingOperationsNamespace.ns(),
                       coordinatorDoc.toBSON());
 
-        TypeCollectionReshardingFields reshardingFields(coordinatorDoc.get_id());
+        TypeCollectionReshardingFields reshardingFields(coordinatorDoc.getReshardingUUID());
         reshardingFields.setState(coordinatorDoc.getState());
-        reshardingFields.setDonorFields(
-            TypeCollectionDonorFields(coordinatorDoc.getReshardingKey()));
+        reshardingFields.setDonorFields(TypeCollectionDonorFields(
+            coordinatorDoc.getTempReshardingNss(),
+            coordinatorDoc.getReshardingKey(),
+            extractShardIdsFromParticipantEntries(coordinatorDoc.getRecipientShards())));
 
         auto originalNssCatalogEntry = makeOriginalCollectionCatalogEntry(
             coordinatorDoc,
@@ -234,24 +236,44 @@ protected:
         OperationContext* opCtx, ReshardingCoordinatorDocument expectedCoordinatorDoc) {
         DBDirectClient client(opCtx);
         auto doc = client.findOne(NamespaceString::kConfigReshardingOperationsNamespace.ns(),
-                                  Query(BSON("nss" << expectedCoordinatorDoc.getNss().ns())));
+                                  Query(BSON("ns" << expectedCoordinatorDoc.getSourceNss().ns())));
 
         auto coordinatorDoc = ReshardingCoordinatorDocument::parse(
             IDLParserErrorContext("ReshardingCoordinatorTest"), doc);
 
-        ASSERT_EQUALS(coordinatorDoc.get_id(), expectedCoordinatorDoc.get_id());
-        ASSERT_EQUALS(coordinatorDoc.getNss(), expectedCoordinatorDoc.getNss());
+        ASSERT_EQUALS(coordinatorDoc.getReshardingUUID(),
+                      expectedCoordinatorDoc.getReshardingUUID());
+        ASSERT_EQUALS(coordinatorDoc.getSourceNss(), expectedCoordinatorDoc.getSourceNss());
         ASSERT_EQUALS(coordinatorDoc.getTempReshardingNss(),
                       expectedCoordinatorDoc.getTempReshardingNss());
         ASSERT_EQUALS(coordinatorDoc.getReshardingKey().toBSON().woCompare(
                           expectedCoordinatorDoc.getReshardingKey().toBSON()),
                       0);
         ASSERT(coordinatorDoc.getState() == expectedCoordinatorDoc.getState());
-        if (expectedCoordinatorDoc.getFetchTimestamp()) {
-            ASSERT_EQUALS(coordinatorDoc.getFetchTimestamp().get(),
-                          expectedCoordinatorDoc.getFetchTimestamp().get());
+        ASSERT(coordinatorDoc.getActive());
+        if (expectedCoordinatorDoc.getCloneTimestamp()) {
+            ASSERT(coordinatorDoc.getCloneTimestamp());
+            ASSERT_EQUALS(coordinatorDoc.getCloneTimestamp().get(),
+                          expectedCoordinatorDoc.getCloneTimestamp().get());
         } else {
-            ASSERT(!coordinatorDoc.getFetchTimestamp());
+            ASSERT(!coordinatorDoc.getCloneTimestamp());
+        }
+
+        // Confirm the (non)existence of the CoordinatorDocument abortReason.
+        if (expectedCoordinatorDoc.getAbortReason()) {
+            ASSERT(coordinatorDoc.getAbortReason());
+            ASSERT_BSONOBJ_EQ(coordinatorDoc.getAbortReason().get(),
+                              expectedCoordinatorDoc.getAbortReason().get());
+        } else {
+            ASSERT(!coordinatorDoc.getAbortReason());
+        }
+
+        if (!expectedCoordinatorDoc.getPresetReshardedChunks()) {
+            ASSERT(!coordinatorDoc.getPresetReshardedChunks());
+        }
+
+        if (!expectedCoordinatorDoc.getZones()) {
+            ASSERT(!coordinatorDoc.getZones());
         }
 
         auto expectedDonorShards = expectedCoordinatorDoc.getDonorShards();
@@ -264,14 +286,14 @@ protected:
                              onDiskDonorShards.end(),
                              [shardId](DonorShardEntry d) { return d.getId() == shardId; });
             ASSERT(onDiskIt != onDiskDonorShards.end());
-            if (it->getMinFetchTimestamp()) {
-                ASSERT(onDiskIt->getMinFetchTimestamp());
-                ASSERT_EQUALS(onDiskIt->getMinFetchTimestamp().get(),
-                              it->getMinFetchTimestamp().get());
+            if (it->getMutableState().getMinFetchTimestamp()) {
+                ASSERT(onDiskIt->getMutableState().getMinFetchTimestamp());
+                ASSERT_EQUALS(onDiskIt->getMutableState().getMinFetchTimestamp().get(),
+                              it->getMutableState().getMinFetchTimestamp().get());
             } else {
-                ASSERT(!onDiskIt->getMinFetchTimestamp());
+                ASSERT(!onDiskIt->getMutableState().getMinFetchTimestamp());
             }
-            ASSERT(onDiskIt->getState() == it->getState());
+            ASSERT(onDiskIt->getMutableState().getState() == it->getMutableState().getState());
         }
 
         auto expectedRecipientShards = expectedCoordinatorDoc.getRecipientShards();
@@ -284,14 +306,7 @@ protected:
                              onDiskRecipientShards.end(),
                              [shardId](RecipientShardEntry r) { return r.getId() == shardId; });
             ASSERT(onDiskIt != onDiskRecipientShards.end());
-            if (it->getStrictConsistencyTimestamp()) {
-                ASSERT(onDiskIt->getStrictConsistencyTimestamp());
-                ASSERT_EQUALS(onDiskIt->getStrictConsistencyTimestamp().get(),
-                              it->getStrictConsistencyTimestamp().get());
-            } else {
-                ASSERT(!onDiskIt->getStrictConsistencyTimestamp());
-            }
-            ASSERT(onDiskIt->getState() == it->getState());
+            ASSERT(onDiskIt->getMutableState().getState() == it->getMutableState().getState());
         }
     }
 
@@ -311,7 +326,7 @@ protected:
         auto expectedCoordinatorState = expectedCoordinatorDoc.getState();
         if (expectedCoordinatorState == CoordinatorStateEnum::kDone ||
             (expectedReshardingFields &&
-             expectedReshardingFields->getState() >= CoordinatorStateEnum::kCommitted &&
+             expectedReshardingFields->getState() >= CoordinatorStateEnum::kDecisionPersisted &&
              expectedReshardingFields->getState() != CoordinatorStateEnum::kError)) {
             ASSERT_EQUALS(onDiskEntry.getNss(), _originalNss);
             ASSERT(onDiskEntry.getUuid() == _reshardingUUID);
@@ -324,7 +339,8 @@ protected:
 
         ASSERT(onDiskEntry.getReshardingFields());
         auto onDiskReshardingFields = onDiskEntry.getReshardingFields().get();
-        ASSERT(onDiskReshardingFields.getUuid() == expectedReshardingFields->getUuid());
+        ASSERT(onDiskReshardingFields.getReshardingUUID() ==
+               expectedReshardingFields->getReshardingUUID());
         ASSERT(onDiskReshardingFields.getState() == expectedReshardingFields->getState());
 
         ASSERT(onDiskReshardingFields.getDonorFields());
@@ -333,11 +349,17 @@ protected:
                 expectedReshardingFields->getDonorFields()->getReshardingKey().toBSON()),
             0);
 
+        if (auto expectedAbortReason = expectedCoordinatorDoc.getAbortReason()) {
+            ASSERT(onDiskReshardingFields.getAbortReason());
+            ASSERT_BSONOBJ_EQ(expectedAbortReason.get(),
+                              onDiskReshardingFields.getAbortReason().get());
+        }
+
         // Check the reshardingFields.recipientFields.
         if (expectedCoordinatorState != CoordinatorStateEnum::kError) {
             // Don't bother checking the recipientFields if the coordinator state is already kError.
-            if (expectedCoordinatorState < CoordinatorStateEnum::kCommitted) {
-                // Until CoordinatorStateEnum::kCommitted, recipientsFields only live on the
+            if (expectedCoordinatorState < CoordinatorStateEnum::kDecisionPersisted) {
+                // Until CoordinatorStateEnum::kDecisionPersisted, recipientsFields only live on the
                 // temporaryNss entry in config.collections.
                 ASSERT(!onDiskReshardingFields.getRecipientFields());
             } else {
@@ -368,19 +390,25 @@ protected:
         ASSERT(onDiskEntry.getReshardingFields());
 
         auto onDiskReshardingFields = onDiskEntry.getReshardingFields().get();
-        ASSERT_EQUALS(onDiskReshardingFields.getUuid(), expectedReshardingFields.getUuid());
+        ASSERT_EQUALS(onDiskReshardingFields.getReshardingUUID(),
+                      expectedReshardingFields.getReshardingUUID());
         ASSERT(onDiskReshardingFields.getState() == expectedReshardingFields.getState());
 
         ASSERT(onDiskReshardingFields.getRecipientFields());
-        ASSERT_EQUALS(onDiskReshardingFields.getRecipientFields()->getOriginalNamespace(),
-                      expectedReshardingFields.getRecipientFields()->getOriginalNamespace());
+        ASSERT_EQUALS(onDiskReshardingFields.getRecipientFields()->getSourceNss(),
+                      expectedReshardingFields.getRecipientFields()->getSourceNss());
 
-        if (expectedReshardingFields.getRecipientFields()->getFetchTimestamp()) {
-            ASSERT(onDiskReshardingFields.getRecipientFields()->getFetchTimestamp());
-            ASSERT_EQUALS(onDiskReshardingFields.getRecipientFields()->getFetchTimestamp().get(),
-                          expectedReshardingFields.getRecipientFields()->getFetchTimestamp().get());
+        if (expectedReshardingFields.getRecipientFields()->getCloneTimestamp()) {
+            ASSERT(onDiskReshardingFields.getRecipientFields()->getCloneTimestamp());
+            ASSERT_EQUALS(onDiskReshardingFields.getRecipientFields()->getCloneTimestamp().get(),
+                          expectedReshardingFields.getRecipientFields()->getCloneTimestamp().get());
         } else {
-            ASSERT(!onDiskReshardingFields.getRecipientFields()->getFetchTimestamp());
+            ASSERT(!onDiskReshardingFields.getRecipientFields()->getCloneTimestamp());
+        }
+
+        if (onDiskReshardingFields.getState() == CoordinatorStateEnum::kError) {
+            // Confirm 'reshardingFields.abortReason' exists on the temporary collection.
+            ASSERT(onDiskReshardingFields.getAbortReason());
         }
 
         // 'donorFields' should not exist for the temporary collection.
@@ -441,23 +469,33 @@ protected:
 
         // Check the resharding fields and allowMigrations in the config.collections entry for the
         // original collection
-        TypeCollectionReshardingFields originalReshardingFields(expectedCoordinatorDoc.get_id());
-        originalReshardingFields.setState(expectedCoordinatorDoc.getState());
-        TypeCollectionDonorFields donorField(expectedCoordinatorDoc.getReshardingKey());
-        originalReshardingFields.setDonorFields(donorField);
+        TypeCollectionReshardingFields expectedReshardingFields(
+            expectedCoordinatorDoc.getReshardingUUID());
+        expectedReshardingFields.setState(expectedCoordinatorDoc.getState());
+        TypeCollectionDonorFields donorField(
+            expectedCoordinatorDoc.getTempReshardingNss(),
+            expectedCoordinatorDoc.getReshardingKey(),
+            extractShardIdsFromParticipantEntries(expectedCoordinatorDoc.getRecipientShards()));
+        expectedReshardingFields.setDonorFields(donorField);
+        if (auto abortReason = expectedCoordinatorDoc.getAbortReason()) {
+            AbortReason abortReasonStruct;
+            abortReasonStruct.setAbortReason(abortReason);
+            expectedReshardingFields.setAbortReasonStruct(std::move(abortReasonStruct));
+        }
+
         auto expectedOriginalCollType = makeOriginalCollectionCatalogEntry(
             expectedCoordinatorDoc,
-            originalReshardingFields,
+            expectedReshardingFields,
             std::move(collectionEpoch),
             opCtx->getServiceContext()->getPreciseClockSource()->now());
         assertOriginalCollectionCatalogEntryMatchesExpected(
             opCtx, expectedOriginalCollType, expectedCoordinatorDoc);
 
         // Check the resharding fields and allowMigrations in the config.collections entry for the
-        // temp collection. If the expected state is >= kCommitted, the entry for the temp
+        // temp collection. If the expected state is >= kDecisionPersisted, the entry for the temp
         // collection should have been removed.
         boost::optional<CollectionType> expectedTempCollType = boost::none;
-        if (expectedCoordinatorDoc.getState() < CoordinatorStateEnum::kCommitted ||
+        if (expectedCoordinatorDoc.getState() < CoordinatorStateEnum::kDecisionPersisted ||
             expectedCoordinatorDoc.getState() == CoordinatorStateEnum::kError) {
             expectedTempCollType = resharding::createTempReshardingCollectionType(
                 opCtx,
@@ -469,7 +507,7 @@ protected:
         assertTemporaryCollectionCatalogEntryMatchesExpected(opCtx, expectedTempCollType);
     }
 
-    void persistInitialStateAndCatalogUpdatesExpectSuccess(
+    void writeInitialStateAndCatalogUpdatesExpectSuccess(
         OperationContext* opCtx,
         ReshardingCoordinatorDocument expectedCoordinatorDoc,
         std::vector<ChunkType> initialChunks,
@@ -477,13 +515,18 @@ protected:
         // Create original collection's catalog entry as well as both config.chunks and config.tags
         // collections.
         {
+            setupDatabase("db", ShardId("shard0000"), true);
             auto opCtx = operationContext();
             DBDirectClient client(opCtx);
 
-            TypeCollectionReshardingFields reshardingFields(expectedCoordinatorDoc.get_id());
+            TypeCollectionReshardingFields reshardingFields(
+                expectedCoordinatorDoc.getReshardingUUID());
             reshardingFields.setState(expectedCoordinatorDoc.getState());
             reshardingFields.setDonorFields(
-                TypeCollectionDonorFields(expectedCoordinatorDoc.getReshardingKey()));
+                TypeCollectionDonorFields(expectedCoordinatorDoc.getTempReshardingNss(),
+                                          expectedCoordinatorDoc.getReshardingKey(),
+                                          extractShardIdsFromParticipantEntries(
+                                              expectedCoordinatorDoc.getRecipientShards())));
 
             auto originalNssCatalogEntry = makeOriginalCollectionCatalogEntry(
                 expectedCoordinatorDoc,
@@ -494,10 +537,34 @@ protected:
 
             client.createCollection(ChunkType::ConfigNS.ns());
             client.createCollection(TagsType::ConfigNS.ns());
+
+            auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+            ASSERT_OK(configShard->createIndexOnConfig(
+                opCtx,
+                ChunkType::ConfigNS,
+                BSON(ChunkType::ns() << 1 << ChunkType::lastmod() << 1),
+                true));
         }
 
-        resharding::persistInitialStateAndCatalogUpdates(
-            opCtx, expectedCoordinatorDoc, initialChunks, newZones);
+        resharding::insertCoordDocAndChangeOrigCollEntry(opCtx, expectedCoordinatorDoc);
+
+        auto shardsAndChunks =
+            resharding::calculateParticipantShardsAndChunks(opCtx, expectedCoordinatorDoc);
+
+        expectedCoordinatorDoc.setDonorShards(std::move(shardsAndChunks.donorShards));
+        expectedCoordinatorDoc.setRecipientShards(std::move(shardsAndChunks.recipientShards));
+
+        expectedCoordinatorDoc.setState(CoordinatorStateEnum::kPreparingToDonate);
+
+        std::vector<BSONObj> zones;
+        if (expectedCoordinatorDoc.getZones()) {
+            zones = std::move(expectedCoordinatorDoc.getZones().get());
+        }
+        expectedCoordinatorDoc.setZones(boost::none);
+        expectedCoordinatorDoc.setPresetReshardedChunks(boost::none);
+
+        resharding::writeParticipantShardsAndTempCollInfo(
+            opCtx, expectedCoordinatorDoc, initialChunks, zones);
 
         // Check that config.reshardingOperations and config.collections entries are updated
         // correctly
@@ -508,9 +575,9 @@ protected:
         readTagCatalogEntriesAndAssertMatchExpected(opCtx, newZones);
     }
 
-    void persistStateTransitionUpdateExpectSuccess(
+    void writeStateTransitionUpdateExpectSuccess(
         OperationContext* opCtx, ReshardingCoordinatorDocument expectedCoordinatorDoc) {
-        resharding::persistStateTransitionAndCatalogUpdatesThenBumpShardVersions(
+        resharding::writeStateTransitionAndCatalogUpdatesThenBumpShardVersions(
             opCtx, expectedCoordinatorDoc);
 
         // Check that config.reshardingOperations and config.collections entries are updated
@@ -518,12 +585,13 @@ protected:
         assertStateAndCatalogEntriesMatchExpected(opCtx, expectedCoordinatorDoc, _originalEpoch);
     }
 
-    void persistCommittedStateExpectSuccess(OperationContext* opCtx,
-                                            ReshardingCoordinatorDocument expectedCoordinatorDoc,
-                                            Timestamp fetchTimestamp,
-                                            std::vector<ChunkType> expectedChunks,
-                                            std::vector<TagsType> expectedZones) {
-        resharding::persistCommittedState(
+    void writeDecisionPersistedStateExpectSuccess(
+        OperationContext* opCtx,
+        ReshardingCoordinatorDocument expectedCoordinatorDoc,
+        Timestamp fetchTimestamp,
+        std::vector<ChunkType> expectedChunks,
+        std::vector<TagsType> expectedZones) {
+        resharding::writeDecisionPersistedState(
             operationContext(), expectedCoordinatorDoc, _finalEpoch, _finalTimestamp);
 
         // Check that config.reshardingOperations and config.collections entries are updated
@@ -555,7 +623,7 @@ protected:
         // Check that the entry is removed from config.reshardingOperations
         DBDirectClient client(opCtx);
         auto doc = client.findOne(NamespaceString::kConfigReshardingOperationsNamespace.ns(),
-                                  Query(BSON("nss" << expectedCoordinatorDoc.getNss().ns())));
+                                  Query(BSON("ns" << expectedCoordinatorDoc.getSourceNss().ns())));
         ASSERT(doc.isEmpty());
 
         // Check that the resharding fields are removed from the config.collections entry and
@@ -610,7 +678,7 @@ protected:
     };
 };
 
-TEST_F(ReshardingCoordinatorPersistenceTest, PersistInitialInfoSucceeds) {
+TEST_F(ReshardingCoordinatorPersistenceTest, WriteInitialInfoSucceeds) {
     auto coordinatorDoc = makeCoordinatorDoc(CoordinatorStateEnum::kInitializing);
 
     // Ensure the chunks for the original namespace exist since they will be bumped as a product of
@@ -621,61 +689,89 @@ TEST_F(ReshardingCoordinatorPersistenceTest, PersistInitialInfoSucceeds) {
 
     auto initialChunks =
         makeChunks(_tempNss, _tempEpoch, _newShardKey, std::vector{OID::gen(), OID::gen()});
+
     auto newZones = makeZones(_tempNss, _newShardKey);
+    std::vector<BSONObj> zonesBSON;
+    for (const auto& zone : newZones) {
+        zonesBSON.push_back(zone.toBSON());
+    }
+
+    std::vector<BSONObj> presetBSONChunks;
+    for (const auto& chunk : initialChunks) {
+        ReshardedChunk reshardChunk(chunk.getShard(), chunk.getMin(), chunk.getMax());
+        presetBSONChunks.push_back(reshardChunk.toBSON());
+    }
 
     // Persist the updates on disk
     auto expectedCoordinatorDoc = coordinatorDoc;
-    expectedCoordinatorDoc.setState(CoordinatorStateEnum::kPreparingToDonate);
+    expectedCoordinatorDoc.setState(CoordinatorStateEnum::kInitializing);
+    expectedCoordinatorDoc.setZones(zonesBSON);
+    expectedCoordinatorDoc.setPresetReshardedChunks(presetBSONChunks);
 
-    persistInitialStateAndCatalogUpdatesExpectSuccess(
+    writeInitialStateAndCatalogUpdatesExpectSuccess(
         operationContext(), expectedCoordinatorDoc, initialChunks, newZones);
 
-    // Confirm the shard version was increased for the donor shard.
+    // Confirm the shard version was increased for the donor shard. The collection version was
+    // bumped twice in 'writeInitialStateAndCatalogUpdatesExpectSuccess': once when reshardingFields
+    // is inserted to the collection doc, and once again when the state transitions to
+    // kPreparingToDonate.
     auto donorChunkPostTransition = getChunkDoc(operationContext(), donorChunk.getMin());
     ASSERT_EQ(donorChunkPostTransition.getStatus(), Status::OK());
     ASSERT_EQ(donorChunkPostTransition.getValue().getVersion().majorVersion(),
-              collectionVersion.majorVersion() + 1);
+              collectionVersion.majorVersion() + 2);
 }
 
-TEST_F(ReshardingCoordinatorPersistenceTest, PersistBasicStateTransitionSucceeds) {
+TEST_F(ReshardingCoordinatorPersistenceTest, BasicStateTransitionSucceeds) {
     auto coordinatorDoc =
         insertStateAndCatalogEntries(CoordinatorStateEnum::kCloning, _originalEpoch);
 
-    // Ensure the chunks for the original namespace exist since they will be bumped as a product of
-    // the state transition to kPreparingToDonate.
+    // Ensure the chunks for the original and temporary namespaces exist since they will be bumped
+    // as a product of the state transition to kBlockingWrites.
     auto donorChunk = makeAndInsertChunksForDonorShard(
         _originalNss, _originalEpoch, _oldShardKey, std::vector{OID::gen(), OID::gen()});
-    auto collectionVersion = donorChunk.getVersion();
-
-    // Persist the updates on disk
-    auto expectedCoordinatorDoc = coordinatorDoc;
-    expectedCoordinatorDoc.setState(CoordinatorStateEnum::kMirroring);
-
-    persistStateTransitionUpdateExpectSuccess(operationContext(), expectedCoordinatorDoc);
-    assertChunkVersionIncreasedAfterStateTransition(donorChunk, collectionVersion);
-}
-
-TEST_F(ReshardingCoordinatorPersistenceTest, PersistFetchTimestampStateTransitionSucceeds) {
-    auto coordinatorDoc =
-        insertStateAndCatalogEntries(CoordinatorStateEnum::kPreparingToDonate, _originalEpoch);
+    auto donorCollectionVersion = donorChunk.getVersion();
 
     auto recipientChunk = makeAndInsertChunksForRecipientShard(
         _tempNss, _tempEpoch, _newShardKey, std::vector{OID::gen(), OID::gen()});
-    auto collectionVersion = recipientChunk.getVersion();
+    auto recipientCollectionVersion = donorChunk.getVersion();
+
+    // Persist the updates on disk
+    auto expectedCoordinatorDoc = coordinatorDoc;
+    expectedCoordinatorDoc.setState(CoordinatorStateEnum::kBlockingWrites);
+
+    writeStateTransitionUpdateExpectSuccess(operationContext(), expectedCoordinatorDoc);
+    assertChunkVersionIncreasedAfterStateTransition(donorChunk, donorCollectionVersion);
+    assertChunkVersionIncreasedAfterStateTransition(recipientChunk, recipientCollectionVersion);
+}
+
+TEST_F(ReshardingCoordinatorPersistenceTest, StateTransitionWithFetchTimestampSucceeds) {
+    auto coordinatorDoc =
+        insertStateAndCatalogEntries(CoordinatorStateEnum::kPreparingToDonate, _originalEpoch);
+
+    // Ensure the chunks for the original and temporary namespaces exist since they will be bumped
+    // as a product of the state transition to kCloning.
+    auto donorChunk = makeAndInsertChunksForDonorShard(
+        _originalNss, _originalEpoch, _oldShardKey, std::vector{OID::gen(), OID::gen()});
+    auto donorCollectionVersion = donorChunk.getVersion();
+
+    auto recipientChunk = makeAndInsertChunksForRecipientShard(
+        _tempNss, _tempEpoch, _newShardKey, std::vector{OID::gen(), OID::gen()});
+    auto recipientCollectionVersion = recipientChunk.getVersion();
 
     // Persist the updates on disk
     auto expectedCoordinatorDoc = coordinatorDoc;
     expectedCoordinatorDoc.setState(CoordinatorStateEnum::kCloning);
-    emplaceFetchTimestampIfExists(expectedCoordinatorDoc, Timestamp(1, 1));
+    emplaceCloneTimestampIfExists(expectedCoordinatorDoc, Timestamp(1, 1));
 
-    persistStateTransitionUpdateExpectSuccess(operationContext(), expectedCoordinatorDoc);
-    assertChunkVersionIncreasedAfterStateTransition(recipientChunk, collectionVersion);
+    writeStateTransitionUpdateExpectSuccess(operationContext(), expectedCoordinatorDoc);
+    assertChunkVersionIncreasedAfterStateTransition(donorChunk, donorCollectionVersion);
+    assertChunkVersionIncreasedAfterStateTransition(recipientChunk, recipientCollectionVersion);
 }
 
-TEST_F(ReshardingCoordinatorPersistenceTest, PersistCommitIntoRenamingSucceeds) {
+TEST_F(ReshardingCoordinatorPersistenceTest, StateTranstionToDecisionPersistedSucceeds) {
     Timestamp fetchTimestamp = Timestamp(1, 1);
     auto coordinatorDoc = insertStateAndCatalogEntries(
-        CoordinatorStateEnum::kMirroring, _originalEpoch, fetchTimestamp);
+        CoordinatorStateEnum::kBlockingWrites, _originalEpoch, fetchTimestamp);
     auto initialChunksIds = std::vector{OID::gen(), OID::gen()};
 
     auto tempNssChunks = makeChunks(_tempNss, _tempEpoch, _newShardKey, initialChunksIds);
@@ -688,71 +784,79 @@ TEST_F(ReshardingCoordinatorPersistenceTest, PersistCommitIntoRenamingSucceeds) 
 
     // Persist the updates on disk
     auto expectedCoordinatorDoc = coordinatorDoc;
-    expectedCoordinatorDoc.setState(CoordinatorStateEnum::kCommitted);
+    expectedCoordinatorDoc.setState(CoordinatorStateEnum::kDecisionPersisted);
 
     // The new epoch to use for the resharded collection to indicate that the collection is a
     // new incarnation of the namespace
     auto updatedChunks = makeChunks(_originalNss, _finalEpoch, _newShardKey, initialChunksIds);
     auto updatedZones = makeZones(_originalNss, _newShardKey);
 
-    persistCommittedStateExpectSuccess(
+    writeDecisionPersistedStateExpectSuccess(
         operationContext(), expectedCoordinatorDoc, fetchTimestamp, updatedChunks, updatedZones);
 
+    // Since the epoch is changed, there is no need to bump the chunk versions with the transition.
     assertChunkVersionDidNotIncreaseAfterStateTransition(recipientChunk,
                                                          recipientChunk.getVersion());
-
-    expectedCoordinatorDoc.setState(CoordinatorStateEnum::kRenaming);
-
-    persistStateTransitionUpdateExpectSuccess(operationContext(), expectedCoordinatorDoc);
-    // This check will still pass even after renaming back to the original namespace since internal
-    // checks find by shard key, not namespace.
-    assertChunkVersionIncreasedAfterStateTransition(recipientChunk, recipientChunk.getVersion());
 }
 
-TEST_F(ReshardingCoordinatorPersistenceTest, PersistTransitionToErrorSucceeds) {
+TEST_F(ReshardingCoordinatorPersistenceTest, StateTransitionToErrorSucceeds) {
     auto coordinatorDoc =
         insertStateAndCatalogEntries(CoordinatorStateEnum::kPreparingToDonate, _originalEpoch);
+    auto initialChunksIds = std::vector{OID::gen(), OID::gen()};
+
+    auto tempNssChunks = makeChunks(_tempNss, _tempEpoch, _newShardKey, initialChunksIds);
+    auto recipientChunk = tempNssChunks[1];
+    insertChunkAndZoneEntries(tempNssChunks, makeZones(_tempNss, _newShardKey));
+
+    insertChunkAndZoneEntries(
+        makeChunks(_originalNss, OID::gen(), _oldShardKey, std::vector{OID::gen(), OID::gen()}),
+        makeZones(_originalNss, _oldShardKey));
 
     // Persist the updates on disk
     auto expectedCoordinatorDoc = coordinatorDoc;
     expectedCoordinatorDoc.setState(CoordinatorStateEnum::kError);
+    auto abortReason = Status{ErrorCodes::InternalError, "reason to abort"};
+    emplaceAbortReasonIfExists(expectedCoordinatorDoc, abortReason);
 
-    persistStateTransitionUpdateExpectSuccess(operationContext(), expectedCoordinatorDoc);
+    writeStateTransitionUpdateExpectSuccess(operationContext(), expectedCoordinatorDoc);
 }
 
-TEST_F(ReshardingCoordinatorPersistenceTest, PersistTransitionToDoneSucceeds) {
+TEST_F(ReshardingCoordinatorPersistenceTest, StateTransitionToDoneSucceeds) {
     auto coordinatorDoc =
-        insertStateAndCatalogEntries(CoordinatorStateEnum::kRenaming, _finalEpoch);
+        insertStateAndCatalogEntries(CoordinatorStateEnum::kDecisionPersisted, _finalEpoch);
+
+    // Ensure the chunks for the original namespace exist since they will be bumped as a product of
+    // the state transition to kDone.
+    auto finalChunk = makeAndInsertChunksForRecipientShard(
+        _originalNss, _finalEpoch, _newShardKey, std::vector{OID::gen(), OID::gen()});
+    auto collectionVersion = finalChunk.getVersion();
 
     removeCoordinatorDocAndReshardingFieldsExpectSuccess(operationContext(), coordinatorDoc);
+    assertChunkVersionIncreasedAfterStateTransition(finalChunk, collectionVersion);
 }
 
-TEST_F(ReshardingCoordinatorPersistenceTest,
-       PersistStateTransitionWhenCoordinatorDocDoesNotExistFails) {
+TEST_F(ReshardingCoordinatorPersistenceTest, StateTransitionWhenCoordinatorDocDoesNotExistFails) {
     // Do not insert initial entry into config.reshardingOperations. Attempt to update coordinator
     // state documents.
     auto coordinatorDoc = makeCoordinatorDoc(CoordinatorStateEnum::kCloning, Timestamp(1, 1));
-    ASSERT_THROWS_CODE(resharding::persistStateTransitionAndCatalogUpdatesThenBumpShardVersions(
+    ASSERT_THROWS_CODE(resharding::writeStateTransitionAndCatalogUpdatesThenBumpShardVersions(
                            operationContext(), coordinatorDoc),
                        AssertionException,
-                       50577);
+                       5514600);
 }
 
 TEST_F(ReshardingCoordinatorPersistenceTest,
-       PersistInitialStateOriginalNamespaceCatalogEntryMissingFails) {
+       WriteInitialStateOriginalNamespaceCatalogEntryMissingFails) {
     auto coordinatorDoc = makeCoordinatorDoc(CoordinatorStateEnum::kInitializing);
-    auto initialChunks =
-        makeChunks(_tempNss, _tempEpoch, _newShardKey, std::vector{OID::gen(), OID::gen()});
-    auto newZones = makeZones(_tempNss, _newShardKey);
 
     auto expectedCoordinatorDoc = coordinatorDoc;
     expectedCoordinatorDoc.setState(CoordinatorStateEnum::kPreparingToDonate);
 
     // Do not create the config.collections entry for the original collection
-    ASSERT_THROWS_CODE(resharding::persistInitialStateAndCatalogUpdates(
-                           operationContext(), coordinatorDoc, initialChunks, newZones),
-                       AssertionException,
-                       ErrorCodes::NamespaceNotFound);
+    ASSERT_THROWS_CODE(
+        resharding::insertCoordDocAndChangeOrigCollEntry(operationContext(), coordinatorDoc),
+        AssertionException,
+        ErrorCodes::NamespaceNotFound);
 }
 
 }  // namespace

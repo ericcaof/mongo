@@ -86,6 +86,8 @@ public:
 
     void init() override;
 
+    void initForTesting(sdam::TopologyManagerPtr topologyManager);
+
     void drop() override;
 
     static ReplicaSetMonitorPtr make(const MongoURI& uri,
@@ -95,12 +97,12 @@ public:
 
     SemiFuture<HostAndPort> getHostOrRefresh(const ReadPreferenceSetting& readPref,
                                              const std::vector<HostAndPort>& excludedHosts,
-                                             const CancelationToken& cancelToken) override;
+                                             const CancellationToken& cancelToken) override;
 
     SemiFuture<std::vector<HostAndPort>> getHostsOrRefresh(
         const ReadPreferenceSetting& readPref,
         const std::vector<HostAndPort>& excludedHosts,
-        const CancelationToken& cancelToken) override;
+        const CancellationToken& cancelToken) override;
 
     HostAndPort getPrimaryOrUassert() override;
 
@@ -176,9 +178,11 @@ private:
             return !wasAlreadyDone;
         }
 
-        CancelationSource deadlineCancelSource;
+        CancellationSource deadlineCancelSource;
 
         ReadPreferenceSetting criteria;
+
+        std::vector<HostAndPort> excludedHosts;
 
         // Used to compute latency.
         Date_t start;
@@ -201,7 +205,8 @@ private:
     SemiFuture<std::vector<HostAndPort>> _enqueueOutstandingQuery(
         WithLock,
         const ReadPreferenceSetting& criteria,
-        const CancelationToken& cancelToken,
+        const std::vector<HostAndPort>& excludedHosts,
+        const CancellationToken& cancelToken,
         const Date_t& deadline);
 
     // Removes the query pointed to by iter and returns an iterator to the next item in the list.

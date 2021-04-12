@@ -1,7 +1,9 @@
 /**
  * If a user attempts to downgrade the server while there is an index build in progress, the
  * downgrade should succeed without blocking.
- * @tags: [requires_replication]
+ * @tags: [
+ *   requires_replication,
+ * ]
  */
 (function() {
 "use strict";

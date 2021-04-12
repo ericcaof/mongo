@@ -2,7 +2,9 @@
  * Tests that we can execute a query which survived a yield using an index scan on a path containing
  * a positional component. This test was designed to reproduce SERVER-52589.
  *
- * @tags: [requires_find_command]
+ * @tags: [
+ *   requires_find_command,
+ * ]
  */
 (function() {
 "use strict";

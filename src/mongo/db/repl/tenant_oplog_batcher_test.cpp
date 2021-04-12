@@ -49,6 +49,7 @@ class TenantOplogBatcherTest : public unittest::Test, public ScopedGlobalService
 public:
     void setUp() override {
         unittest::Test::setUp();
+        Client::initThread("TenantOplogBatcherTest");
         auto network = std::make_unique<executor::NetworkInterfaceMock>();
         _net = network.get();
         executor::ThreadPoolMock::Options thread_pool_options;
@@ -56,6 +57,12 @@ public:
         _executor = makeSharedThreadPoolTestExecutor(std::move(network), thread_pool_options);
         _executor->startup();
         _oplogBuffer.startup(nullptr);
+    }
+
+    void tearDown() override {
+        _executor->shutdown();
+        _executor->join();
+        Client::releaseCurrent();
     }
 
 protected:
@@ -94,7 +101,8 @@ std::string toString(TenantOplogBatch& batch) {
 constexpr auto dbName = "tenant_test"_sd;
 
 TEST_F(TenantOplogBatcherTest, CannotRequestTwoBatchesAtOnce) {
-    auto batcher = std::make_shared<TenantOplogBatcher>("tenant", &_oplogBuffer, _executor);
+    auto batcher = std::make_shared<TenantOplogBatcher>(
+        "tenant", &_oplogBuffer, _executor, Timestamp(0, 0) /* resumeBatchingTs */);
     ASSERT_OK(batcher->startup());
     auto batchFuture = batcher->getNextBatch(bigBatchLimits);
     // We just started, no batch should be available.
@@ -107,7 +115,8 @@ TEST_F(TenantOplogBatcherTest, CannotRequestTwoBatchesAtOnce) {
 }
 
 TEST_F(TenantOplogBatcherTest, OplogBatcherGroupsCrudOps) {
-    auto batcher = std::make_shared<TenantOplogBatcher>("tenant", &_oplogBuffer, _executor);
+    auto batcher = std::make_shared<TenantOplogBatcher>(
+        "tenant", &_oplogBuffer, _executor, Timestamp(0, 0) /* resumeBatchingTs */);
     ASSERT_OK(batcher->startup());
     auto batchFuture = batcher->getNextBatch(bigBatchLimits);
     // We just started, no batch should be available.
@@ -131,7 +140,8 @@ TEST_F(TenantOplogBatcherTest, OplogBatcherGroupsCrudOps) {
 }
 
 TEST_F(TenantOplogBatcherTest, OplogBatcherFailsOnPreparedApplyOps) {
-    auto batcher = std::make_shared<TenantOplogBatcher>("tenant", &_oplogBuffer, _executor);
+    auto batcher = std::make_shared<TenantOplogBatcher>(
+        "tenant", &_oplogBuffer, _executor, Timestamp(0, 0) /* resumeBatchingTs */);
     ASSERT_OK(batcher->startup());
     auto batchFuture = batcher->getNextBatch(bigBatchLimits);
 
@@ -145,7 +155,8 @@ TEST_F(TenantOplogBatcherTest, OplogBatcherFailsOnPreparedApplyOps) {
 }
 
 TEST_F(TenantOplogBatcherTest, OplogBatcherFailsOnPreparedCommit) {
-    auto batcher = std::make_shared<TenantOplogBatcher>("tenant", &_oplogBuffer, _executor);
+    auto batcher = std::make_shared<TenantOplogBatcher>(
+        "tenant", &_oplogBuffer, _executor, Timestamp(0, 0) /* resumeBatchingTs */);
     ASSERT_OK(batcher->startup());
     auto batchFuture = batcher->getNextBatch(bigBatchLimits);
 
@@ -176,7 +187,8 @@ TEST_F(TenantOplogBatcherTest, GetNextApplierBatchGroupsUnpreparedApplyOpsOpWith
     srcOps.push_back(makeApplyOpsOplogEntry(1, false, innerOps).getEntry().toBSON());
     srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")).getEntry().toBSON());
 
-    auto batcher = std::make_shared<TenantOplogBatcher>("tenant", &_oplogBuffer, _executor);
+    auto batcher = std::make_shared<TenantOplogBatcher>(
+        "tenant", &_oplogBuffer, _executor, Timestamp(0, 0) /* resumeBatchingTs */);
     ASSERT_OK(batcher->startup());
     auto batchFuture = batcher->getNextBatch(bigBatchLimits);
     _oplogBuffer.push(nullptr, srcOps.cbegin(), srcOps.cend());
@@ -209,7 +221,8 @@ TEST_F(TenantOplogBatcherTest, GetNextApplierBatchGroupsMultipleTransactions) {
     srcOps.push_back(makeApplyOpsOplogEntry(1, false, innerOps1).getEntry().toBSON());
     srcOps.push_back(makeApplyOpsOplogEntry(2, false, innerOps2).getEntry().toBSON());
 
-    auto batcher = std::make_shared<TenantOplogBatcher>("tenant", &_oplogBuffer, _executor);
+    auto batcher = std::make_shared<TenantOplogBatcher>(
+        "tenant", &_oplogBuffer, _executor, Timestamp(0, 0) /* resumeBatchingTs */);
     ASSERT_OK(batcher->startup());
     auto batchFuture = batcher->getNextBatch(bigBatchLimits);
     _oplogBuffer.push(nullptr, srcOps.cbegin(), srcOps.cend());
@@ -252,7 +265,8 @@ TEST_F(TenantOplogBatcherTest, GetNextApplierBatchChecksBatchLimitsForNumberOfOp
     // Set batch limits so that each batch contains a maximum of 'BatchLimit::ops'.
     auto limits = bigBatchLimits;
     limits.ops = 3U;
-    auto batcher = std::make_shared<TenantOplogBatcher>("tenant", &_oplogBuffer, _executor);
+    auto batcher = std::make_shared<TenantOplogBatcher>(
+        "tenant", &_oplogBuffer, _executor, Timestamp(0, 0) /* resumeBatchingTs */);
     ASSERT_OK(batcher->startup());
     auto batchFuture = batcher->getNextBatch(limits);
 
@@ -283,7 +297,8 @@ TEST_F(TenantOplogBatcherTest, GetNextApplierBatchChecksBatchLimitsForSizeOfOper
     // Set batch limits so that only the first two operations can fit into the first batch.
     auto limits = bigBatchLimits;
     limits.bytes = std::size_t(srcOps[0].objsize() + srcOps[1].objsize());
-    auto batcher = std::make_shared<TenantOplogBatcher>("tenant", &_oplogBuffer, _executor);
+    auto batcher = std::make_shared<TenantOplogBatcher>(
+        "tenant", &_oplogBuffer, _executor, Timestamp(0, 0) /* resumeBatchingTs */);
     ASSERT_OK(batcher->startup());
     auto batchFuture = batcher->getNextBatch(limits);
 
@@ -328,7 +343,8 @@ TEST_F(TenantOplogBatcherTest, LargeTransactionProcessedIndividuallyAndExpanded)
 
     _oplogBuffer.push(nullptr, srcOps.cbegin(), srcOps.cend());
 
-    auto batcher = std::make_shared<TenantOplogBatcher>("tenant", &_oplogBuffer, _executor);
+    auto batcher = std::make_shared<TenantOplogBatcher>(
+        "tenant", &_oplogBuffer, _executor, Timestamp(0, 0) /* resumeBatchingTs */);
     ASSERT_OK(batcher->startup());
     auto batchFuture = batcher->getNextBatch(bigBatchLimits);
 
@@ -379,8 +395,82 @@ TEST_F(TenantOplogBatcherTest, LargeTransactionProcessedIndividuallyAndExpanded)
     batcher->join();
 }
 
+TEST_F(TenantOplogBatcherTest, OplogBatcherRetreivesPreImageOutOfOrder) {
+    auto batcher = std::make_shared<TenantOplogBatcher>(
+        "tenant", &_oplogBuffer, _executor, Timestamp(0, 0) /* resumeBatchingTs */);
+    ASSERT_OK(batcher->startup());
+    auto batchFuture = batcher->getNextBatch(bigBatchLimits);
+    // We just started, no batch should be available.
+    ASSERT(!batchFuture.isReady());
+    std::vector<BSONObj> srcOps;
+    srcOps.push_back(makeNoopOplogEntry(1, "preImage").getEntry().toBSON());
+    srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "foo")).getEntry().toBSON());
+    srcOps.push_back(
+        makeUpdateOplogEntry(3, NamespaceString(dbName, "bar"), UUID::gen(), OpTime({1, 1}, 1))
+            .getEntry()
+            .toBSON());
+
+    _oplogBuffer.push(nullptr, srcOps.cbegin(), srcOps.cend());
+
+    auto batch = batchFuture.get();
+    batcher->shutdown();
+
+    // Expect the pre-image to have been inserted twice.
+    ASSERT_EQUALS(srcOps.size() + 1, batch.ops.size()) << toString(batch);
+    ASSERT(batch.expansions.empty());
+    ASSERT_BSONOBJ_EQ(srcOps[0], batch.ops[0].entry.getEntry().toBSON());
+    ASSERT_EQUALS(-1, batch.ops[0].expansionsEntry);
+    ASSERT_BSONOBJ_EQ(srcOps[1], batch.ops[1].entry.getEntry().toBSON());
+    ASSERT_EQUALS(-1, batch.ops[1].expansionsEntry);
+    ASSERT_BSONOBJ_EQ(srcOps[0], batch.ops[2].entry.getEntry().toBSON());
+    ASSERT_EQUALS(-1, batch.ops[2].expansionsEntry);
+    ASSERT_BSONOBJ_EQ(srcOps[2], batch.ops[3].entry.getEntry().toBSON());
+    ASSERT_EQUALS(-1, batch.ops[3].expansionsEntry);
+
+    batcher->join();
+}
+
+TEST_F(TenantOplogBatcherTest, OplogBatcherRetreivesPostImageOutOfOrder) {
+    auto batcher = std::make_shared<TenantOplogBatcher>(
+        "tenant", &_oplogBuffer, _executor, Timestamp(0, 0) /* resumeBatchingTs */);
+    ASSERT_OK(batcher->startup());
+    auto batchFuture = batcher->getNextBatch(bigBatchLimits);
+    // We just started, no batch should be available.
+    ASSERT(!batchFuture.isReady());
+    std::vector<BSONObj> srcOps;
+    srcOps.push_back(makeNoopOplogEntry(1, "postImage").getEntry().toBSON());
+    srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "foo")).getEntry().toBSON());
+    srcOps.push_back(makeUpdateOplogEntry(3,
+                                          NamespaceString(dbName, "bar"),
+                                          UUID::gen(),
+                                          boost::none /* preImageOpTime */,
+                                          OpTime({1, 1}, 1))
+                         .getEntry()
+                         .toBSON());
+
+    _oplogBuffer.push(nullptr, srcOps.cbegin(), srcOps.cend());
+
+    auto batch = batchFuture.get();
+    batcher->shutdown();
+
+    // Expect the post-image to have been inserted twice.
+    ASSERT_EQUALS(srcOps.size() + 1, batch.ops.size()) << toString(batch);
+    ASSERT(batch.expansions.empty());
+    ASSERT_BSONOBJ_EQ(srcOps[0], batch.ops[0].entry.getEntry().toBSON());
+    ASSERT_EQUALS(-1, batch.ops[0].expansionsEntry);
+    ASSERT_BSONOBJ_EQ(srcOps[1], batch.ops[1].entry.getEntry().toBSON());
+    ASSERT_EQUALS(-1, batch.ops[1].expansionsEntry);
+    ASSERT_BSONOBJ_EQ(srcOps[0], batch.ops[2].entry.getEntry().toBSON());
+    ASSERT_EQUALS(-1, batch.ops[2].expansionsEntry);
+    ASSERT_BSONOBJ_EQ(srcOps[2], batch.ops[3].entry.getEntry().toBSON());
+    ASSERT_EQUALS(-1, batch.ops[3].expansionsEntry);
+
+    batcher->join();
+}
+
 TEST_F(TenantOplogBatcherTest, GetNextApplierBatchRejectsZeroBatchOpsLimits) {
-    auto batcher = std::make_shared<TenantOplogBatcher>("tenant", &_oplogBuffer, _executor);
+    auto batcher = std::make_shared<TenantOplogBatcher>(
+        "tenant", &_oplogBuffer, _executor, Timestamp(0, 0) /* resumeBatchingTs */);
     ASSERT_OK(batcher->startup());
     // bigBatchLimits is a legal batch limit.
     auto limits = bigBatchLimits;
@@ -391,13 +481,123 @@ TEST_F(TenantOplogBatcherTest, GetNextApplierBatchRejectsZeroBatchOpsLimits) {
     batcher->join();
 }
 
+TEST_F(TenantOplogBatcherTest, OplogBatcherRetreivesPreImageBeforeBatchStart) {
+    auto batcher = std::make_shared<TenantOplogBatcher>(
+        "tenant", &_oplogBuffer, _executor, Timestamp(0, 0) /* resumeBatchingTs */);
+    ASSERT_OK(batcher->startup());
+    std::vector<BSONObj> srcOps;
+    srcOps.push_back(makeNoopOplogEntry(1, "preImage").getEntry().toBSON());
+    srcOps.push_back(
+        makeUpdateOplogEntry(2, NamespaceString(dbName, "bar"), UUID::gen(), OpTime({1, 1}, 1))
+            .getEntry()
+            .toBSON());
+
+    _oplogBuffer.push(nullptr, srcOps.cbegin(), srcOps.cend());
+    // Pull the preImage off the buffer.
+    BSONObj preImagePopped;
+    ASSERT(_oplogBuffer.tryPop(nullptr /* mock does not need opCtx */, &preImagePopped));
+    // Start the batcher reading after the preImage has been removed.
+    auto batchFuture = batcher->getNextBatch(bigBatchLimits);
+    ASSERT_BSONOBJ_EQ(preImagePopped, srcOps[0]);
+    auto batch = batchFuture.get();
+    batcher->shutdown();
+
+    // Expect the pre-image to have been inserted.
+    ASSERT_EQUALS(srcOps.size(), batch.ops.size()) << toString(batch);
+    ASSERT(batch.expansions.empty());
+    ASSERT_BSONOBJ_EQ(srcOps[0], batch.ops[0].entry.getEntry().toBSON());
+    ASSERT_EQUALS(-1, batch.ops[0].expansionsEntry);
+    ASSERT_BSONOBJ_EQ(srcOps[1], batch.ops[1].entry.getEntry().toBSON());
+    ASSERT_EQUALS(-1, batch.ops[1].expansionsEntry);
+    batcher->join();
+}
+
+TEST_F(TenantOplogBatcherTest, OplogBatcherRetreivesPostImageBeforeBatchStart) {
+    auto batcher = std::make_shared<TenantOplogBatcher>(
+        "tenant", &_oplogBuffer, _executor, Timestamp(0, 0) /* resumeBatchingTs */);
+    ASSERT_OK(batcher->startup());
+    std::vector<BSONObj> srcOps;
+    srcOps.push_back(makeNoopOplogEntry(1, "postImage").getEntry().toBSON());
+    srcOps.push_back(makeUpdateOplogEntry(2,
+                                          NamespaceString(dbName, "bar"),
+                                          UUID::gen(),
+                                          boost::none /* preImageOpTime */,
+                                          OpTime({1, 1}, 1))
+                         .getEntry()
+                         .toBSON());
+
+    _oplogBuffer.push(nullptr, srcOps.cbegin(), srcOps.cend());
+    // Pull the postImage off the buffer.
+    BSONObj postImagePopped;
+    ASSERT(_oplogBuffer.tryPop(nullptr /* mock does not need opCtx */, &postImagePopped));
+    // Start the batcher reading after the preImage has been removed.
+    auto batchFuture = batcher->getNextBatch(bigBatchLimits);
+    ASSERT_BSONOBJ_EQ(postImagePopped, srcOps[0]);
+    auto batch = batchFuture.get();
+    batcher->shutdown();
+
+    // Expect the post-image to have been inserted.
+    ASSERT_EQUALS(srcOps.size(), batch.ops.size()) << toString(batch);
+    ASSERT(batch.expansions.empty());
+    ASSERT_BSONOBJ_EQ(srcOps[0], batch.ops[0].entry.getEntry().toBSON());
+    ASSERT_EQUALS(-1, batch.ops[0].expansionsEntry);
+    ASSERT_BSONOBJ_EQ(srcOps[1], batch.ops[1].entry.getEntry().toBSON());
+    ASSERT_EQUALS(-1, batch.ops[1].expansionsEntry);
+    batcher->join();
+}
+
 TEST_F(TenantOplogBatcherTest, GetNextApplierBatchRejectsZeroBatchSizeLimits) {
-    auto batcher = std::make_shared<TenantOplogBatcher>("tenant", &_oplogBuffer, _executor);
+    auto batcher = std::make_shared<TenantOplogBatcher>(
+        "tenant", &_oplogBuffer, _executor, Timestamp(0, 0) /* resumeBatchingTs */);
     ASSERT_OK(batcher->startup());
     // bigBatchLimits is a legal batch limit.
     auto limits = bigBatchLimits;
     limits.bytes = 0;
     ASSERT_THROWS_CODE(batcher->getNextBatch(limits), DBException, 4885601);
+
+    batcher->shutdown();
+    batcher->join();
+}
+
+TEST_F(TenantOplogBatcherTest, ResumeOplogBatcherFromTimestamp) {
+    std::vector<BSONObj> srcOps;
+    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "bar")).getEntry().toBSON());
+    srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")).getEntry().toBSON());
+    srcOps.push_back(makeInsertOplogEntry(3, NamespaceString(dbName, "bar")).getEntry().toBSON());
+    srcOps.push_back(makeInsertOplogEntry(4, NamespaceString(dbName, "bar")).getEntry().toBSON());
+    srcOps.push_back(makeInsertOplogEntry(5, NamespaceString(dbName, "bar")).getEntry().toBSON());
+    _oplogBuffer.push(nullptr, srcOps.cbegin(), srcOps.cend());
+
+    auto batcher =
+        std::make_shared<TenantOplogBatcher>("tenant", &_oplogBuffer, _executor, Timestamp(4, 1));
+    ASSERT_OK(batcher->startup());
+
+    auto batchFuture = batcher->getNextBatch(bigBatchLimits);
+
+    auto batch = batchFuture.get();
+    ASSERT_EQUALS(1U, batch.ops.size()) << toString(batch);
+    ASSERT_BSONOBJ_EQ(srcOps[4], batch.ops[0].entry.getEntry().toBSON());
+
+    batcher->shutdown();
+    batcher->join();
+}
+
+TEST_F(TenantOplogBatcherTest, ResumeOplogBatcherFromNonExistentTimestamp) {
+    std::vector<BSONObj> srcOps;
+    srcOps.push_back(makeInsertOplogEntry(4, NamespaceString(dbName, "bar")).getEntry().toBSON());
+    srcOps.push_back(makeInsertOplogEntry(5, NamespaceString(dbName, "bar")).getEntry().toBSON());
+    _oplogBuffer.push(nullptr, srcOps.cbegin(), srcOps.cend());
+
+    auto batcher =
+        std::make_shared<TenantOplogBatcher>("tenant", &_oplogBuffer, _executor, Timestamp(3, 1));
+    ASSERT_OK(batcher->startup());
+
+    auto batchFuture = batcher->getNextBatch(bigBatchLimits);
+
+    auto batch = batchFuture.get();
+    ASSERT_EQUALS(2U, batch.ops.size()) << toString(batch);
+    ASSERT_BSONOBJ_EQ(srcOps[0], batch.ops[0].entry.getEntry().toBSON());
+    ASSERT_BSONOBJ_EQ(srcOps[1], batch.ops[1].entry.getEntry().toBSON());
 
     batcher->shutdown();
     batcher->join();

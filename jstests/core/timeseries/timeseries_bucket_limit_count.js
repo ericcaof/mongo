@@ -1,13 +1,11 @@
 /**
  * Tests maximum number of measurements held in each bucket in a time-series buckets collection.
  * @tags: [
- *     assumes_unsharded_collection,         # TODO(SERVER-53816): remove
- *     does_not_support_causal_consistency,  # TODO(SERVER-53819): remove
+ *     assumes_no_implicit_collection_creation_after_drop,
  *     does_not_support_stepdowns,
  *     requires_fcv_49,
  *     requires_find_command,
  *     requires_getmore,
- *     sbe_incompatible,
  * ]
  */
 (function() {
@@ -20,8 +18,7 @@ if (!TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo())) {
     return;
 }
 
-const testDB = db.getSiblingDB(jsTestName());
-assert.commandWorked(testDB.dropDatabase());
+const collNamePrefix = 'timeseries_bucket_limit_count_';
 
 // Assumes each bucket has a limit of 1000 measurements.
 const bucketMaxCount = 1000;
@@ -30,19 +27,20 @@ const numDocs = bucketMaxCount + 100;
 const timeFieldName = 'time';
 
 const runTest = function(numDocsPerInsert) {
-    const coll = testDB.getCollection('t_' + numDocsPerInsert);
-    const bucketsColl = testDB.getCollection('system.buckets.' + coll.getName());
+    const coll = db.getCollection(collNamePrefix + numDocsPerInsert);
+    const bucketsColl = db.getCollection('system.buckets.' + coll.getName());
     coll.drop();
 
     assert.commandWorked(
-        testDB.createCollection(coll.getName(), {timeseries: {timeField: timeFieldName}}));
-    assert.contains(bucketsColl.getName(), testDB.getCollectionNames());
+        db.createCollection(coll.getName(), {timeseries: {timeField: timeFieldName}}));
+    assert.contains(bucketsColl.getName(), db.getCollectionNames());
 
     let docs = [];
     for (let i = 0; i < numDocs; i++) {
         docs.push({_id: i, [timeFieldName]: ISODate(), x: i});
         if ((i + 1) % numDocsPerInsert === 0) {
-            assert.commandWorked(coll.insert(docs), 'failed to insert docs: ' + tojson(docs));
+            assert.commandWorked(coll.insert(docs, {ordered: false}),
+                                 'failed to insert docs: ' + tojson(docs));
             docs = [];
         }
     }
@@ -58,36 +56,38 @@ const runTest = function(numDocsPerInsert) {
 
     // Check bucket collection.
     const bucketDocs = bucketsColl.find().sort({_id: 1}).toArray();
-    assert.eq(2, bucketDocs.length, bucketDocs);
+    assert.eq(2, bucketDocs.length, tojson(bucketDocs));
+
+    jsTestLog('Collection stats for ' + coll.getFullName() + ': ' + tojson(coll.stats()));
 
     // Check both buckets.
     // First bucket should be full with 'bucketMaxCount' documents.
     assert.eq(0,
               bucketDocs[0].control.min._id,
-              'invalid control.min for _id in first bucket: ' + tojson(bucketDocs[0].control));
+              'invalid control.min for _id in first bucket: ' + tojson(bucketDocs));
     assert.eq(0,
               bucketDocs[0].control.min.x,
-              'invalid control.min for x in first bucket: ' + tojson(bucketDocs[0].control));
+              'invalid control.min for x in first bucket: ' + tojson(bucketDocs));
     assert.eq(bucketMaxCount - 1,
               bucketDocs[0].control.max._id,
-              'invalid control.max for _id in first bucket: ' + tojson(bucketDocs[0].control));
+              'invalid control.max for _id in first bucket: ' + tojson(bucketDocs));
     assert.eq(bucketMaxCount - 1,
               bucketDocs[0].control.max.x,
-              'invalid control.max for x in first bucket: ' + tojson(bucketDocs[0].control));
+              'invalid control.max for x in first bucket: ' + tojson(bucketDocs));
 
     // Second bucket should contain the remaining documents.
     assert.eq(bucketMaxCount,
               bucketDocs[1].control.min._id,
-              'invalid control.min for _id in second bucket: ' + tojson(bucketDocs[1].control));
+              'invalid control.min for _id in second bucket: ' + tojson(bucketDocs));
     assert.eq(bucketMaxCount,
               bucketDocs[1].control.min.x,
-              'invalid control.min for x in second bucket: ' + tojson(bucketDocs[1].control));
+              'invalid control.min for x in second bucket: ' + tojson(bucketDocs));
     assert.eq(numDocs - 1,
               bucketDocs[1].control.max._id,
-              'invalid control.max for _id in second bucket: ' + tojson(bucketDocs[1].control));
+              'invalid control.max for _id in second bucket: ' + tojson(bucketDocs));
     assert.eq(numDocs - 1,
               bucketDocs[1].control.max.x,
-              'invalid control.max for x in second bucket: ' + tojson(bucketDocs[1].control));
+              'invalid control.max for x in second bucket: ' + tojson(bucketDocs));
 };
 
 runTest(1);

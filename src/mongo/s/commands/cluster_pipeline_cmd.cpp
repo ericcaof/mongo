@@ -32,6 +32,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/status.h"
+#include "mongo/db/auth/authorization_checks.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/pipeline/aggregate_command_gen.h"
@@ -73,13 +74,17 @@ public:
         OperationContext* opCtx,
         const OpMsgRequest& opMsgRequest,
         boost::optional<ExplainOptions::Verbosity> explainVerbosity) override {
-        const auto aggregationRequest = uassertStatusOK(aggregation_request_helper::parseFromBSON(
-            opMsgRequest.getDatabase().toString(), opMsgRequest.body, explainVerbosity));
+        const auto aggregationRequest = aggregation_request_helper::parseFromBSON(
+            opMsgRequest.getDatabase().toString(),
+            opMsgRequest.body,
+            explainVerbosity,
+            APIParameters::get(opCtx).getAPIStrict().value_or(false));
 
-        auto privileges =
-            uassertStatusOK(AuthorizationSession::get(opCtx->getClient())
-                                ->getPrivilegesForAggregate(
-                                    aggregationRequest.getNamespace(), aggregationRequest, true));
+        auto privileges = uassertStatusOK(
+            auth::getPrivilegesForAggregate(AuthorizationSession::get(opCtx->getClient()),
+                                            aggregationRequest.getNamespace(),
+                                            aggregationRequest,
+                                            true));
 
         return std::make_unique<Invocation>(
             this, opMsgRequest, std::move(aggregationRequest), std::move(privileges));
@@ -89,7 +94,7 @@ public:
     public:
         Invocation(Command* cmd,
                    const OpMsgRequest& request,
-                   const AggregateCommand aggregationRequest,
+                   const AggregateCommandRequest aggregationRequest,
                    PrivilegeVector privileges)
             : CommandInvocation(cmd),
               _request(request),
@@ -164,7 +169,7 @@ public:
 
         const OpMsgRequest& _request;
         const std::string _dbName;
-        const AggregateCommand _aggregationRequest;
+        const AggregateCommandRequest _aggregationRequest;
         const LiteParsedPipeline _liteParsedPipeline;
         const PrivilegeVector _privileges;
     };
@@ -180,6 +185,10 @@ public:
 
     bool adminOnly() const override {
         return false;
+    }
+
+    const AuthorizationContract* getAuthorizationContract() const final {
+        return &::mongo::AggregateCommandRequest::kAuthorizationContract;
     }
 } clusterPipelineCmd;
 

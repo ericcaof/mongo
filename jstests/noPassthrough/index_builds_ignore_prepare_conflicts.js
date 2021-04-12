@@ -6,7 +6,7 @@
  *   requires_replication,
  *   uses_prepare_transaction,
  *   uses_transactions,
- *   ]
+ * ]
  */
 (function() {
 "use strict";

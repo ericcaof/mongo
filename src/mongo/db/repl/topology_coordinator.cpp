@@ -351,12 +351,17 @@ HostAndPort TopologyCoordinator::_chooseNearbySyncSource(Date_t now,
             const auto closestNode = _rsConfig.getMemberAt(closestIndex).getHostAndPort();
 
             // Do not update 'closestIndex' if the candidate is not the closest node we've seen.
-            if (_getPing(syncSourceCandidate) > _getPing(closestNode)) {
+            auto syncSourceCandidatePing = _getPing(syncSourceCandidate);
+            auto closestPing = _getPing(closestNode);
+            if (syncSourceCandidatePing > closestPing) {
                 LOGV2_DEBUG(3873114,
                             2,
                             "Cannot select sync source with higher latency than the best "
                             "candidate",
-                            "syncSourceCandidate"_attr = syncSourceCandidate);
+                            "syncSourceCandidate"_attr = syncSourceCandidate,
+                            "syncSourceCandidatePing"_attr = syncSourceCandidatePing,
+                            "closestNode"_attr = closestNode,
+                            "closestPing"_attr = closestPing);
                 continue;
             }
             closestIndex = candidateIndex;
@@ -478,13 +483,14 @@ bool TopologyCoordinator::_isEligibleSyncSource(int candidateIndex,
             return false;
         }
         // Candidate must not have a configured delay larger than ours.
-        if (_selfConfig().getSlaveDelay() < memberConfig.getSlaveDelay()) {
+        if (_selfConfig().getSecondaryDelay() < memberConfig.getSecondaryDelay()) {
             LOGV2_DEBUG(3873111,
                         2,
-                        "Cannot select sync source with larger slaveDelay than ours",
+                        "Cannot select sync source with larger secondaryDelaySecs than ours",
                         "syncSourceCandidate"_attr = syncSourceCandidate,
-                        "syncSourceCandidateSlaveDelay"_attr = memberConfig.getSlaveDelay(),
-                        "slaveDelay"_attr = _selfConfig().getSlaveDelay());
+                        "syncSourceCandidateSecondaryDelaySecs"_attr =
+                            memberConfig.getSecondaryDelay(),
+                        "secondaryDelaySecs"_attr = _selfConfig().getSecondaryDelay());
             return false;
         }
     }
@@ -997,8 +1003,11 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
             nextAction = HeartbeatResponseAction::makeReconfigAction();
             nextAction.setNextHeartbeatStartDate(nextHeartbeatStartDate);
 
-            // TODO(SERVER-48178) Only continue processing heartbeat in primary state to avoid
-            // concurrent reconfig and rollback.
+            // Only continue processing heartbeat in primary state. In other states it is not
+            // safe to continue processing heartbeat and should start reconfig right away.
+            // e.g. if this node was removed from replSet, _selfIndex is -1, and a following
+            // check on _selfIndex will keep retrying heartbeat to fetch new config, preventing
+            // the new config to be installed.
             if (_role != Role::kLeader) {
                 return nextAction;
             }
@@ -1062,6 +1071,7 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
     MemberData& hbData = _memberData.at(memberIndex);
     const MemberConfig member = _rsConfig.getMemberAt(memberIndex);
     bool advancedOpTimeOrUpdatedConfig = false;
+    bool becameElectable = false;
     if (!hbResponse.isOK()) {
         if (isUnauthorized) {
             hbData.setAuthIssue(now);
@@ -1088,7 +1098,9 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
                     "setUpValues: heartbeat response good",
                     "memberId"_attr = member.getId());
         pingsInConfig++;
+        auto wasUnelectable = hbData.isUnelectable();
         advancedOpTimeOrUpdatedConfig = hbData.setUpValues(now, std::move(hbr));
+        becameElectable = wasUnelectable && !hbData.isUnelectable();
     }
 
     _updatePrimaryFromHBDataV1(now);
@@ -1102,6 +1114,7 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
 
     nextAction.setNextHeartbeatStartDate(nextHeartbeatStartDate);
     nextAction.setAdvancedOpTimeOrUpdatedConfig(advancedOpTimeOrUpdatedConfig);
+    nextAction.setBecameElectable(becameElectable);
     return nextAction;
 }
 
@@ -1862,8 +1875,8 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
                 bb.appendDate("electionDate",
                               Date_t::fromDurationSinceEpoch(Seconds(_electionTime.getSecs())));
             }
-            bb.appendIntOrLL("configVersion", _rsConfig.getConfigVersion());
-            bb.appendIntOrLL("configTerm", _rsConfig.getConfigTerm());
+            bb.appendNumber("configVersion", static_cast<long long>(_rsConfig.getConfigVersion()));
+            bb.appendNumber("configTerm", static_cast<long long>(_rsConfig.getConfigTerm()));
             bb.append("self", true);
             bb.append("lastHeartbeatMessage", "");
             membersOut.push_back(bb.obj());
@@ -1925,8 +1938,8 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
                     "electionDate",
                     Date_t::fromDurationSinceEpoch(Seconds(it->getElectionTime().getSecs())));
             }
-            bb.appendIntOrLL("configVersion", it->getConfigVersion());
-            bb.appendIntOrLL("configTerm", it->getConfigTerm());
+            bb.appendNumber("configVersion", it->getConfigVersion());
+            bb.appendNumber("configTerm", it->getConfigTerm());
             membersOut.push_back(bb.obj());
         }
     }
@@ -2087,7 +2100,7 @@ void TopologyCoordinator::fillHelloForReplSet(std::shared_ptr<HelloResponse> res
     invariant(!_rsConfig.members().empty());
 
     for (const auto& member : _rsConfig.members()) {
-        if (member.isHidden() || member.getSlaveDelay() > Seconds{0}) {
+        if (member.isHidden() || member.getSecondaryDelay() > Seconds{0}) {
             continue;
         }
         auto hostView = member.getHostAndPort(horizonString);
@@ -2121,8 +2134,8 @@ void TopologyCoordinator::fillHelloForReplSet(std::shared_ptr<HelloResponse> res
     } else if (selfConfig.getPriority() == 0) {
         response->setIsPassive(true);
     }
-    if (selfConfig.getSlaveDelay() > Seconds(0)) {
-        response->setSecondaryDelaySecs(selfConfig.getSlaveDelay());
+    if (selfConfig.getSecondaryDelay() > Seconds(0)) {
+        response->setSecondaryDelaySecs(selfConfig.getSecondaryDelay());
     }
     if (selfConfig.isHidden()) {
         response->setIsHidden(true);
@@ -3089,8 +3102,8 @@ bool TopologyCoordinator::shouldChangeSyncSourceDueToPingTime(const HostAndPort&
         return false;
     }
 
-    // If we are configured with slaveDelay, do not re-evaluate our sync source.
-    if (_selfIndex == -1 || _selfConfig().getSlaveDelay() > Seconds(0)) {
+    // If we are configured with secondaryDelaySecs, do not re-evaluate our sync source.
+    if (_selfIndex == -1 || _selfConfig().getSecondaryDelay() > Seconds(0)) {
         return false;
     }
 

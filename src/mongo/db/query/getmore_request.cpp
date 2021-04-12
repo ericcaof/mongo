@@ -35,6 +35,7 @@
 
 #include <boost/optional.hpp>
 
+#include "mongo/db/api_parameters_gen.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/bson_extract_optime.h"
@@ -51,9 +52,6 @@ const char kBatchSizeField[] = "batchSize";
 const char kAwaitDataTimeoutField[] = "maxTimeMS";
 const char kTermField[] = "term";
 const char kLastKnownCommittedOpTimeField[] = "lastKnownCommittedOpTime";
-const char kApiVersion[] = "apiVersion";
-const char kApiStrict[] = "apiStrict";
-const char kApiDeprecationErrors[] = "apiDeprecationErrors";
 
 }  // namespace
 
@@ -91,101 +89,6 @@ Status GetMoreRequest::isValid() const {
     }
 
     return Status::OK();
-}
-
-// static
-StatusWith<GetMoreRequest> GetMoreRequest::parseFromBSON(const std::string& dbname,
-                                                         const BSONObj& cmdObj) {
-    // Required fields.
-    boost::optional<CursorId> cursorid;
-    boost::optional<NamespaceString> nss;
-
-    // Optional fields.
-    boost::optional<std::int64_t> batchSize;
-    boost::optional<Milliseconds> awaitDataTimeout;
-    boost::optional<long long> term;
-    boost::optional<repl::OpTime> lastKnownCommittedOpTime;
-
-    for (BSONElement el : cmdObj) {
-        const auto fieldName = el.fieldNameStringData();
-
-        auto containsAPIParamField = fieldName == kApiVersion || fieldName == kApiStrict ||
-            fieldName == kApiDeprecationErrors;
-        uassert(4937600,
-                str::stream() << "Cannot pass in API parameter field " << fieldName,
-                !containsAPIParamField);
-
-        if (fieldName == kGetMoreCommandName) {
-            if (el.type() != BSONType::NumberLong) {
-                return {ErrorCodes::TypeMismatch,
-                        str::stream() << "Field 'getMore' must be of type long in: " << cmdObj};
-            }
-
-            cursorid = el.Long();
-        } else if (fieldName == kCollectionField) {
-            if (el.type() != BSONType::String) {
-                return {ErrorCodes::TypeMismatch,
-                        str::stream()
-                            << "Field 'collection' must be of type string in: " << cmdObj};
-            }
-
-            BSONElement collElt = cmdObj["collection"];
-            const std::string coll = (collElt.type() == BSONType::String) ? collElt.String() : "";
-            nss = NamespaceString(dbname, coll);
-        } else if (fieldName == kBatchSizeField) {
-            if (!el.isNumber()) {
-                return {ErrorCodes::TypeMismatch,
-                        str::stream() << "Field 'batchSize' must be a number in: " << cmdObj};
-            }
-
-            batchSize = el.numberLong();
-        } else if (fieldName == kAwaitDataTimeoutField) {
-            auto maxAwaitDataTime = QueryRequest::parseMaxTimeMS(el);
-            if (!maxAwaitDataTime.isOK()) {
-                return maxAwaitDataTime.getStatus();
-            }
-
-            if (maxAwaitDataTime.getValue()) {
-                awaitDataTimeout = Milliseconds(maxAwaitDataTime.getValue());
-            }
-        } else if (fieldName == kTermField) {
-            if (el.type() != BSONType::NumberLong) {
-                return {ErrorCodes::TypeMismatch,
-                        str::stream() << "Field 'term' must be of type NumberLong in: " << cmdObj};
-            }
-            term = el.Long();
-        } else if (fieldName == kLastKnownCommittedOpTimeField) {
-            repl::OpTime ot;
-            Status status = bsonExtractOpTimeField(el.wrap(), kLastKnownCommittedOpTimeField, &ot);
-            if (!status.isOK()) {
-                return status;
-            }
-            lastKnownCommittedOpTime = ot;
-        } else if (!isGenericArgument(fieldName)) {
-            return {ErrorCodes::FailedToParse,
-                    str::stream() << "Failed to parse: " << cmdObj << ". "
-                                  << "Unrecognized field '" << fieldName << "'."};
-        }
-    }
-
-    if (!cursorid) {
-        return {ErrorCodes::FailedToParse,
-                str::stream() << "Field 'getMore' missing in: " << cmdObj};
-    }
-
-    if (!nss) {
-        return {ErrorCodes::FailedToParse,
-                str::stream() << "Field 'collection' missing in: " << cmdObj};
-    }
-
-    GetMoreRequest request(
-        std::move(*nss), *cursorid, batchSize, awaitDataTimeout, term, lastKnownCommittedOpTime);
-    Status validStatus = request.isValid();
-    if (!validStatus.isOK()) {
-        return validStatus;
-    }
-
-    return request;
 }
 
 BSONObj GetMoreRequest::toBSON() const {

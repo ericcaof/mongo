@@ -56,25 +56,20 @@ inline Status asyncTryCanceledStatus() {
 }
 
 /**
- * Widget to get a default-constructible object that allows access to the type passed in at
- * compile time. Used for getReturnType below.
+ * Creates an ExecutorFuture from the result of the input callable.
  */
-template <typename T>
-struct DefaultConstructibleWrapper {
-    using type = T;
-};
+template <typename Callable>
+auto makeExecutorFutureWith(ExecutorPtr executor, Callable&& callable) {
+    using CallableResult = std::invoke_result_t<Callable>;
 
-/**
- * Helper to get the return type of the loop body in TryUntilLoop/TryUntilLoopWithDelay. This is
- * required because the loop body may return a future-like type, which wraps another result type
- * (specified in Future<T>::value_type), or some other kind of raw type which can be used directly.
- */
-template <typename T>
-auto getReturnType() {
-    if constexpr (future_details::isFutureLike<std::decay_t<T>>) {
-        return DefaultConstructibleWrapper<typename T::value_type>();
+    if constexpr (future_details::isFutureLike<CallableResult>) {
+        try {
+            return callable().thenRunOn(executor);
+        } catch (const DBException& e) {
+            return ExecutorFuture<FutureContinuationResult<Callable>>(executor, e.toStatus());
+        }
     } else {
-        return DefaultConstructibleWrapper<T>();
+        return makeReadyFutureWith(callable).thenRunOn(executor);
     }
 }
 
@@ -101,7 +96,7 @@ public:
      * iteration of the loop body threw an exception or otherwise returned an error status, the
      * returned ExecutorFuture will contain that error.
      */
-    auto on(std::shared_ptr<executor::TaskExecutor> executor, CancelationToken cancelToken)&& {
+    auto on(std::shared_ptr<executor::TaskExecutor> executor, CancellationToken cancelToken)&& {
         auto loop = std::make_shared<TryUntilLoopWithDelay>(std::move(executor),
                                                             std::move(_body),
                                                             std::move(_condition),
@@ -121,7 +116,7 @@ private:
                               BodyCallable executeLoopBody,
                               ConditionCallable shouldStopIteration,
                               Delay delay,
-                              CancelationToken cancelToken)
+                              CancellationToken cancelToken)
             : executor(std::move(executor)),
               executeLoopBody(std::move(executeLoopBody)),
               shouldStopIteration(std::move(shouldStopIteration)),
@@ -132,31 +127,67 @@ private:
          * Performs actual looping through recursion.
          */
         ExecutorFuture<FutureContinuationResult<BodyCallable>> run() {
-            using ReturnType =
-                typename decltype(getReturnType<decltype(executeLoopBody())>())::type;
-            // If the request to executeLoopBody has already been canceled, don't attempt to run it.
-            if (cancelToken.isCanceled()) {
+            using ReturnType = FutureContinuationResult<BodyCallable>;
+
+            // If the request is already canceled, don't run anything.
+            if (cancelToken.isCanceled())
                 return ExecutorFuture<ReturnType>(executor, asyncTryCanceledStatus());
-            }
-            auto future = ExecutorFuture<void>(executor).then(executeLoopBody);
 
-            return std::move(future).onCompletion(
-                [this, self = this->shared_from_this()](StatusOrStatusWith<ReturnType> s) {
-                    if (shouldStopIteration(s))
-                        return ExecutorFuture<ReturnType>(executor, std::move(s));
+            auto [promise, future] = makePromiseFuture<ReturnType>();
 
-                    // Retry after a delay.
-                    return executor->sleepFor(delay.getNext(), cancelToken).then([this, self] {
-                        return run();
+            // Kick off the asynchronous loop.
+            runImpl(std::move(promise));
+
+            return std::move(future).thenRunOn(executor);
+        }
+
+
+        /**
+         * Helper function that schedules an asynchronous task. This task executes the loop body and
+         * either terminates the loop by emplacing the resultPromise, or makes a recursive call to
+         * reschedule another iteration of the loop.
+         */
+        template <typename ReturnType>
+        void runImpl(Promise<ReturnType> resultPromise) {
+            executor->schedule([this,
+                                self = this->shared_from_this(),
+                                resultPromise =
+                                    std::move(resultPromise)](Status scheduleStatus) mutable {
+                if (!scheduleStatus.isOK()) {
+                    resultPromise.setError(std::move(scheduleStatus));
+                    return;
+                }
+
+                using BodyCallableResult = std::invoke_result_t<BodyCallable>;
+                // Convert the result of the loop body into an ExecutorFuture, even if the
+                // loop body is not future-returning. This isn't strictly necessary but it
+                // makes implementation easier.
+                makeExecutorFutureWith(executor, executeLoopBody)
+                    .getAsync([this, self, resultPromise = std::move(resultPromise)](
+                                  StatusOrStatusWith<ReturnType>&& swResult) mutable {
+                        if (cancelToken.isCanceled()) {
+                            resultPromise.setError(asyncTryCanceledStatus());
+                        } else if (shouldStopIteration(swResult)) {
+                            resultPromise.setFrom(std::move(swResult));
+                        } else {
+                            // Retry after a delay.
+                            executor->sleepFor(delay.getNext(), cancelToken)
+                                .getAsync([this, self, resultPromise = std::move(resultPromise)](
+                                              Status s) mutable {
+                                    if (s.isOK()) {
+                                        runImpl(std::move(resultPromise));
+                                    }
+                                });
+                        }
                     });
-                });
+            });
         }
 
         std::shared_ptr<executor::TaskExecutor> executor;
         BodyCallable executeLoopBody;
         ConditionCallable shouldStopIteration;
         Delay delay;
-        CancelationToken cancelToken;
+        CancellationToken cancelToken;
     };
 
     BodyCallable _body;
@@ -206,7 +237,7 @@ public:
      * iteration of the loop body threw an exception or otherwise returned an error status, the
      * returned ExecutorFuture will contain that error.
      */
-    auto on(std::shared_ptr<executor::TaskExecutor> executor, CancelationToken cancelToken)&& {
+    auto on(ExecutorPtr executor, CancellationToken cancelToken)&& {
         auto loop = std::make_shared<TryUntilLoop>(
             std::move(executor), std::move(_body), std::move(_condition), std::move(cancelToken));
         // Launch the recursive chain using the helper class.
@@ -245,10 +276,10 @@ private:
      * Mostly needed to clean up lambda captures and make the looping logic more readable.
      */
     struct TryUntilLoop : public std::enable_shared_from_this<TryUntilLoop> {
-        TryUntilLoop(std::shared_ptr<executor::TaskExecutor> executor,
+        TryUntilLoop(ExecutorPtr executor,
                      BodyCallable executeLoopBody,
                      ConditionCallable shouldStopIteration,
-                     CancelationToken cancelToken)
+                     CancellationToken cancelToken)
             : executor(std::move(executor)),
               executeLoopBody(std::move(executeLoopBody)),
               shouldStopIteration(std::move(shouldStopIteration)),
@@ -258,26 +289,56 @@ private:
          * Performs actual looping through recursion.
          */
         ExecutorFuture<FutureContinuationResult<BodyCallable>> run() {
-            using ReturnType =
-                typename decltype(getReturnType<decltype(executeLoopBody())>())::type;
+            using ReturnType = FutureContinuationResult<BodyCallable>;
+
             // If the request is already canceled, don't run anything.
             if (cancelToken.isCanceled())
                 return ExecutorFuture<ReturnType>(executor, asyncTryCanceledStatus());
-            auto future = ExecutorFuture<void>(executor).then(executeLoopBody);
 
-            return std::move(future).onCompletion(
-                [this, self = this->shared_from_this()](StatusOrStatusWith<ReturnType> s) {
-                    if (shouldStopIteration(s))
-                        return ExecutorFuture<ReturnType>(executor, std::move(s));
+            auto [promise, future] = makePromiseFuture<ReturnType>();
 
-                    return run();
+            // Kick off the asynchronous loop.
+            runImpl(std::move(promise));
+
+            return std::move(future).thenRunOn(executor);
+        }
+
+        /**
+         * Helper function that schedules an asynchronous task. This task executes the loop body and
+         * either terminates the loop by emplacing the resultPromise, or makes a recursive call to
+         * reschedule another iteration of the loop.
+         */
+        template <typename ReturnType>
+        void runImpl(Promise<ReturnType> resultPromise) {
+            executor->schedule(
+                [this, self = this->shared_from_this(), resultPromise = std::move(resultPromise)](
+                    Status scheduleStatus) mutable {
+                    if (!scheduleStatus.isOK()) {
+                        resultPromise.setError(std::move(scheduleStatus));
+                        return;
+                    }
+
+                    // Convert the result of the loop body into an ExecutorFuture, even if the
+                    // loop body is not Future-returning. This isn't strictly necessary but it
+                    // makes implementation easier.
+                    makeExecutorFutureWith(executor, executeLoopBody)
+                        .getAsync([this, self, resultPromise = std::move(resultPromise)](
+                                      StatusOrStatusWith<ReturnType>&& swResult) mutable {
+                            if (cancelToken.isCanceled()) {
+                                resultPromise.setError(asyncTryCanceledStatus());
+                            } else if (shouldStopIteration(swResult)) {
+                                resultPromise.setFrom(std::move(swResult));
+                            } else {
+                                runImpl(std::move(resultPromise));
+                            }
+                        });
                 });
         }
 
-        std::shared_ptr<executor::TaskExecutor> executor;
+        ExecutorPtr executor;
         BodyCallable executeLoopBody;
         ConditionCallable shouldStopIteration;
-        CancelationToken cancelToken;
+        CancellationToken cancelToken;
     };
 
     BodyCallable _body;
@@ -295,6 +356,18 @@ inline constexpr bool isFutureOrExecutorFuture<ExecutorFuture<T>> = true;
 
 static inline const std::string kWhenAllSucceedEmptyInputInvariantMsg =
     "Must pass at least one future to whenAllSucceed";
+
+/**
+ * Turns a variadic parameter pack into a vector without invoking copies if possible via static
+ * casts.
+ */
+template <typename... U, typename T = std::common_type_t<U...>>
+std::vector<T> variadicArgsToVector(U&&... elems) {
+    std::vector<T> vector;
+    vector.reserve(sizeof...(elems));
+    (vector.push_back(std::forward<U>(elems)), ...);
+    return vector;
+}
 
 }  // namespace future_util_details
 
@@ -541,4 +614,172 @@ SemiFuture<Result> whenAny(std::vector<FutureT>&& futures) {
 
     return std::move(future).semi();
 }
+
+/**
+ * Variadic template overloads for the above helper functions. Though not strictly necessary,
+ * we peel off the first element of each input list in order to assist the compiler in type
+ * inference and to prevent 0 length lists from compiling.
+ */
+TEMPLATE(typename... FuturePack,
+         typename FutureLike = std::common_type_t<FuturePack...>,
+         typename Value = typename FutureLike::value_type,
+         typename ResultVector = std::vector<Value>)
+REQUIRES(future_util_details::isFutureOrExecutorFuture<FutureLike>)
+auto whenAllSucceed(FuturePack&&... futures) {
+    return whenAllSucceed(
+        future_util_details::variadicArgsToVector(std::forward<FuturePack>(futures)...));
+}
+
+template <typename... FuturePack,
+          typename FutureT = std::common_type_t<FuturePack...>,
+          typename Value = typename FutureT::value_type,
+          typename ResultVector = std::vector<StatusOrStatusWith<Value>>>
+SemiFuture<ResultVector> whenAll(FuturePack&&... futures) {
+    return whenAll(future_util_details::variadicArgsToVector(std::forward<FuturePack>(futures)...));
+}
+
+template <typename... FuturePack,
+          typename FutureT = std::common_type_t<FuturePack...>,
+          typename Result = WhenAnyResult<typename FutureT::value_type>>
+SemiFuture<Result> whenAny(FuturePack&&... futures) {
+    return whenAny(future_util_details::variadicArgsToVector(std::forward<FuturePack>(futures)...));
+}
+
+namespace future_util {
+
+/**
+ * Takes an input Future, ExecutorFuture, SemiFuture, or SharedSemiFuture and a CancellationToken,
+ * and returns a new SemiFuture that will be resolved when either the input future is resolved or
+ * when the input CancellationToken is canceled. If the token is canceled before the input future is
+ * resolved, the resulting SemiFuture will be resolved with a CallbackCanceled error. Otherwise, the
+ * resulting SemiFuture will be resolved with the same result as the input future.
+ */
+template <typename FutureT, typename Value = typename FutureT::value_type>
+SemiFuture<Value> withCancellation(FutureT&& inputFuture, const CancellationToken& token) {
+    /**
+     * A structure used to share state between the continuation we attach to the input future and
+     * the continuation we attach to the token's onCancel() future.
+     */
+    struct SharedBlock {
+        SharedBlock(Promise<Value> result) : resultPromise(std::move(result)) {}
+        // Tracks whether or not the resultPromise has been set.
+        AtomicWord<bool> done{false};
+        // The promise corresponding to the resulting SemiFuture returned by this function.
+        Promise<Value> resultPromise;
+    };
+
+    auto [promise, future] = makePromiseFuture<Value>();
+    auto sharedBlock = std::make_shared<SharedBlock>(std::move(promise));
+
+    std::move(inputFuture)
+        .unsafeToInlineFuture()
+        .getAsync([sharedBlock](StatusOrStatusWith<Value> result) {
+            // If the input future completes first, change done to true and set the
+            // value on the promise.
+            if (!sharedBlock->done.swap(true)) {
+                sharedBlock->resultPromise.setFrom(std::move(result));
+            }
+        });
+
+    token.onCancel().unsafeToInlineFuture().getAsync([sharedBlock](Status s) {
+        if (s.isOK()) {
+            // If the cancellation token is canceled first, change done to true and set the value on
+            // the promise.
+            if (!sharedBlock->done.swap(true)) {
+                sharedBlock->resultPromise.setError(
+                    {ErrorCodes::CallbackCanceled,
+                     "CancellationToken canceled while waiting for input future"});
+            }
+        }
+    });
+
+    return std::move(future).semi();
+}
+
+/**
+ * This class is a helper for ensuring RAII-like behavior in async code.
+ *
+ * This class constructs a heap allocated State object in make(), and then uses that State object
+ * with a Launcher functor to create a future. The State object is persisted until the future
+ * created by the Launcher completes. If the Launcher emits an exception, the state is destructed.
+ * If the State ctor throws, then the error Status is returned as a ready future instead of invoking
+ * the Launcher. The simplest example would be a guard that is destroyed once an async function
+ * finishes:
+ * ```
+ * auto myFuture = future_util::AsyncState::make<MyGuard>({})
+ *     .thenWithState([](MyGuard*) { return myAsyncFunc(); });
+ * ```
+ *
+ * Note that this class is not usable for ExecutorFutures because there is no tapAll() function to
+ * invoke. If you want similar behavior, simply bind your state to the final callback in the async
+ * chain, but do be mindful of TODO(SERVER-52942).
+ */
+template <typename State>
+class [[nodiscard]] AsyncState {
+public:
+    explicit AsyncState(std::unique_ptr<State> state)
+        : _status(Status::OK()), _state(std::move(state)) {}
+
+    /**
+     * Consume the AsyncState and bind the underlying state to the tail of the future returned from
+     * the launcher functor.
+     *
+     * If the AsyncState was constructed with a Status, then return the captured status instead of
+     * running the launcher.
+     */
+    template <typename Launcher>
+        auto thenWithState(Launcher && launcher) && noexcept {
+        using namespace future_details;
+        using ReturnType = FutureFor<NormalizedCallResult<Launcher, State*>>;
+
+        if (!_status.isOK()) {
+            // The factory threw, we have no state to run the launcher with.
+            return ReturnType::makeReady(std::move(_status));
+        }
+
+        auto ptr = _state.get();
+        return makeReadyFutureWith([&] {
+            auto future = coerceToFuture(std::forward<Launcher>(launcher)(ptr));
+            return std::move(future).tapAll([state = std::move(_state)](auto&&) mutable {
+                // Finally, release our state.
+                auto localState = std::move(state);
+            });
+        });
+    }
+
+    /**
+     * This function is a helper for making an AsyncState given ala make_unique.
+     *
+     * If an exception would be emitted, it is instead stored in the AsyncState.
+     */
+    template <typename... Args>
+    static auto make(Args && ... args) noexcept {
+        try {
+            auto ptr = std::make_unique<State>(std::forward<Args>(args)...);
+            return AsyncState(std::move(ptr));
+        } catch (const DBException& ex) {
+            return AsyncState(ex.toStatus());
+        }
+    }
+
+private:
+    /**
+     * This ctor allows make to capture exceptions and defer them until someone invokes
+     * thenWithState(). It is private simply because it is difficult to justify a good use case for
+     * it by an external user.
+     */
+    explicit AsyncState(Status status) : _status(std::move(status)) {}
+
+    Status _status;
+    std::unique_ptr<State> _state;
+};
+
+// This function is syntactic sugar for AsyncState<T>::make().
+template <typename T, typename... Args>
+auto makeState(Args&&... args) {
+    return AsyncState<T>::make(std::forward<Args>(args)...);
+}
+
+}  // namespace future_util
+
 }  // namespace mongo

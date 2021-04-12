@@ -75,7 +75,10 @@ function testProperAuthorization(conn, t, testcase, r) {
                 " with role " + r.key;
         }
     } else {
-        if (res.ok == 1 || (res.ok == 0 && res.code != authErrCode)) {
+        // Don't error if the test failed with CommandNotFound rather than an authorization failure
+        // because some commands may be guarded by feature flags.
+        if (res.ok == 1 ||
+            (res.ok == 0 && res.code != authErrCode && res.code !== ErrorCodes.CommandNotFound)) {
             out = "expected authorization failure" +
                 " but received result " + tojson(res) + " on db " + testcase.runOnDb +
                 " with role " + r.key;
@@ -162,17 +165,13 @@ authCommandsLib.runTests(conn, impls);
 MongoRunner.stopMongod(conn);
 
 // run all tests sharded
-// TODO: SERVER-43897 Make commands_user_defined_roles.js and commands_builtin_roles.js start shards
-// as replica sets.
 conn = new ShardingTest({
-    shards: 2,
+    shards: 1,
     mongos: 1,
+    config: 1,
     keyFile: "jstests/libs/key1",
-    other: {
-        shardOptions: opts,
-        shardAsReplicaSet: false,
-        mongosOptions: {setParameter: "trafficRecordingDirectory=" + dbPath}
-    }
+    other:
+        {shardOptions: opts, mongosOptions: {setParameter: "trafficRecordingDirectory=" + dbPath}}
 });
 authCommandsLib.runTests(conn, impls);
 conn.stop();

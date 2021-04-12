@@ -2,7 +2,10 @@
  * Tests that the writeConcern of a $out/$merge executed on a secondary is propagated to the primary
  * and is properly respected.
  *
- * @tags: [assumes_unsharded_collection, requires_replication]
+ * @tags: [
+ *   assumes_unsharded_collection,
+ *   requires_replication,
+ * ]
  */
 (function() {
 "use strict";

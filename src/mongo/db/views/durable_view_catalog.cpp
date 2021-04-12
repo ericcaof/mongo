@@ -85,7 +85,7 @@ void DurableViewCatalog::onSystemViewsCollectionDrop(OperationContext* opCtx,
     if (db) {
         // If the 'system.views' collection is dropped, we need to clear the in-memory state of the
         // view catalog.
-        ViewCatalog::clear(db);
+        ViewCatalog::clear(opCtx, db);
     }
 }
 
@@ -208,7 +208,6 @@ void DurableViewCatalogImpl::upsert(OperationContext* opCtx,
         CollectionUpdateArgs args;
         args.update = view;
         args.criteria = BSON("_id" << name.ns());
-        args.fromMigrate = false;
 
         const bool assumeIndexesAreAffected = true;
         systemViews->updateDocument(

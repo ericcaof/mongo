@@ -1,7 +1,9 @@
 /**
  * Confirms that background index builds on a primary are aborted when the node steps down between
  * the initialization and collection scan phases.
- * @tags: [requires_replication]
+ * @tags: [
+ *   requires_replication,
+ * ]
  */
 (function() {
 "use strict";

@@ -31,6 +31,7 @@
 
 #include "mongo/db/ops/write_ops_retryability.h"
 
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/write_ops_gen.h"
@@ -44,7 +45,7 @@ namespace {
  * In the case of nested oplog entry where the correct links are in the top level
  * oplog, oplogWithCorrectLinks can be used to specify the outer oplog.
  */
-void validateFindAndModifyRetryability(const write_ops::FindAndModifyCommand& request,
+void validateFindAndModifyRetryability(const write_ops::FindAndModifyCommandRequest& request,
                                        const repl::OplogEntry& oplogEntry,
                                        const repl::OplogEntry& oplogWithCorrectLinks) {
     auto opType = oplogEntry.getOpType();
@@ -127,14 +128,14 @@ BSONObj extractPreOrPostImage(OperationContext* opCtx, const repl::OplogEntry& o
  * previous execution of the command. In the case of nested oplog entry where the correct links
  * are in the top level oplog, oplogWithCorrectLinks can be used to specify the outer oplog.
  */
-write_ops::FindAndModifyReply parseOplogEntryForFindAndModify(
+write_ops::FindAndModifyCommandReply parseOplogEntryForFindAndModify(
     OperationContext* opCtx,
-    const write_ops::FindAndModifyCommand& request,
+    const write_ops::FindAndModifyCommandRequest& request,
     const repl::OplogEntry& oplogEntry,
     const repl::OplogEntry& oplogWithCorrectLinks) {
     validateFindAndModifyRetryability(request, oplogEntry, oplogWithCorrectLinks);
 
-    write_ops::FindAndModifyReply result;
+    write_ops::FindAndModifyCommandReply result;
     write_ops::FindAndModifyLastError lastError;
     lastError.setNumDocs(1);
 
@@ -205,9 +206,9 @@ SingleWriteResult parseOplogEntryForUpdate(const repl::OplogEntry& entry) {
     return res;
 }
 
-write_ops::FindAndModifyReply parseOplogEntryForFindAndModify(
+write_ops::FindAndModifyCommandReply parseOplogEntryForFindAndModify(
     OperationContext* opCtx,
-    const write_ops::FindAndModifyCommand& request,
+    const write_ops::FindAndModifyCommandRequest& request,
     const repl::OplogEntry& oplogEntry) {
     // Migrated op case.
     if (oplogEntry.getOpType() == repl::OpTypeEnum::kNoop) {

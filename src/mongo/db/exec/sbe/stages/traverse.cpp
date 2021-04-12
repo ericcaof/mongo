@@ -124,6 +124,8 @@ value::SlotAccessor* TraverseStage::getAccessor(CompileCtx& ctx, value::SlotId s
 }
 
 void TraverseStage::open(bool reOpen) {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.opens++;
     _children[0]->open(reOpen);
     // Do not open the inner child as we do not have values of correlated parameters yet.
@@ -140,6 +142,8 @@ void TraverseStage::openInner(value::TypeTags tag, value::Value val) {
 }
 
 PlanState TraverseStage::getNext() {
+    auto optTimer(getOptTimer(_opCtx));
+
     auto state = _children[0]->getNext();
     if (state != PlanState::ADVANCED) {
         return trackPlanState(state);
@@ -250,6 +254,8 @@ bool TraverseStage::traverse(value::SlotAccessor* inFieldAccessor,
 }
 
 void TraverseStage::close() {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.closes++;
 
     if (_reOpenInner) {
@@ -268,14 +274,14 @@ std::unique_ptr<PlanStageStats> TraverseStage::getStats(bool includeDebugInfo) c
     if (includeDebugInfo) {
         DebugPrinter printer;
         BSONObjBuilder bob;
-        bob.appendNumber("innerOpens", _specificStats.innerOpens);
-        bob.appendNumber("innerCloses", _specificStats.innerCloses);
-        bob.appendIntOrLL("inputSlot", _inField);
-        bob.appendIntOrLL("outputSlot", _outField);
-        bob.appendIntOrLL("outputSlotInner", _outFieldInner);
+        bob.appendNumber("innerOpens", static_cast<long long>(_specificStats.innerOpens));
+        bob.appendNumber("innerCloses", static_cast<long long>(_specificStats.innerCloses));
+        bob.appendNumber("inputSlot", static_cast<long long>(_inField));
+        bob.appendNumber("outputSlot", static_cast<long long>(_outField));
+        bob.appendNumber("outputSlotInner", static_cast<long long>(_outFieldInner));
         bob.append("correlatedSlots", _correlatedSlots);
         if (_nestedArraysDepth) {
-            bob.appendNumber("nestedArraysDepth", *_nestedArraysDepth);
+            bob.appendNumber("nestedArraysDepth", static_cast<long long>(*_nestedArraysDepth));
         }
         if (_fold) {
             bob.append("fold", printer.print(_fold->debugPrint()));
@@ -312,17 +318,18 @@ std::vector<DebugPrinter::Block> TraverseStage::debugPrint() const {
         }
         ret.emplace_back("`]");
     }
-    if (_fold) {
-        ret.emplace_back("{`");
-        DebugPrinter::addBlocks(ret, _fold->debugPrint());
-        ret.emplace_back("`}");
-    }
 
-    if (_final) {
-        ret.emplace_back("{`");
-        DebugPrinter::addBlocks(ret, _final->debugPrint());
-        ret.emplace_back("`}");
+    ret.emplace_back("{`");
+    if (_fold) {
+        DebugPrinter::addBlocks(ret, _fold->debugPrint());
     }
+    ret.emplace_back("`}");
+
+    ret.emplace_back("{`");
+    if (_final) {
+        DebugPrinter::addBlocks(ret, _final->debugPrint());
+    }
+    ret.emplace_back("`}");
 
     DebugPrinter::addNewLine(ret);
     DebugPrinter::addIdentifier(ret, "from");

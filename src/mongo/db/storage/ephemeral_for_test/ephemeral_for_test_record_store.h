@@ -51,16 +51,16 @@ public:
     explicit RecordStore(StringData ns,
                          StringData ident,
                          bool isCapped = false,
-                         int64_t cappedMaxSize = -1,
-                         int64_t cappedMaxDocs = -1,
                          CappedCallback* cappedCallback = nullptr,
                          VisibilityManager* visibilityManager = nullptr);
     ~RecordStore() = default;
 
     virtual const char* name() const;
+    virtual KeyFormat keyFormat() const {
+        return KeyFormat::Long;
+    }
     virtual long long dataSize(OperationContext* opCtx) const;
     virtual long long numRecords(OperationContext* opCtx) const;
-    virtual bool isCapped() const;
     virtual void setCappedCallback(CappedCallback*);
     virtual int64_t storageSize(OperationContext* opCtx,
                                 BSONObjBuilder* extraInfo = nullptr,
@@ -101,10 +101,7 @@ public:
 
     virtual void appendCustomStats(OperationContext* opCtx,
                                    BSONObjBuilder* result,
-                                   double scale) const;
-
-    virtual boost::optional<RecordId> oplogStartHack(OperationContext* opCtx,
-                                                     const RecordId& startingPosition) const;
+                                   double scale) const {}
 
     void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) const override;
 
@@ -122,16 +119,7 @@ private:
      */
     int64_t _nextRecordId(OperationContext* opCtx);
 
-    /**
-     *  Two helper functions for deleting excess records in capped record stores.
-     *  The caller should not have an active SizeAdjuster.
-     */
-    bool _cappedAndNeedDelete(OperationContext* opCtx, StringStore* workingCopy);
-    void _cappedDeleteAsNeeded(OperationContext* opCtx, StringStore* workingCopy);
-
     const bool _isCapped;
-    const int64_t _cappedMaxSize;
-    const int64_t _cappedMaxDocs;
 
     StringData _ident;
 
@@ -188,6 +176,7 @@ private:
                VisibilityManager* visibilityManager);
         boost::optional<Record> next() final;
         boost::optional<Record> seekExact(const RecordId& id) final override;
+        boost::optional<Record> seekNear(const RecordId& id) final override;
         void save() final;
         void saveUnpositioned() final override;
         bool restore() final;
@@ -213,6 +202,7 @@ private:
                       VisibilityManager* visibilityManager);
         boost::optional<Record> next() final;
         boost::optional<Record> seekExact(const RecordId& id) final override;
+        boost::optional<Record> seekNear(const RecordId& id) final override;
         void save() final;
         void saveUnpositioned() final override;
         bool restore() final;

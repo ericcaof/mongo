@@ -77,7 +77,9 @@ public:
     BSONObj getPostBatchResumeToken() const {
         // Return a resume token compatible with resumable initial sync.
         if (_params.requestResumeToken) {
-            return BSON("$recordId" << _lastSeenId.repr());
+            BSONObjBuilder builder;
+            _lastSeenId.serializeToken("$recordId", &builder);
+            return builder.obj();
         }
         // Return a resume token compatible with resharding oplog sync.
         if (_params.shouldTrackLatestOplogTimestamp) {
@@ -111,20 +113,15 @@ private:
     void setLatestOplogEntryTimestamp(const Record& record);
 
     /**
-     * Asserts that the 'minTs' specified in the query filter has not already fallen off the oplog.
+     * Asserts that the minimum timestamp in the query filter has not already fallen off the oplog.
      */
-    void assertMinTsHasNotFallenOffOplog(const Record& record);
+    void assertTsHasNotFallenOffOplog(const Record& record);
 
     // WorkingSet is not owned by us.
     WorkingSet* _workingSet;
 
     // The filter is not owned by us.
     const MatchExpression* _filter;
-
-    // If a document does not pass '_filter' but passes '_endCondition', stop scanning and return
-    // IS_EOF.
-    BSONObj _endConditionBSON;
-    std::unique_ptr<GTEMatchExpression> _endCondition;
 
     std::unique_ptr<SeekableRecordCursor> _cursor;
 

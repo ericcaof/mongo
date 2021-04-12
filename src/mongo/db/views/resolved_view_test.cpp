@@ -54,7 +54,7 @@ const BSONObj kSimpleCollation;
 
 TEST(ResolvedViewTest, ExpandingAggRequestWithEmptyPipelineOnNoOpViewYieldsEmptyPipeline) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregateCommand requestOnView{viewNss, emptyPipeline};
+    AggregateCommandRequest requestOnView{viewNss, emptyPipeline};
 
     auto result = resolvedView.asExpandedViewAggregation(requestOnView);
     BSONObj expected =
@@ -66,7 +66,7 @@ TEST(ResolvedViewTest, ExpandingAggRequestWithEmptyPipelineOnNoOpViewYieldsEmpty
 TEST(ResolvedViewTest, ExpandingAggRequestWithNonemptyPipelineAppendsToViewPipeline) {
     std::vector<BSONObj> viewPipeline{BSON("skip" << 7)};
     const ResolvedView resolvedView{backingNss, viewPipeline, kSimpleCollation};
-    AggregateCommand requestOnView{viewNss, std::vector<BSONObj>{BSON("limit" << 3)}};
+    AggregateCommandRequest requestOnView{viewNss, std::vector<BSONObj>{BSON("limit" << 3)}};
 
     auto result = resolvedView.asExpandedViewAggregation(requestOnView);
 
@@ -79,7 +79,7 @@ TEST(ResolvedViewTest, ExpandingAggRequestWithNonemptyPipelineAppendsToViewPipel
 
 TEST(ResolvedViewTest, ExpandingAggRequestPreservesExplain) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregateCommand aggRequest{viewNss, {}};
+    AggregateCommandRequest aggRequest{viewNss, {}};
     aggRequest.setExplain(ExplainOptions::Verbosity::kExecStats);
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
@@ -89,19 +89,23 @@ TEST(ResolvedViewTest, ExpandingAggRequestPreservesExplain) {
 
 TEST(ResolvedViewTest, ExpandingAggRequestWithCursorAndExplainOnlyPreservesExplain) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregateCommand aggRequest{viewNss, {}};
-    aggRequest.setBatchSize(10);
+    AggregateCommandRequest aggRequest{viewNss, {}};
+    SimpleCursorOptions cursor;
+    cursor.setBatchSize(10);
+    aggRequest.setCursor(cursor);
     aggRequest.setExplain(ExplainOptions::Verbosity::kExecStats);
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
     ASSERT(result.getExplain());
     ASSERT(*result.getExplain() == ExplainOptions::Verbosity::kExecStats);
-    ASSERT_EQ(result.getBatchSize(), aggregation_request_helper::kDefaultBatchSize);
+    ASSERT_EQ(
+        result.getCursor().getBatchSize().value_or(aggregation_request_helper::kDefaultBatchSize),
+        aggregation_request_helper::kDefaultBatchSize);
 }
 
 TEST(ResolvedViewTest, ExpandingAggRequestPreservesBypassDocumentValidation) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregateCommand aggRequest(viewNss, {});
+    AggregateCommandRequest aggRequest(viewNss, {});
     aggRequest.setBypassDocumentValidation(true);
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
@@ -110,7 +114,7 @@ TEST(ResolvedViewTest, ExpandingAggRequestPreservesBypassDocumentValidation) {
 
 TEST(ResolvedViewTest, ExpandingAggRequestPreservesAllowDiskUse) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregateCommand aggRequest(viewNss, {});
+    AggregateCommandRequest aggRequest(viewNss, {});
     aggRequest.setAllowDiskUse(true);
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
@@ -119,7 +123,7 @@ TEST(ResolvedViewTest, ExpandingAggRequestPreservesAllowDiskUse) {
 
 TEST(ResolvedViewTest, ExpandingAggRequestPreservesHint) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregateCommand aggRequest(viewNss, {});
+    AggregateCommandRequest aggRequest(viewNss, {});
     aggRequest.setHint(BSON("a" << 1));
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
@@ -128,7 +132,7 @@ TEST(ResolvedViewTest, ExpandingAggRequestPreservesHint) {
 
 TEST(ResolvedViewTest, ExpandingAggRequestPreservesReadPreference) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregateCommand aggRequest(viewNss, {});
+    AggregateCommandRequest aggRequest(viewNss, {});
     aggRequest.setUnwrappedReadPref(BSON("$readPreference"
                                          << "nearest"));
 
@@ -140,7 +144,7 @@ TEST(ResolvedViewTest, ExpandingAggRequestPreservesReadPreference) {
 
 TEST(ResolvedViewTest, ExpandingAggRequestPreservesReadConcern) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregateCommand aggRequest(viewNss, {});
+    AggregateCommandRequest aggRequest(viewNss, {});
     aggRequest.setReadConcern(BSON("level"
                                    << "linearizable"));
 
@@ -152,7 +156,7 @@ TEST(ResolvedViewTest, ExpandingAggRequestPreservesReadConcern) {
 
 TEST(ResolvedViewTest, ExpandingAggRequestPreservesMaxTimeMS) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregateCommand aggRequest(viewNss, {});
+    AggregateCommandRequest aggRequest(viewNss, {});
     aggRequest.setMaxTimeMS(100u);
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
@@ -167,7 +171,7 @@ TEST(ResolvedViewTest, ExpandingAggRequestPreservesDefaultCollationOfView) {
     ASSERT_BSONOBJ_EQ(resolvedView.getDefaultCollation(),
                       BSON("locale"
                            << "fr_CA"));
-    AggregateCommand aggRequest(viewNss, {});
+    AggregateCommandRequest aggRequest(viewNss, {});
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
     ASSERT_BSONOBJ_EQ(result.getCollation().value_or(BSONObj()),

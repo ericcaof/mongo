@@ -2,6 +2,15 @@
  * Utilities for testing tenant migrations.
  */
 var TenantMigrationUtil = (function() {
+    const kExternalKeysNs = "config.external_validation_keys";
+
+    /**
+     * Returns the external keys for the given migration id.
+     */
+    function getExternalKeys(conn, migrationId) {
+        return conn.getCollection(kExternalKeysNs).find({migrationId}).toArray();
+    }
+
     /**
      * Returns whether tenant migration commands are supported.
      */
@@ -58,10 +67,18 @@ var TenantMigrationUtil = (function() {
     function makeMigrationCertificatesForTest() {
         return {
             donorCertificateForRecipient:
-                getCertificateAndPrivateKey("jstests/libs/rs0_tenant_migration.pem"),
+                getCertificateAndPrivateKey("jstests/libs/tenant_migration_donor.pem"),
             recipientCertificateForDonor:
-                getCertificateAndPrivateKey("jstests/libs/rs1_tenant_migration.pem")
+                getCertificateAndPrivateKey("jstests/libs/tenant_migration_recipient.pem")
         };
+    }
+
+    /**
+     * Takes in the response to the donorStartMigration command and returns true if the state is
+     * "committed" or "aborted".
+     */
+    function isMigrationCompleted(res) {
+        return res.state === "committed" || res.state === "aborted";
     }
 
     /**
@@ -78,6 +95,7 @@ var TenantMigrationUtil = (function() {
      */
     function runMigrationAsync(migrationOpts, donorRstArgs, retryOnRetryableErrors = false) {
         load("jstests/replsets/libs/tenant_migration_util.js");
+        const donorRst = new ReplSetTest({rstArgs: donorRstArgs});
 
         const migrationCertificates = TenantMigrationUtil.makeMigrationCertificatesForTest();
         const cmdObj = {
@@ -92,35 +110,8 @@ var TenantMigrationUtil = (function() {
                 migrationCertificates.recipientCertificateForDonor
         };
 
-        const donorRst = new ReplSetTest({rstArgs: donorRstArgs});
-        let donorPrimary = donorRst.getPrimary();
-
-        let res;
-        assert.soon(() => {
-            try {
-                res = donorPrimary.adminCommand(cmdObj);
-
-                if (!res.ok) {
-                    // If retry is enabled and the command failed with a NotPrimary error, continue
-                    // looping.
-                    if (retryOnRetryableErrors && ErrorCodes.isNotPrimaryError(res.code)) {
-                        donorPrimary = donorRst.getPrimary();
-                        return false;
-                    }
-                    return true;
-                }
-
-                return (res.state === "committed" || res.state === "aborted");
-            } catch (e) {
-                // If the thrown error is network related and we are allowing retryable errors,
-                // continue issuing commands.
-                if (retryOnRetryableErrors && isNetworkError(e)) {
-                    return false;
-                }
-                throw e;
-            }
-        });
-        return res;
+        return TenantMigrationUtil.runTenantMigrationCommand(
+            cmdObj, donorRst, retryOnRetryableErrors, TenantMigrationUtil.isMigrationCompleted);
     }
 
     /**
@@ -134,25 +125,60 @@ var TenantMigrationUtil = (function() {
      * TenantMigrationTest fixture.
      */
     function forgetMigrationAsync(migrationIdString, donorRstArgs, retryOnRetryableErrors = false) {
+        load("jstests/replsets/libs/tenant_migration_util.js");
         const donorRst = new ReplSetTest({rstArgs: donorRstArgs});
-        let donorPrimary = donorRst.getPrimary();
+        const cmdObj = {donorForgetMigration: 1, migrationId: UUID(migrationIdString)};
+        return TenantMigrationUtil.runTenantMigrationCommand(
+            cmdObj, donorRst, retryOnRetryableErrors);
+    }
 
+    /**
+     * Runs the donorAbortMigration command with the given migration options and returns the
+     * response.
+     *
+     * If 'retryOnRetryableErrors' is set, this function will retry if the command fails with a
+     * NotPrimary or network error.
+     *
+     * Only use when it is necessary to run the donorAbortMigration command in its own thread. For
+     * all other use cases, please consider the tryAbortMigration() function in the
+     * TenantMigrationTest fixture.
+     */
+    function tryAbortMigrationAsync(migrationOpts, donorRstArgs, retryOnRetryableErrors = false) {
+        load("jstests/replsets/libs/tenant_migration_util.js");
+        const donorRst = new ReplSetTest({rstArgs: donorRstArgs});
+        const cmdObj = {
+            donorAbortMigration: 1,
+            migrationId: UUID(migrationOpts.migrationIdString),
+        };
+        return TenantMigrationUtil.runTenantMigrationCommand(
+            cmdObj, donorRst, retryOnRetryableErrors);
+    }
+
+    /**
+     * Runs the given tenant migration command against the primary of the given replica set until
+     * the command succeeds or fails with a non-retryable error (if 'retryOnRetryableErrors' is
+     * true) or until 'shouldStopFunc' returns true (if it is given). Returns the last response.
+     */
+    function runTenantMigrationCommand(cmdObj, rst, retryOnRetryableErrors, shouldStopFunc) {
+        let primary = rst.getPrimary();
         let res;
-
         assert.soon(() => {
             try {
-                res = donorPrimary.adminCommand(
-                    {donorForgetMigration: 1, migrationId: UUID(migrationIdString)});
+                res = primary.adminCommand(cmdObj);
 
                 if (!res.ok) {
                     // If retry is enabled and the command failed with a NotPrimary error, continue
                     // looping.
                     if (retryOnRetryableErrors && ErrorCodes.isNotPrimaryError(res.code)) {
-                        donorPrimary = donorRst.getPrimary();
+                        primary = rst.getPrimary();
                         return false;
                     }
+                    return true;
                 }
 
+                if (shouldStopFunc) {
+                    return shouldStopFunc(res);
+                }
                 return true;
             } catch (e) {
                 if (retryOnRetryableErrors && isNetworkError(e)) {
@@ -164,26 +190,144 @@ var TenantMigrationUtil = (function() {
         return res;
     }
 
-    function createRstArgs(donorRst) {
-        const donorRstArgs = {
-            name: donorRst.name,
-            nodeHosts: donorRst.nodes.map(node => `127.0.0.1:${node.port}`),
-            nodeOptions: donorRst.nodeOptions,
-            keyFile: donorRst.keyFile,
-            host: donorRst.host,
+    function createRstArgs(rst) {
+        const rstArgs = {
+            name: rst.name,
+            nodeHosts: rst.nodes.map(node => `127.0.0.1:${node.port}`),
+            nodeOptions: rst.nodeOptions,
+            keyFile: rst.keyFile,
+            host: rst.host,
             waitForKeys: false,
         };
-        return donorRstArgs;
+        return rstArgs;
+    }
+
+    /**
+     * Returns the TenantMigrationAccessBlocker serverStatus output for the migration for the given
+     * tenant if there one.
+     */
+    function getTenantMigrationAccessBlocker(node, tenantId) {
+        const mtabs =
+            assert.commandWorked(node.adminCommand({serverStatus: 1})).tenantMigrationAccessBlocker;
+        if (!mtabs) {
+            return null;
+        }
+        return mtabs[tenantId];
+    }
+
+    /**
+     * Returns the number of reads on the given donor node that were blocked due to tenant migration
+     * for the given tenant.
+     */
+    function getNumBlockedReads(donorNode, tenantId) {
+        const mtab = getTenantMigrationAccessBlocker(donorNode, tenantId);
+        if (!mtab) {
+            return 0;
+        }
+        return mtab.numBlockedReads;
+    }
+
+    /**
+     * Returns the number of writes on the given donor node that were blocked due to tenant
+     * migration for the given tenant.
+     */
+    function getNumBlockedWrites(donorNode, tenantId) {
+        const mtab = getTenantMigrationAccessBlocker(donorNode, tenantId);
+        if (!mtab) {
+            return 0;
+        }
+        return mtab.numBlockedWrites;
+    }
+
+    /**
+     * Determines if a database name belongs to the given tenant.
+     */
+    function isNamespaceForTenant(tenantId, dbName) {
+        return dbName.startsWith(`${tenantId}_`);
+    }
+
+    /**
+     * Compares the hashes for DBs that belong to the specified tenant between the donor and
+     * recipient primaries.
+     */
+    function checkTenantDBHashes(donorRst,
+                                 recipientRst,
+                                 tenantId,
+                                 excludedDBs = [],
+                                 msgPrefix = 'checkTenantDBHashes',
+                                 ignoreUUIDs = false) {
+        // Always skip db hash checks for the config, admin, and local database.
+        excludedDBs = [...excludedDBs, "config", "admin", "local"];
+
+        const donorPrimary = donorRst.getPrimary();
+        const recipientPrimary = recipientRst.getPrimary();
+
+        // Filter out all dbs that don't belong to the tenant.
+        let combinedDBNames = [...donorPrimary.getDBNames(), ...recipientPrimary.getDBNames()];
+        combinedDBNames = combinedDBNames.filter(
+            dbName => (isNamespaceForTenant(tenantId, dbName) && !excludedDBs.includes(dbName)));
+        combinedDBNames = new Set(combinedDBNames);
+
+        for (const dbName of combinedDBNames) {
+            // Pass in an empty array for the secondaries, since we only wish to compare the DB
+            // hashes between the donor and recipient primary in this test.
+            const donorDBHash = assert.commandWorked(donorRst.getHashes(dbName, []).primary);
+            const recipientDBHash =
+                assert.commandWorked(recipientRst.getHashes(dbName, []).primary);
+
+            const donorCollections = Object.keys(donorDBHash.collections);
+            const donorCollInfos = new CollInfos(donorPrimary, 'donorPrimary', dbName);
+            donorCollInfos.filter(donorCollections);
+
+            const recipientCollections = Object.keys(recipientDBHash.collections);
+            const recipientCollInfos = new CollInfos(recipientPrimary, 'recipientPrimary', dbName);
+            recipientCollInfos.filter(recipientCollections);
+
+            // TODO (SERVER-55343): Investigate temp collection behavior during tenant migrations.
+            donorCollInfos.collInfosRes =
+                donorCollInfos.collInfosRes.filter(info => !info.options.temp);
+            recipientCollInfos.collInfosRes =
+                recipientCollInfos.collInfosRes.filter(info => !info.options.temp);
+
+            print(`checking db hash between donor: ${donorPrimary} and recipient: ${
+                recipientPrimary}`);
+
+            const collectionPrinted = new Set();
+            const success = DataConsistencyChecker.checkDBHash(donorDBHash,
+                                                               donorCollInfos,
+                                                               recipientDBHash,
+                                                               recipientCollInfos,
+                                                               msgPrefix,
+                                                               ignoreUUIDs,
+                                                               true, /* syncingHasIndexes */
+                                                               collectionPrinted);
+            if (!success) {
+                print(`checkTenantDBHashes dumping donor and recipient primary oplogs`);
+                donorRst.dumpOplog(donorPrimary, {}, 100);
+                recipientRst.dumpOplog(recipientPrimary, {}, 100);
+            }
+            assert(success, 'dbhash mismatch between donor and recipient primaries');
+        }
     }
 
     return {
+        kExternalKeysNs,
+        getExternalKeys,
         runMigrationAsync,
         forgetMigrationAsync,
+        tryAbortMigrationAsync,
         createRstArgs,
+        runTenantMigrationCommand,
         isFeatureFlagEnabled,
         getCertificateAndPrivateKey,
         makeX509Options,
         makeMigrationCertificatesForTest,
         makeX509OptionsForTest,
+        isMigrationCompleted,
+        getTenantMigrationAccessBlocker,
+        getNumBlockedReads,
+        getNumBlockedWrites,
+        isNamespaceForTenant,
+        checkTenantDBHashes
     };
 })();

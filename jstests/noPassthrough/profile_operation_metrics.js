@@ -1,17 +1,18 @@
 /**
  * Tests that resource consumption metrics are reported in the profiler.
  *
- *  @tags: [
- *    requires_capped,
- *    requires_fcv_47,
- *    requires_replication,
- *    requires_wiredtiger,
- *  ]
+ * @tags: [
+ *   requires_capped,
+ *   requires_fcv_47,
+ *   requires_replication,
+ *   requires_wiredtiger,
+ * ]
  */
 (function() {
 "use strict";
 
 load("jstests/libs/fixture_helpers.js");  // For isReplSet().
+load("jstests/core/timeseries/libs/timeseries.js");
 
 const dbName = jsTestName();
 const collName = 'coll';
@@ -34,11 +35,13 @@ const assertMetricsExist = (profilerEntry) => {
     assert.gte(metrics.docUnitsReturned, 0);
     assert.gte(metrics.cursorSeeks, 0);
 
-    // Every test should perform enough work to be measured as non-zero CPU activity in
-    // nanoseconds.
+    // Even though every test should perform enough work to be measured as non-zero CPU activity in
+    // nanoseconds, the OS is only required to return monotonically-increasing values. That means
+    // the OS may occasionally return the same CPU time between two different reads of the timer,
+    // resulting in the server calculating zero elapsed time.
     // The CPU time metrics are only collected on Linux.
     if (isLinux) {
-        assert.gt(metrics.cpuNanos, 0);
+        assert.gte(metrics.cpuNanos, 0);
     }
     assert.gte(metrics.docBytesWritten, 0);
     assert.gte(metrics.docUnitsWritten, 0);
@@ -1311,17 +1314,16 @@ const operations = [
         profileFilter: {op: 'insert', 'command.insert': 'capped'},
         profileAssert: (db, profileDoc) => {
             if (!isDebugBuild(db)) {
-                // Should read exactly as many bytes as are in the document that is being deleted.
+                // Capped deletes will read two documents. The first is the document to be deleted
+                // and the next is to cache the RecordId of the next document.
                 // Debug builds may perform extra reads of the _mdb_catalog.
-                assert.eq(profileDoc.docBytesRead, 29);
-                assert.eq(profileDoc.docUnitsRead, 1);
-                // The first time doing a capped delete, we don't know what the _cappedFirstRecord
-                // should be so we cannot seek to it.
-                assert.eq(profileDoc.cursorSeeks, 0);
+                assert.eq(profileDoc.docBytesRead, 58);
+                assert.eq(profileDoc.docUnitsRead, 2);
+                assert.eq(profileDoc.cursorSeeks, 1);
             } else {
-                assert.gte(profileDoc.docBytesRead, 29);
-                assert.gte(profileDoc.docUnitsRead, 1);
-                assert.gte(profileDoc.cursorSeeks, 0);
+                assert.gte(profileDoc.docBytesRead, 58);
+                assert.gte(profileDoc.docUnitsRead, 2);
+                assert.gte(profileDoc.cursorSeeks, 1);
             }
             assert.eq(profileDoc.idxEntryBytesRead, 0);
             assert.eq(profileDoc.idxEntryUnitsRead, 0);
@@ -1347,17 +1349,15 @@ const operations = [
         profileFilter: {op: 'insert', 'command.insert': 'capped'},
         profileAssert: (db, profileDoc) => {
             if (!isDebugBuild(db)) {
-                // Should read exactly as many bytes as are in the documents that are being deleted.
+                // Capped deletes will read two documents. The first is the document to be deleted
+                // and the next is to cache the RecordId of the next document.
                 // Debug builds may perform extra reads of the _mdb_catalog.
-                assert.eq(profileDoc.docBytesRead, 261);
-                assert.eq(profileDoc.docUnitsRead, 9);
-                // Each capped delete seeks twice if it knows what record to start at. Once at the
-                // start of the delete process and then once again to reposition itself at the first
-                // record to delete after it figures out how many documents must be deleted.
+                assert.eq(profileDoc.docBytesRead, 522);
+                assert.eq(profileDoc.docUnitsRead, 18);
                 assert.eq(profileDoc.cursorSeeks, 18);
             } else {
-                assert.gte(profileDoc.docBytesRead, 261);
-                assert.gte(profileDoc.docUnitsRead, 9);
+                assert.gte(profileDoc.docBytesRead, 522);
+                assert.gte(profileDoc.docUnitsRead, 18);
                 assert.gte(profileDoc.cursorSeeks, 18);
             }
             assert.eq(profileDoc.idxEntryBytesRead, 0);
@@ -1368,10 +1368,114 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 18);
             assert.eq(profileDoc.docUnitsReturned, 0);
         }
-    }
+    },
+    resetProfileColl,
+    {
+        name: 'createTimeseries',
+        skipTest: (db) => {
+            return !TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo());
+        },
+        command: (db) => {
+            assert.commandWorked(
+                db.createCollection('ts', {timeseries: {timeField: 't', metaField: 'host'}}));
+        },
+        profileFilter: {op: 'command', 'command.create': 'ts'},
+        profileAssert: (db, profileDoc) => {
+            // The size of the collection document in the _mdb_catalog may not be the same every
+            // test run, so only assert this is non-zero.
+            assert.gt(profileDoc.docBytesRead, 0);
+            assert.gt(profileDoc.docUnitsRead, 0);
+            assert.eq(profileDoc.idxEntryBytesRead, 0);
+            assert.eq(profileDoc.idxEntryUnitsRead, 0);
+            assert.gte(profileDoc.docBytesWritten, 0);
+            assert.gte(profileDoc.docUnitsWritten, 0);
+            assert.gte(profileDoc.idxEntryBytesWritten, 0);
+            assert.gte(profileDoc.idxEntryUnitsWritten, 0);
+            assert.gt(profileDoc.cursorSeeks, 0);
+            assert.eq(profileDoc.keysSorted, 0);
+            assert.eq(profileDoc.sorterSpills, 0);
+        }
+    },
+    {
+        name: 'insertTimeseriesNewBucket',
+        skipTest: (db) => {
+            return !TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo());
+        },
+        command: (db) => {
+            // Inserts a document that creates a new bucket.
+            assert.commandWorked(db.ts.insert({t: new Date(), host: 0}));
+        },
+        profileFilter: {op: 'insert', 'command.insert': 'ts'},
+        profileAssert: (db, profileDoc) => {
+            assert.eq(profileDoc.docBytesRead, 0);
+            assert.eq(profileDoc.docUnitsRead, 0);
+            assert.eq(profileDoc.idxEntryBytesRead, 0);
+            assert.eq(profileDoc.idxEntryUnitsRead, 0);
+            assert.eq(profileDoc.docBytesWritten, 194);
+            assert.eq(profileDoc.docUnitsWritten, 2);
+            assert.eq(profileDoc.idxEntryBytesWritten, 0);
+            assert.eq(profileDoc.idxEntryUnitsWritten, 0);
+            assert.eq(profileDoc.cursorSeeks, 0);
+            assert.eq(profileDoc.keysSorted, 0);
+            assert.eq(profileDoc.sorterSpills, 0);
+        }
+    },
+    resetProfileColl,
+    {
+        name: 'timeseriesUpdateBucket',
+        skipTest: (db) => {
+            return !TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo());
+        },
+        command: (db) => {
+            // Inserts a document by updating an existing bucket.
+            assert.commandWorked(db.ts.insert({t: new Date(), host: 0}));
+        },
+        profileFilter: {op: 'update'},
+        profileAssert: (db, profileDoc) => {
+            assert.eq(profileDoc.docBytesRead, 194);
+            assert.eq(profileDoc.docUnitsRead, 2);
+            assert.eq(profileDoc.idxEntryBytesRead, 0);
+            assert.eq(profileDoc.idxEntryUnitsRead, 0);
+            assert.eq(profileDoc.docBytesWritten, 220);
+            assert.eq(profileDoc.docUnitsWritten, 2);
+            assert.eq(profileDoc.idxEntryBytesWritten, 0);
+            assert.eq(profileDoc.idxEntryUnitsWritten, 0);
+            assert.eq(profileDoc.cursorSeeks, 1);
+            assert.eq(profileDoc.keysSorted, 0);
+            assert.eq(profileDoc.sorterSpills, 0);
+        }
+    },
+    {
+        name: 'timeseriesQuery',
+        skipTest: (db) => {
+            return !TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo());
+        },
+        command: (db) => {
+            assert.eq(2, db.ts.find().itcount());
+        },
+        profileFilter: {op: 'query', 'command.find': 'ts'},
+        profileAssert: (db, profileDoc) => {
+            assert.eq(profileDoc.docBytesRead, 220);
+            assert.eq(profileDoc.docUnitsRead, 2);
+            assert.eq(profileDoc.idxEntryBytesRead, 0);
+            assert.eq(profileDoc.idxEntryUnitsRead, 0);
+            assert.eq(profileDoc.docBytesWritten, 0);
+            assert.eq(profileDoc.docUnitsWritten, 0);
+            assert.eq(profileDoc.idxEntryBytesWritten, 0);
+            assert.eq(profileDoc.idxEntryUnitsWritten, 0);
+            assert.eq(profileDoc.cursorSeeks, 0);
+            assert.eq(profileDoc.keysSorted, 0);
+            assert.eq(profileDoc.sorterSpills, 0);
+        }
+    },
 ];
 
 const testOperation = (db, operation) => {
+    if (operation.skipTest && operation.skipTest(db)) {
+        jsTestLog("skipping test case: " + operation.name);
+        return;
+    }
+
     jsTestLog("Testing operation: " + operation.name);
     operation.command(db);
     if (!operation.profileFilter) {

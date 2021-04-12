@@ -38,6 +38,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/server_options.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/uuid.h"
@@ -73,6 +74,13 @@ public:
     static constexpr StringData kOrphanCollectionPrefix = "orphan."_sd;
     static constexpr StringData kOrphanCollectionDb = "local"_sd;
 
+    // Prefix for collections that store the local resharding oplog buffer.
+    static constexpr StringData kReshardingLocalOplogBufferPrefix =
+        "localReshardingOplogBuffer."_sd;
+
+    // Prefix for resharding conflict stash collections.
+    static constexpr StringData kReshardingConflictStashPrefix = "localReshardingConflictStash."_sd;
+
     // Prefix for temporary resharding collection.
     static constexpr StringData kTemporaryReshardingCollectionPrefix = "system.resharding."_sd;
 
@@ -100,8 +108,12 @@ public:
     // of a specific database
     static const NamespaceString kShardConfigDatabasesNamespace;
 
-    // Name for causal consistency's key collection.
-    static const NamespaceString kSystemKeysNamespace;
+    // Namespace for storing keys for signing and validating cluster times created by the cluster
+    // that this node is in.
+    static const NamespaceString kKeysCollectionNamespace;
+
+    // Namespace for storing keys for validating cluster times created by other clusters.
+    static const NamespaceString kExternalKeysCollectionNamespace;
 
     // Namespace of the the oplog collection.
     static const NamespaceString kRsOplogNamespace;
@@ -118,6 +130,9 @@ public:
     // Namespace for storing the persisted state of tenant migration recipient service instances.
     static const NamespaceString kTenantMigrationRecipientsNamespace;
 
+    // Namespace for view on local.oplog.rs for tenant migrations.
+    static const NamespaceString kTenantMigrationOplogView;
+
     // Namespace for replica set configuration settings.
     static const NamespaceString kSystemReplSetNamespace;
 
@@ -127,6 +142,9 @@ public:
     // Namespace for pending range deletions.
     static const NamespaceString kRangeDeletionNamespace;
 
+    // Namespace containing pending range deletions snapshots for rename operations.
+    static const NamespaceString kRangeDeletionForRenameNamespace;
+
     // Namespace for the coordinator's resharding operation state.
     static const NamespaceString kConfigReshardingOperationsNamespace;
 
@@ -135,6 +153,9 @@ public:
 
     // Namespace for the recipient shard's local resharding operation state.
     static const NamespaceString kRecipientReshardingOperationsNamespace;
+
+    // Namespace for persisting sharding DDL coordinators state documents
+    static const NamespaceString kShardingDDLCoordinatorsNamespace;
 
     // Namespace for balancer settings and default read and write concerns.
     static const NamespaceString kConfigSettingsNamespace;
@@ -148,12 +169,11 @@ public:
     // Namespace for storing config.transactions cloner progress for resharding.
     static const NamespaceString kReshardingTxnClonerProgressNamespace;
 
-    // Namespace for storing keys for signing and validating cluster times created by the cluster
-    // that this node is in.
-    static const NamespaceString kKeysCollectionNamespace;
+    // Namespace for storing config.collectionCriticalSections documents
+    static const NamespaceString kCollectionCriticalSectionsNamespace;
 
-    // Namespace for storing keys for validating cluster times created by other clusters.
-    static const NamespaceString kExternalKeysCollectionNamespace;
+    // Dummy namespace used for forcing secondaries to handle an oplog entry on its own batch.
+    static const NamespaceString kForceOplogBatchBoundaryNamespace;
 
     /**
      * Constructs an empty NamespaceString.
@@ -316,6 +336,16 @@ public:
     bool isConfigDotCacheDotChunks() const;
 
     /**
+     * Returns whether the specified namespace is config.localReshardingOplogBuffer.<>.
+     */
+    bool isReshardingLocalOplogBufferCollection() const;
+
+    /**
+     * Returns whether the specified namespace is config.localReshardingConflictStash.<>.
+     */
+    bool isReshardingConflictStashCollection() const;
+
+    /**
      * Returns whether the specified namespace is <database>.system.resharding.<>.
      */
     bool isTemporaryReshardingCollection() const;
@@ -359,7 +389,7 @@ public:
      * Returns true if a client can modify this namespace even though it is under ".system."
      * For example <dbname>.system.users is ok for regular clients to update.
      */
-    bool isLegalClientSystemNS() const;
+    bool isLegalClientSystemNS(const ServerGlobalParams::FeatureCompatibility& currentFCV) const;
 
     /**
      * Returns true if this namespace refers to a drop-pending collection.

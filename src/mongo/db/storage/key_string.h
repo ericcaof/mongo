@@ -544,6 +544,7 @@ public:
     void appendUndefined();
     void appendBinData(const BSONBinData& data);
     void appendSetAsArray(const BSONElementSet& set, const StringTransformFn& f = nullptr);
+    void appendOID(OID oid);
 
     /**
      * Appends a Discriminator byte and kEnd byte to a key string.
@@ -638,6 +639,9 @@ protected:
     void _appendNumberLong(const long long num, bool invert);
     void _appendNumberInt(const int num, bool invert);
     void _appendNumberDecimal(const Decimal128 num, bool invert);
+
+    void _appendRecordIdLong(const int64_t val);
+    void _appendRecordIdStr(const char* val, int size);
 
     /**
      * @param name - optional, can be NULL
@@ -940,9 +944,15 @@ BSONObj toBson(const T& keyString, Ordering ord) noexcept {
 }
 
 /**
- * Decodes a RecordId from the end of a buffer.
+ * Decodes a RecordId long from the end of a buffer.
  */
-RecordId decodeRecordIdAtEnd(const void* buf, size_t size);
+RecordId decodeRecordIdLongAtEnd(const void* buf, size_t size);
+
+/**
+ * Decodes a RecordId string from the end of a buffer.
+ * The RecordId string length cannot be determined by looking at the start of the string.
+ */
+RecordId decodeRecordIdStrAtEnd(const void* buf, size_t size);
 
 /**
  * Given a KeyString with a RecordId, returns the length of the section without the RecordId.
@@ -952,7 +962,7 @@ size_t sizeWithoutRecordIdAtEnd(const void* bufferRaw, size_t bufSize);
 /**
  * Decodes a RecordId, consuming all bytes needed from reader.
  */
-RecordId decodeRecordId(BufReader* reader);
+RecordId decodeRecordIdLong(BufReader* reader);
 
 int compare(const char* leftBuf, const char* rightBuf, size_t leftSize, size_t rightSize);
 
@@ -967,6 +977,16 @@ bool readSBEValue(BufReader* reader,
                   bool inverted,
                   Version version,
                   sbe::value::ValueBuilder* valueBuilder);
+
+/*
+ * Appends the first field of a key string to a BSON object.
+ * This does not accept TypeBits because callers of this function discard TypeBits.
+ */
+void appendSingleFieldToBSONAs(const char* buf,
+                               int len,
+                               StringData fieldName,
+                               BSONObjBuilder* builder,
+                               Version version = KeyString::Version::kLatestVersion);
 
 template <class BufferT>
 template <class T>

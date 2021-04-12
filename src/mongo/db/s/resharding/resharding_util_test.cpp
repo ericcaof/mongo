@@ -134,7 +134,7 @@ TEST(ReshardingUtilTest, HighestMinFetchTimestampThrowsWhenDonorMissingTimestamp
 
 TEST(ReshardingUtilTest, HighestMinFetchTimestampSucceedsWithDonorStateGTkDonatingOplogEntries) {
     std::vector<DonorShardEntry> donorShards{
-        makeDonorShard(ShardId("s0"), DonorStateEnum::kPreparingToMirror, Timestamp(10, 2)),
+        makeDonorShard(ShardId("s0"), DonorStateEnum::kPreparingToBlockWrites, Timestamp(10, 2)),
         makeDonorShard(ShardId("s1"), DonorStateEnum::kDonatingOplogEntries, Timestamp(10, 3)),
         makeDonorShard(ShardId("s2"), DonorStateEnum::kDonatingOplogEntries, Timestamp(10, 1))};
     auto highestMinFetchTimestamp = getHighestMinFetchTimestamp(donorShards);
@@ -350,26 +350,6 @@ TEST_F(ReshardingTxnCloningPipelineTest, TxnPipelineSorted) {
 
     ASSERT(pipelineMatchesDeque(pipeline, expectedTransactions));
 }
-
-
-TEST_F(ReshardingTxnCloningPipelineTest, TxnPipelineBeforeFetchTimestamp) {
-    size_t numTransactions = 10;
-    Timestamp fetchTimestamp(numTransactions / 2 + 1, 0);
-    auto [mockResults, expectedTransactions] = makeTransactions(
-        numTransactions, numTransactions, [](size_t i) { return Timestamp(i + 1, 0); });
-    expectedTransactions.erase(
-        std::remove_if(expectedTransactions.begin(),
-                       expectedTransactions.end(),
-                       [&fetchTimestamp](SessionTxnRecord transaction) {
-                           return transaction.getLastWriteOpTime().getTimestamp() >= fetchTimestamp;
-                       }),
-        expectedTransactions.end());
-
-    auto pipeline = constructPipeline(mockResults, fetchTimestamp, boost::none);
-
-    ASSERT(pipelineMatchesDeque(pipeline, expectedTransactions));
-}
-
 
 TEST_F(ReshardingTxnCloningPipelineTest, TxnPipelineAfterID) {
     size_t numTransactions = 10;

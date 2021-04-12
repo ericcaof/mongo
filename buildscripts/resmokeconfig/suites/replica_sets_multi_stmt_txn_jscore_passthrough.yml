@@ -8,12 +8,6 @@ selector:
   # These tests already run with transactions.
   - jstests/core/txns/*.js
 
-  # These tests are not expected to pass with replica-sets:
-  - jstests/core/capped_update.js
-  - jstests/core/dbadmin.js
-  - jstests/core/opcounters_write_cmd.js
-  - jstests/core/read_after_optime.js
-
   ##
   ## Limitations with the way the runner file injects transactions.
   ##
@@ -53,6 +47,7 @@ selector:
   - jstests/core/or1.js
   - jstests/core/or2.js
   - jstests/core/or3.js
+  - jstests/core/ord.js
   - jstests/core/orj.js
   - jstests/core/projection_expr_mod.js
   - jstests/core/ref.js
@@ -66,6 +61,7 @@ selector:
   - jstests/core/sortj.js
   - jstests/core/sort_with_meta_operator.js
   - jstests/core/tailable_skip_limit.js
+  - jstests/core/timeseries/timeseries_special_indexes.js
   - jstests/core/type_array.js
   - jstests/core/uniqueness.js
   - jstests/core/unset2.js
@@ -96,6 +92,7 @@ selector:
   - jstests/core/sort_array.js
   - jstests/core/views/views_collation.js
   - jstests/core/wildcard_index_count.js
+  - jstests/core/explain_server_params.js
 
   # $listSessions
   - jstests/core/list_all_local_sessions.js
@@ -105,6 +102,7 @@ selector:
 
   # $indexStats
   - jstests/core/index_stats.js
+  - jstests/core/timeseries/timeseries_index_stats.js
 
   # $collStats
   - jstests/core/operation_latency_histogram.js
@@ -128,6 +126,7 @@ selector:
   - jstests/core/update_dbref.js
   - jstests/core/updatel.js
   - jstests/core/write_result.js
+  - jstests/core/positional_projection.js
 
   # Trick for bypassing mongo shell validation in the test doesn't work because txn_override
   # retry logic will hit the shell validation.
@@ -184,9 +183,6 @@ selector:
   - jstests/core/json_schema/misc_validation.js
   - jstests/core/views/views_all_commands.js
 
-  # Fails with implicit sessions because it will use multiple sessions on the same Mongo connection.
-  - jstests/core/dropdb.js
-
   # Committing a transaction when the server is fsync locked fails.
   - jstests/core/fsync.js
 
@@ -239,6 +235,7 @@ selector:
   - jstests/core/SERVER-23626.js
 
   exclude_with_any_tags:
+  - assumes_standalone_mongod
   # "Cowardly refusing to override read concern of command: ..."
   - assumes_read_concern_unchanged
   # "writeConcern is not allowed within a multi-statement transaction"
@@ -248,8 +245,7 @@ selector:
   - requires_profiling
   # Retrying a query can change whether a plan cache entry is active.
   - inspects_whether_plan_cache_entry_is_active
-  # $out is not supported in transactions
-  - uses_$out
+  - does_not_support_transactions
   # Transaction-continuing commands cannot specify API parameters, so tests that use API parameters
   # cannot be run with transactions.
   - uses_api_parameters

@@ -70,7 +70,7 @@ class Spec(object):
 
     def is_rc(self):
         """Return True if rc."""
-        return bool(re.search(r"-rc\d+$", self.version()))
+        return bool(re.search(r"(-rc|-alpha)\d+$", self.version()))
 
     def is_pre_release(self):
         """Return True if pre-release."""
@@ -103,7 +103,10 @@ class Spec(object):
 
     def suffix(self):
         """Return suffix."""
-        return "-org" if int(self.ver.split(".")[1]) % 2 == 0 else "-org-unstable"
+        if int(self.ver.split(".")[0]) >= 5:
+            return "-org" if int(self.ver.split(".")[1]) == 0 else "-org-unstable"
+        else:
+            return "-org" if int(self.ver.split(".")[1]) % 2 == 0 else "-org-unstable"
 
     def prelease(self):
         """Return pre-release verison suffix."""
@@ -803,7 +806,7 @@ def make_rpm(distro, build_os, arch, spec, srcdir):  # pylint: disable=too-many-
         "-D",
         f"dist .{distro.release_dist(build_os)}",
         "-D",
-        f"_use_internal_dependency_generator 0",
+        "_use_internal_dependency_generator 0",
         "-D",
         f"dynamic_version {spec.pversion(distro)}",
         "-D",

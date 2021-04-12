@@ -57,6 +57,7 @@
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/move_timing_helper.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/range_deletion_task_gen.h"
 #include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/db/s/sharding_statistics.h"
@@ -434,7 +435,7 @@ Status MigrationDestinationManager::start(OperationContext* opCtx,
     }
 
     _sessionMigration =
-        std::make_unique<SessionCatalogMigrationDestination>(_fromShard, *_sessionId);
+        std::make_unique<SessionCatalogMigrationDestination>(_nss, _fromShard, *_sessionId);
     ShardingStatistics::get(opCtx).countRecipientMoveChunkStarted.addAndFetch(1);
 
     _migrateThreadHandle = stdx::thread([this]() { _migrateThread(); });
@@ -570,7 +571,10 @@ Status MigrationDestinationManager::startCommit(const MigrationSessionId& sessio
     _state = COMMIT_START;
     _stateChangedCV.notify_all();
 
-    auto const deadline = Date_t::now() + Seconds(30);
+    // Assigning a timeout slightly higher than the one used for network requests to the config
+    // server. Enough time to retry at least once in case of network failures (SERVER-51397).
+    auto const deadline = Date_t::now() + Shard::kDefaultConfigCommandTimeout +
+        Shard::kDefaultConfigCommandTimeout / 4;
     while (_sessionId) {
         if (stdx::cv_status::timeout ==
             _isActiveCV.wait_until(lock, deadline.toSystemTimePoint())) {
@@ -823,6 +827,8 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(
         } else {
             // We do not have a collection by this name. Create the collection with the donor's
             // options.
+            OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE
+                unsafeCreateCollection(opCtx);
             WriteUnitOfWork wuow(opCtx);
             CollectionOptions collectionOptions = uassertStatusOK(
                 CollectionOptions::parse(collectionOptionsAndIndexes.options,
@@ -1050,8 +1056,8 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
 
                 assertNotAborted(opCtx);
 
-                write_ops::Insert insertOp(_nss);
-                insertOp.getWriteCommandBase().setOrdered(true);
+                write_ops::InsertCommandRequest insertOp(_nss);
+                insertOp.getWriteCommandRequestBase().setOrdered(true);
                 insertOp.setDocuments([&] {
                     std::vector<BSONObj> toInsert;
                     while (it != arr.end() &&
@@ -1066,7 +1072,8 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
                     return toInsert;
                 }());
 
-                const auto reply = write_ops_exec::performInserts(opCtx, insertOp, true);
+                const auto reply =
+                    write_ops_exec::performInserts(opCtx, insertOp, OperationSource::kFromMigrate);
 
                 for (unsigned long i = 0; i < reply.results.size(); ++i) {
                     uassertStatusOKWithContext(

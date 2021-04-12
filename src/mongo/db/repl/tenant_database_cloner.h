@@ -47,7 +47,10 @@ public:
         Date_t end;
         size_t collections{0};
         size_t clonedCollections{0};
+        size_t clonedCollectionsBeforeFailover{0};
+
         std::vector<TenantCollectionCloner::Stats> collectionStats;
+        long long approxTotalBytesCopied{0};
 
         std::string toString() const;
         BSONObj toBSON() const;

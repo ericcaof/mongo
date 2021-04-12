@@ -32,7 +32,6 @@
 #include "mongo/db/keys_collection_cache.h"
 
 #include "mongo/db/keys_collection_client.h"
-#include "mongo/db/keys_collection_document_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/util/str.h"
 
@@ -113,13 +112,18 @@ Status KeysCollectionCache::_refreshExternalKeys(OperationContext* opCtx) {
         originalSize = _externalKeysCache.size();
     }
 
-    auto refreshStatus = _client->getNewExternalKeys(opCtx, _purpose, LogicalTime(), true);
+    auto refreshStatus = _client->getAllExternalKeys(opCtx, _purpose);
 
     if (!refreshStatus.isOK()) {
         return refreshStatus.getStatus();
     }
 
     auto& newKeys = refreshStatus.getValue();
+
+    std::multimap<long long, ExternalKeysCollectionDocument> newExternalKeysCache;
+    for (auto&& key : newKeys) {
+        newExternalKeysCache.emplace(key.getKeyId(), std::move(key));
+    }
 
     stdx::lock_guard<Latch> lk(_cacheMutex);
     if (originalSize > _externalKeysCache.size()) {
@@ -128,9 +132,9 @@ Status KeysCollectionCache::_refreshExternalKeys(OperationContext* opCtx) {
         return Status::OK();
     }
 
-    for (auto&& key : newKeys) {
-        _externalKeysCache[key.getKeyId()].emplace(key.getReplicaSetName(), std::move(key));
-    }
+    // Replace the cached keys with the newly loaded ones. Note because all external keys are loaded
+    // when refreshing them, this will remove keys that have been deleted from the collection.
+    std::swap(_externalKeysCache, newExternalKeysCache);
 
     return Status::OK();
 }
@@ -157,21 +161,25 @@ StatusWith<std::vector<ExternalKeysCollectionDocument>> KeysCollectionCache::get
     stdx::lock_guard<Latch> lk(_cacheMutex);
     std::vector<ExternalKeysCollectionDocument> keys;
 
-    auto keysIter = _externalKeysCache.find(keyId);
-
-    if (keysIter == _externalKeysCache.end()) {
+    if (_externalKeysCache.empty()) {
         return {ErrorCodes::KeyNotFound,
                 str::stream() << "Cache Reader No external keys found for " << _purpose
                               << " with id: " << keyId};
     }
 
-    invariant(!keysIter->second.empty());
-
-    for (auto keyIter = keysIter->second.begin(); keyIter != keysIter->second.end(); keyIter++) {
+    auto keysRange = _externalKeysCache.equal_range(keyId);
+    for (auto keyIter = keysRange.first; keyIter != keysRange.second; keyIter++) {
         auto key = keyIter->second;
         if (key.getExpiresAt() > forThisTime) {
             keys.push_back(key);
         }
+    }
+
+    if (keys.empty()) {
+        return {ErrorCodes::KeyNotFound,
+                str::stream() << "Cache Reader No external keys found for " << _purpose
+                              << " that is valid for time: " << forThisTime.toString()
+                              << " with id: " << keyId};
     }
 
     return std::move(keys);
@@ -198,6 +206,11 @@ void KeysCollectionCache::resetCache() {
         _internalKeysCache.clear();
         _externalKeysCache.clear();
     }
+}
+
+void KeysCollectionCache::cacheExternalKey(ExternalKeysCollectionDocument key) {
+    stdx::lock_guard<Latch> lk(_cacheMutex);
+    _externalKeysCache.emplace(key.getKeyId(), std::move(key));
 }
 
 }  // namespace mongo

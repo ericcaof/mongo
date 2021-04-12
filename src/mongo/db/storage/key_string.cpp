@@ -236,6 +236,9 @@ const uint8_t kEnd = 0x4;
 // the encoding of NUL bytes in strings as "\x00\xff".
 const uint8_t kLess = 1;
 const uint8_t kGreater = 254;
+
+// The maximum length of a RecordId binary string that may be appended to a KeyString.
+const int8_t kMaxRecordIdStrLen = 127;
 }  // namespace
 
 // some utility functions
@@ -275,7 +278,7 @@ StringData readCString(BufReader* reader) {
  */
 StringData readCStringWithNuls(BufReader* reader, std::string* scratch) {
     const StringData initial = readCString(reader);
-    if (reader->peek<unsigned char>() != 0xFF)
+    if (!reader->remaining() || reader->peek<unsigned char>() != 0xFF)
         return initial;  // Don't alloc or copy for simple case with no NUL bytes.
 
     scratch->append(initial.rawData(), initial.size());
@@ -406,6 +409,13 @@ void BuilderBase<BufferT>::appendSetAsArray(const BSONElementSet& set, const Str
 }
 
 template <class BufferT>
+void BuilderBase<BufferT>::appendOID(OID oid) {
+    _verifyAppendingState();
+    _appendOID(oid, _shouldInvertOnAppend());
+    _elemCount++;
+}
+
+template <class BufferT>
 void BuilderBase<BufferT>::appendDiscriminator(const Discriminator discriminator) {
     // The discriminator forces this KeyString to compare Less/Greater than any KeyString with
     // the same prefix of keys. As an example, this can be used to land on the first key in the
@@ -452,10 +462,17 @@ template <class BufferT>
 void BuilderBase<BufferT>::appendRecordId(RecordId loc) {
     _doneAppending();
     _transition(BuildState::kAppendedRecordID);
+    loc.withFormat([](RecordId::Null n) { invariant(false); },
+                   [&](int64_t rid) { _appendRecordIdLong(rid); },
+                   [&](const char* str, int size) { _appendRecordIdStr(str, size); });
+}
+
+template <class BufferT>
+void BuilderBase<BufferT>::_appendRecordIdLong(int64_t val) {
     // The RecordId encoding must be able to determine the full length starting from the last
     // byte, without knowing where the first byte is since it is stored at the end of a
     // KeyString, and we need to be able to read the RecordId without decoding the whole thing.
-    //
+
     // This encoding places a number (N) between 0 and 7 in both the high 3 bits of the first
     // byte and the low 3 bits of the last byte. This is the number of bytes between the first
     // and last byte (ie total bytes is N + 2). The remaining bits of the first and last bytes
@@ -463,11 +480,11 @@ void BuilderBase<BufferT>::appendRecordId(RecordId loc) {
     // big-endian order. This does not encode negative RecordIds to give maximum space to
     // positive RecordIds which are the only ones that are allowed to be stored in an index.
 
-    int64_t raw = loc.repr();
+    int64_t raw = val;
     if (raw < 0) {
-        // Note: we encode RecordId::min() and RecordId() the same which is ok, as they are
-        // never stored so they will never be compared to each other.
-        invariant(raw == RecordId::min().repr());
+        // Note: we encode RecordId::minLong() and RecordId() the same which is ok, as they
+        // are never stored so they will never be compared to each other.
+        invariant(raw == RecordId::minLong().getLong());
         raw = 0;
     }
     const uint64_t value = static_cast<uint64_t>(raw);
@@ -495,6 +512,24 @@ void BuilderBase<BufferT>::appendRecordId(RecordId loc) {
                      false);
     }
     _append(lastByte, false);
+}
+
+template <class BufferT>
+void BuilderBase<BufferT>::_appendRecordIdStr(const char* str, int size) {
+    // This encoding for RecordId binary strings stores the size at the end. This means that a
+    // RecordId may only be appended at the end of a KeyString. That is, it cannot be appended in
+    // the middle of a KeyString and also be binary-comparable.
+
+    // The current maximum string length is 127. The high bit is reserved for future usage.
+    invariant(size <= kMaxRecordIdStrLen);
+    invariant(size > 0);
+
+    const bool invert = false;
+
+    // String is encoded with a single byte for the size at the end.
+    _appendBytes(str, size, invert);
+    auto encodedSize = static_cast<uint8_t>(size);
+    _append(encodedSize, invert);
 }
 
 template <class BufferT>
@@ -2438,15 +2473,15 @@ BSONObj toBson(StringData data, Ordering ord, const TypeBits& typeBits) {
     return toBson(data.rawData(), data.size(), ord, typeBits);
 }
 
-RecordId decodeRecordIdAtEnd(const void* bufferRaw, size_t bufSize) {
-    invariant(bufSize >= 2);  // smallest possible encoding of a RecordId.
+RecordId decodeRecordIdLongAtEnd(const void* bufferRaw, size_t bufSize) {
     const unsigned char* buffer = static_cast<const unsigned char*>(bufferRaw);
+    invariant(bufSize >= 2);  // smallest possible encoding of a RecordId.
     const unsigned char lastByte = *(buffer + bufSize - 1);
     const size_t ridSize = 2 + (lastByte & 0x7);  // stored in low 3 bits.
     invariant(bufSize >= ridSize);
     const unsigned char* firstBytePtr = buffer + bufSize - ridSize;
     BufReader reader(firstBytePtr, ridSize);
-    return decodeRecordId(&reader);
+    return decodeRecordIdLong(&reader);
 }
 
 size_t sizeWithoutRecordIdAtEnd(const void* bufferRaw, size_t bufSize) {
@@ -2458,7 +2493,7 @@ size_t sizeWithoutRecordIdAtEnd(const void* bufferRaw, size_t bufSize) {
     return bufSize - ridSize;
 }
 
-RecordId decodeRecordId(BufReader* reader) {
+RecordId decodeRecordIdLong(BufReader* reader) {
     const uint8_t firstByte = readType<uint8_t>(reader, false);
     const uint8_t numExtraBytes = firstByte >> 5;  // high 3 bits in firstByte
     uint64_t repr = firstByte & 0x1f;              // low 5 bits in firstByte
@@ -2470,6 +2505,23 @@ RecordId decodeRecordId(BufReader* reader) {
     invariant((lastByte & 0x7) == numExtraBytes);
     repr = (repr << 5) | (lastByte >> 3);  // fold in high 5 bits of last byte
     return RecordId(repr);
+}
+
+RecordId decodeRecordIdStrAtEnd(const void* bufferRaw, size_t bufSize) {
+    invariant(bufSize > 0);
+    const uint8_t* buffer = static_cast<const uint8_t*>(bufferRaw);
+
+    // The current encoding for strings supports strings up to 128 bytes. The high bit is reserved
+    // for future usage.
+    uint8_t len = buffer[bufSize - 1];
+    keyStringAssert(5577900,
+                    fmt::format("Cannot decode record id string longer than {} bytes; size is {}",
+                                kMaxRecordIdStrLen,
+                                len),
+                    len <= kMaxRecordIdStrLen);
+    invariant(bufSize > len);
+    const uint8_t* firstBytePtr = (buffer + bufSize - len - 1);
+    return RecordId(reinterpret_cast<const char*>(firstBytePtr), len);
 }
 
 int compare(const char* leftBuf, const char* rightBuf, size_t leftSize, size_t rightSize) {
@@ -2520,8 +2572,43 @@ bool readSBEValue(BufReader* reader,
     return true;
 }
 
+void appendSingleFieldToBSONAs(
+    const char* buf, int len, StringData fieldName, BSONObjBuilder* builder, Version version) {
+    const bool inverted = false;
+
+    BufReader reader(buf, len);
+    invariant(reader.remaining());
+    uint8_t ctype = readType<uint8_t>(&reader, inverted);
+    invariant(ctype != kEnd && ctype > kLess && ctype < kGreater);
+
+    const uint32_t depth = 1;  // This function only gets called for a top-level KeyString::Value.
+    // Callers discard their TypeBits.
+    TypeBits typeBits(version);
+    TypeBits::Reader typeBitsReader(typeBits);
+
+    BSONObjBuilderValueStream& stream = *builder << fieldName;
+    toBsonValue(ctype, &reader, &typeBitsReader, inverted, version, &stream, depth);
+}
+
+void appendToBSONArray(const char* buf, int len, BSONArrayBuilder* builder, Version version) {
+    const bool inverted = false;
+
+    BufReader reader(buf, len);
+    invariant(reader.remaining());
+    uint8_t ctype = readType<uint8_t>(&reader, inverted);
+    invariant(ctype != kEnd && ctype > kLess && ctype < kGreater);
+
+    // This function only gets called for a top-level KeyString::Value.
+    const uint32_t depth = 1;
+    // All users of this currently discard type bits.
+    TypeBits typeBits(version);
+    TypeBits::Reader typeBitsReader(typeBits);
+
+    toBsonValue(ctype, &reader, &typeBitsReader, inverted, version, builder, depth);
+}
+
 void Value::serializeWithoutRecordId(BufBuilder& buf) const {
-    dassert(decodeRecordIdAtEnd(_buffer.get(), _ksSize).isValid());
+    dassert(decodeRecordIdLongAtEnd(_buffer.get(), _ksSize).isValid());
 
     const int32_t sizeWithoutRecordId = sizeWithoutRecordIdAtEnd(_buffer.get(), _ksSize);
     buf.appendNum(sizeWithoutRecordId);                 // Serialize size of KeyString

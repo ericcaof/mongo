@@ -38,7 +38,6 @@
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/server_options.h"
 
 namespace mongo {
 
@@ -100,20 +99,6 @@ public:
      * Returns true if the specified index version is supported, and returns false otherwise.
      */
     static bool isIndexVersionSupported(IndexVersion indexVersion);
-
-    /**
-     * Returns a set of the currently supported index versions.
-     */
-    static std::set<IndexVersion> getSupportedIndexVersions();
-
-    /**
-     * Returns Status::OK() if indexes of version 'indexVersion' are allowed to be created, and
-     * returns ErrorCodes::CannotCreateIndex otherwise.
-     */
-    static Status isIndexVersionAllowedForCreation(
-        IndexVersion indexVersion,
-        const ServerGlobalParams::FeatureCompatibility& featureCompatibility,
-        const BSONObj& indexSpec);
 
     /**
      * Returns the index version to use if it isn't specified in the index specification.

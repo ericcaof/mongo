@@ -1,5 +1,7 @@
 // Test that transactions run on secondaries do not change the serverStatus transaction metrics.
-// @tags: [uses_transactions]
+// @tags: [
+//   uses_transactions,
+// ]
 (function() {
 "use strict";
 

@@ -349,7 +349,8 @@ private:
 };
 
 /**
- * This class holds values in a buffer. The most common usage is a sort and hash agg plan stages.
+ * This class holds values in a buffer. The most common usage is a sort and hash agg plan stages. A
+ * materialized row must only be used to store owned (deep) value copies.
  */
 class MaterializedRow {
 public:
@@ -419,6 +420,10 @@ public:
         return _count;
     }
 
+    bool isEmpty() {
+        return _count == 0 ? true : false;
+    }
+
     void resize(size_t count) {
         if (_data) {
             release();
@@ -438,20 +443,6 @@ public:
                 *ownedPtr++ = false;
             }
         }
-    }
-
-    bool operator==(const MaterializedRow& rhs) const {
-        for (size_t idx = 0; idx < size(); ++idx) {
-            auto [lhsTag, lhsVal] = getViewOfValue(idx);
-            auto [rhsTag, rhsVal] = rhs.getViewOfValue(idx);
-            auto [tag, val] = compareValue(lhsTag, lhsVal, rhsTag, rhsVal);
-
-            if (tag != value::TypeTags::NumberInt32 || value::bitcastTo<int32_t>(val) != 0) {
-                return false;
-            }
-        }
-
-        return true;
     }
 
     // The following methods are used by the sorter only.
@@ -522,45 +513,103 @@ private:
 };
 
 
-struct MaterializedRowComparator {
-    MaterializedRowComparator(const std::vector<value::SortDirection>& direction)
-        : _direction(direction) {}
+/**
+ * Provides a view of a slot inside a single MaterializedRow.
+ */
+class MaterializedSingleRowAccessor final : public SlotAccessor {
+public:
+    /**
+     * Constructs an accessor that gives a view of the value at the given 'slot' of a
+     * given single row.
+     */
+    MaterializedSingleRowAccessor(MaterializedRow& row, size_t slot) : _row(row), _slot(slot) {}
+
+    std::pair<TypeTags, Value> getViewOfValue() const override {
+        return _row.getViewOfValue(_slot);
+    }
+    std::pair<TypeTags, Value> copyOrMoveValue() override {
+        return _row.copyOrMoveValue(_slot);
+    }
+    void reset(bool owned, TypeTags tag, Value val) {
+        _row.reset(_slot, owned, tag, val);
+    }
+
+private:
+    MaterializedRow& _row;
+    const size_t _slot;
+};
+
+struct MaterializedRowEq {
+    using ComparatorType = StringData::ComparatorInterface*;
+
+    explicit MaterializedRowEq(const ComparatorType comparator = nullptr)
+        : _comparator(comparator) {}
+
+    bool operator()(const MaterializedRow& lhs, const MaterializedRow& rhs) const {
+        for (size_t idx = 0; idx < lhs.size(); ++idx) {
+            auto [lhsTag, lhsVal] = lhs.getViewOfValue(idx);
+            auto [rhsTag, rhsVal] = rhs.getViewOfValue(idx);
+            auto [tag, val] = compareValue(lhsTag, lhsVal, rhsTag, rhsVal, _comparator);
+
+            if (tag != value::TypeTags::NumberInt32 || value::bitcastTo<int32_t>(val) != 0) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+private:
+    const ComparatorType _comparator = nullptr;
+};
+
+struct MaterializedRowLess {
+public:
+    MaterializedRowLess(const std::vector<value::SortDirection>& sortDirs) {
+        _sortDirs.reserve(sortDirs.size());
+        for (auto&& dir : sortDirs) {
+            // Store directions 'Ascending' as -1 and 'Descending' as 1 so that we can compare the
+            // result of 'compareValue()' on the two pairs of tags & vals directly to the sort
+            // direction.
+            _sortDirs.push_back(dir == value::SortDirection::Ascending ? -1 : 1);
+        }
+    }
 
     bool operator()(const MaterializedRow& lhs, const MaterializedRow& rhs) const {
         for (size_t idx = 0; idx < lhs.size(); ++idx) {
             auto [lhsTag, lhsVal] = lhs.getViewOfValue(idx);
             auto [rhsTag, rhsVal] = rhs.getViewOfValue(idx);
             auto [tag, val] = compareValue(lhsTag, lhsVal, rhsTag, rhsVal);
-            if (tag != TypeTags::NumberInt32) {
-                return false;
-            }
-            if (bitcastTo<int32_t>(val) < 0 && _direction[idx] == SortDirection::Ascending) {
-                return true;
-            }
-            if (bitcastTo<int32_t>(val) > 0 && _direction[idx] == SortDirection::Descending) {
-                return true;
-            }
-            if (bitcastTo<int32_t>(val) != 0) {
+
+            if (tag != value::TypeTags::NumberInt32 ||
+                value::bitcastTo<int32_t>(val) != _sortDirs[idx]) {
                 return false;
             }
         }
 
-        return false;
+        return true;
     }
 
-    const std::vector<SortDirection>& _direction;
-    // TODO - add collator and whatnot.
+private:
+    std::vector<int8_t> _sortDirs;
 };
 
 struct MaterializedRowHasher {
+    using CollatorType = CollatorInterface*;
+
+    explicit MaterializedRowHasher(const CollatorType collator = nullptr) : _collator(collator) {}
+
     std::size_t operator()(const MaterializedRow& k) const {
         size_t res = hashInit();
         for (size_t idx = 0; idx < k.size(); ++idx) {
             auto [tag, val] = k.getViewOfValue(idx);
-            res = hashCombine(res, hashValue(tag, val));
+            res = hashCombine(res, hashValue(tag, val, _collator));
         }
         return res;
     }
+
+private:
+    const CollatorType _collator = nullptr;
 };
 
 /**
@@ -584,11 +633,29 @@ void readKeyStringValueIntoAccessors(
 template <typename T>
 using SlotMap = absl::flat_hash_map<SlotId, T>;
 using SlotAccessorMap = SlotMap<SlotAccessor*>;
-using FieldAccessorMap = absl::flat_hash_map<std::string, std::unique_ptr<ViewOfValueAccessor>>;
+using FieldAccessorMap = StringMap<std::unique_ptr<ViewOfValueAccessor>>;
 using SlotSet = absl::flat_hash_set<SlotId>;
 using SlotVector = std::vector<SlotId>;
 
 using SlotIdGenerator = IdGenerator<value::SlotId>;
 using FrameIdGenerator = IdGenerator<FrameId>;
 using SpoolIdGenerator = IdGenerator<SpoolId>;
+
+/**
+ * Given an unordered slot 'map', calls 'callback' for each slot/value pair in order of ascending
+ * slot id.
+ */
+template <typename T, typename C>
+void orderedSlotMapTraverse(const SlotMap<T>& map, C callback) {
+    std::set<SlotId> slots;
+    for (auto&& elem : map) {
+        slots.insert(elem.first);
+    }
+
+    for (auto slot : slots) {
+        callback(slot, map.at(slot));
+    }
+}
+
+int getApproximateSize(TypeTags tag, Value val);
 }  // namespace mongo::sbe::value

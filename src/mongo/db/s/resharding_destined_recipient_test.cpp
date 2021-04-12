@@ -31,6 +31,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
@@ -49,6 +50,7 @@
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog_cache_loader_mock.h"
 #include "mongo/s/database_version.h"
+#include "mongo/s/shard_cannot_refresh_due_to_locks_held_exception.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/unittest/unittest.h"
 
@@ -105,7 +107,7 @@ public:
 
         configTargeterMock()->setFindHostReturnValue(kConfigHostAndPort);
 
-        WaitForMajorityService::get(getServiceContext()).setUp(getServiceContext());
+        WaitForMajorityService::get(getServiceContext()).startup(getServiceContext());
 
         for (const auto& shard : kShardList) {
             std::unique_ptr<RemoteCommandTargeterMock> targeter(
@@ -181,27 +183,35 @@ protected:
 
     ReshardingEnv setupReshardingEnv(OperationContext* opCtx, bool refreshTempNss) {
         DBDirectClient client(opCtx);
-        client.createCollection(kNss.ns());
-        client.createCollection(NamespaceString::kSessionTransactionsTableNamespace.ns());
+        ASSERT(client.createCollection(NamespaceString::kSessionTransactionsTableNamespace.ns()));
+
+        OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE unsafeCreateCollection(
+            opCtx);
+        Status status = createCollection(
+            operationContext(), kNss.db().toString(), BSON("create" << kNss.coll()));
+        if (status != ErrorCodes::NamespaceExists) {
+            uassertStatusOK(status);
+        }
 
         ReshardingEnv env(CollectionCatalog::get(opCtx)->lookupUUIDByNSS(opCtx, kNss).value());
         env.destShard = kShardList[1].getName();
         env.version = ChunkVersion(1, 0, OID::gen(), boost::none /* timestamp */);
         env.dbVersion = DatabaseVersion(UUID::gen());
-
         env.tempNss =
             NamespaceString(kNss.db(),
                             fmt::format("{}{}",
                                         NamespaceString::kTemporaryReshardingCollectionPrefix,
                                         env.sourceUuid.toString()));
 
-        client.createCollection(env.tempNss.ns());
-
-        DatabaseType db(kNss.db().toString(), kShardList[0].getName(), true, env.dbVersion);
+        uassertStatusOK(createCollection(
+            operationContext(), env.tempNss.db().toString(), BSON("create" << env.tempNss.coll())));
 
         TypeCollectionReshardingFields reshardingFields;
-        reshardingFields.setUuid(UUID::gen());
-        reshardingFields.setDonorFields(TypeCollectionDonorFields{BSON("y" << 1)});
+        reshardingFields.setReshardingUUID(UUID::gen());
+        reshardingFields.setDonorFields(TypeCollectionDonorFields{
+            env.tempNss,
+            BSON("y" << 1),
+            {ShardId{kShardList[0].getName()}, ShardId{kShardList[1].getName()}}});
         reshardingFields.setState(CoordinatorStateEnum::kPreparingToDonate);
 
         CollectionType coll(kNss, env.version.epoch(), Date_t::now(), UUID::gen());
@@ -209,7 +219,8 @@ protected:
         coll.setUnique(false);
         coll.setAllowMigrations(false);
 
-        _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(db);
+        _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(
+            DatabaseType(kNss.db().toString(), kShardList[0].getName(), true, env.dbVersion));
         _mockCatalogCacheLoader->setCollectionRefreshValues(
             kNss, coll, createChunks(env.version.epoch(), kShardKey), reshardingFields);
         _mockCatalogCacheLoader->setCollectionRefreshValues(
@@ -277,7 +288,11 @@ TEST_F(DestinedRecipientTest, TestGetDestinedRecipient) {
     AutoGetCollection coll(opCtx, kNss, MODE_IX);
     OperationShardingState::get(opCtx).initializeClientRoutingVersions(
         kNss, env.version, env.dbVersion);
-    auto destShardId = getDestinedRecipient(opCtx, kNss, BSON("x" << 2 << "y" << 10));
+    auto* const css = CollectionShardingState::get(opCtx, kNss);
+    auto collDesc = css->getCollectionDescription(opCtx);
+
+    auto destShardId =
+        getDestinedRecipient(opCtx, kNss, BSON("x" << 2 << "y" << 10), css, collDesc);
     ASSERT(destShardId);
     ASSERT_EQ(*destShardId, env.destShard);
 }
@@ -290,8 +305,18 @@ TEST_F(DestinedRecipientTest, TestGetDestinedRecipientThrowsOnBlockedRefresh) {
         AutoGetCollection coll(opCtx, kNss, MODE_IX);
         OperationShardingState::get(opCtx).initializeClientRoutingVersions(
             kNss, env.version, env.dbVersion);
-        ASSERT_THROWS(getDestinedRecipient(opCtx, kNss, BSON("x" << 2 << "y" << 10)),
-                      ExceptionFor<ErrorCodes::ShardInvalidatedForTargeting>);
+        auto* const css = CollectionShardingState::get(opCtx, kNss);
+        auto collDesc = css->getCollectionDescription(opCtx);
+
+        FailPointEnableBlock failPoint("blockCollectionCacheLookup");
+        ASSERT_THROWS_WITH_CHECK(
+            getDestinedRecipient(opCtx, kNss, BSON("x" << 2 << "y" << 10), css, collDesc),
+            ShardCannotRefreshDueToLocksHeldException,
+            [&](const ShardCannotRefreshDueToLocksHeldException& ex) {
+                const auto refreshInfo = ex.extraInfo<ShardCannotRefreshDueToLocksHeldInfo>();
+                ASSERT(refreshInfo);
+                ASSERT_EQ(refreshInfo->getNss(), env.tempNss);
+            });
     }
 
     auto sw = catalogCache()->getCollectionRoutingInfoWithRefresh(opCtx, env.tempNss);
@@ -483,12 +508,14 @@ TEST_F(DestinedRecipientTest, TestUpdateChangesOwningShardThrows) {
 
     OperationShardingState::get(opCtx).initializeClientRoutingVersions(
         kNss, env.version, env.dbVersion);
-    ASSERT_THROWS(runInTransaction(
-                      opCtx,
-                      [&]() {
-                          updateDoc(
-                              opCtx, kNss, BSON("_id" << 0), BSON("$set" << BSON("y" << 50)), env);
-                      }),
+    ASSERT_THROWS(runInTransaction(opCtx,
+                                   [&]() {
+                                       updateDoc(opCtx,
+                                                 kNss,
+                                                 BSON("_id" << 0 << "x" << 2),
+                                                 BSON("$set" << BSON("y" << 50)),
+                                                 env);
+                                   }),
                   ExceptionFor<ErrorCodes::WouldChangeOwningShard>);
 }
 
@@ -503,7 +530,7 @@ TEST_F(DestinedRecipientTest, TestUpdateSameOwningShard) {
     OperationShardingState::get(opCtx).initializeClientRoutingVersions(
         kNss, env.version, env.dbVersion);
     runInTransaction(opCtx, [&]() {
-        updateDoc(opCtx, kNss, BSON("_id" << 0), BSON("$set" << BSON("y" << 3)), env);
+        updateDoc(opCtx, kNss, BSON("_id" << 0 << "x" << 2), BSON("$set" << BSON("y" << 3)), env);
     });
 }
 

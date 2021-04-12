@@ -64,7 +64,6 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/database_sharding_state.h"
-#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/top.h"
@@ -78,13 +77,12 @@
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/random.h"
-#include "mongo/s/cannot_implicitly_create_collection_info.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
 
 namespace mongo {
-
 namespace {
+
 MONGO_FAIL_POINT_DEFINE(throwWCEDuringTxnCollCreate);
 MONGO_FAIL_POINT_DEFINE(hangBeforeLoggingCreateCollection);
 MONGO_FAIL_POINT_DEFINE(hangAndFailAfterCreateCollectionReservesOpTime);
@@ -122,7 +120,7 @@ void assertMovePrimaryInProgress(OperationContext* opCtx, NamespaceString const&
     auto mpsm = dss->getMovePrimarySourceManager(dssLock);
 
     if (mpsm) {
-        LOGV2(4909100, "assertMovePrimaryInProgress", "movePrimaryNss"_attr = nss.toString());
+        LOGV2(4909100, "assertMovePrimaryInProgress", "namespace"_attr = nss.toString());
 
         uasserted(ErrorCodes::MovePrimaryInProgress,
                   "movePrimary is in progress for namespace " + nss.toString());
@@ -282,7 +280,11 @@ void DatabaseImpl::getStats(OperationContext* opCtx, BSONObjBuilder* output, dou
             return true;
         });
 
-    ViewCatalog::get(this)->iterate(opCtx, [&](const ViewDefinition& view) { nViews += 1; });
+
+    ViewCatalog::get(this)->iterate([&](const ViewDefinition& view) {
+        nViews += 1;
+        return true;
+    });
 
     output->appendNumber("collections", nCollections);
     output->appendNumber("views", nViews);
@@ -348,8 +350,9 @@ Status DatabaseImpl::dropCollection(OperationContext* opCtx,
                               "turn off profiling before dropping system.profile collection");
         } else if (!(nss.isSystemDotViews() || nss.isHealthlog() ||
                      nss == NamespaceString::kLogicalSessionsNamespace ||
-                     nss == NamespaceString::kSystemKeysNamespace ||
-                     nss.isTemporaryReshardingCollection())) {
+                     nss == NamespaceString::kKeysCollectionNamespace ||
+                     nss.isTemporaryReshardingCollection() ||
+                     nss.isTimeseriesBucketsCollection())) {
             return Status(ErrorCodes::IllegalOperation,
                           str::stream() << "can't drop system collection " << nss);
         }
@@ -390,7 +393,7 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
                           << numIndexesInProgress << " index builds in progress.",
             numIndexesInProgress == 0);
 
-    audit::logDropCollection(&cc(), nss.toString());
+    audit::logDropCollection(opCtx->getClient(), nss);
 
     auto serviceContext = opCtx->getServiceContext();
     Top::get(serviceContext).collectionDropped(nss);
@@ -524,7 +527,7 @@ Status DatabaseImpl::renameCollection(OperationContext* opCtx,
                                       NamespaceString fromNss,
                                       NamespaceString toNss,
                                       bool stayTemp) const {
-    audit::logRenameCollection(&cc(), fromNss.ns(), toNss.ns());
+    audit::logRenameCollection(opCtx->getClient(), fromNss, toNss);
 
     invariant(opCtx->lockState()->isCollectionLockedForMode(fromNss, MODE_X));
     invariant(opCtx->lockState()->isCollectionLockedForMode(toNss, MODE_X));
@@ -619,11 +622,12 @@ Status DatabaseImpl::createView(OperationContext* opCtx,
         status = {ErrorCodes::InvalidNamespace,
                   str::stream() << "invalid namespace name for a view: " + viewName.toString()};
     } else {
-        status = ViewCatalog::createView(
-            opCtx, this, viewName, viewOnNss, pipeline, options.collation, options.timeseries);
+        status =
+            ViewCatalog::createView(opCtx, this, viewName, viewOnNss, pipeline, options.collation);
     }
 
-    audit::logCreateView(&cc(), viewName.toString(), viewOnNss.toString(), pipeline, status.code());
+    audit::logCreateView(
+        opCtx->getClient(), viewName, viewOnNss.toString(), pipeline, status.code());
     return status;
 }
 
@@ -636,17 +640,10 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
 
     invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IX));
 
-    uassert(CannotImplicitlyCreateCollectionInfo(nss),
-            "request doesn't allow collection to be created implicitly",
-            serverGlobalParams.clusterRole != ClusterRole::ShardServer ||
-                OperationShardingState::get(opCtx).allowImplicitCollectionCreation() ||
-                options.temp);
-
     auto coordinator = repl::ReplicationCoordinator::get(opCtx);
     bool canAcceptWrites =
         (coordinator->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) ||
         coordinator->canAcceptWritesForDatabase(opCtx, nss.db()) || nss.isSystemDotProfile();
-
 
     CollectionOptions optionsWithUUID = options;
     bool generatedUUID = false;
@@ -689,7 +686,7 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
 
     _checkCanCreateCollection(opCtx, nss, optionsWithUUID);
     assertMovePrimaryInProgress(opCtx, nss);
-    audit::logCreateCollection(&cc(), nss.ns());
+    audit::logCreateCollection(opCtx->getClient(), nss);
 
     LOGV2(20320,
           "createCollection: {namespace} with {generatedUUID_generated_provided} UUID: "
@@ -706,12 +703,8 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
         uassertStatusOK(storageEngine->getCatalog()->createCollection(
             opCtx, nss, optionsWithUUID, true /*allocateDefaultSpace*/));
     auto catalogId = catalogIdRecordStorePair.first;
-    std::shared_ptr<Collection> ownedCollection =
-        Collection::Factory::get(opCtx)->make(opCtx,
-                                              nss,
-                                              catalogId,
-                                              optionsWithUUID.uuid.get(),
-                                              std::move(catalogIdRecordStorePair.second));
+    std::shared_ptr<Collection> ownedCollection = Collection::Factory::get(opCtx)->make(
+        opCtx, nss, catalogId, optionsWithUUID, std::move(catalogIdRecordStorePair.second));
     auto collection = ownedCollection.get();
     ownedCollection->init(opCtx);
     ownedCollection->setCommitted(false);

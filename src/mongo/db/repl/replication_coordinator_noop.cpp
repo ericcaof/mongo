@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2019 MongoDB, Inc.
+ *    Copyright (C) 2019-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -257,6 +257,11 @@ ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorNoOp::awaitRepli
     MONGO_UNREACHABLE;
 }
 
+SharedSemiFuture<void> ReplicationCoordinatorNoOp::awaitReplicationAsyncNoWTimeout(
+    const OpTime& opTime, const WriteConcernOptions& writeConcern) {
+    MONGO_UNREACHABLE;
+}
+
 void ReplicationCoordinatorNoOp::stepDown(OperationContext*,
                                           const bool,
                                           const Milliseconds&,
@@ -330,6 +335,11 @@ Status ReplicationCoordinatorNoOp::processReplSetReconfig(OperationContext*,
 Status ReplicationCoordinatorNoOp::doReplSetReconfig(OperationContext* opCtx,
                                                      GetNewConfigFn getNewConfig,
                                                      bool force) {
+    MONGO_UNREACHABLE;
+}
+
+Status ReplicationCoordinatorNoOp::doOptimizedReconfig(OperationContext* opCtx,
+                                                       GetNewConfigFn getNewConfig) {
     MONGO_UNREACHABLE;
 }
 

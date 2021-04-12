@@ -6,7 +6,8 @@
  * migration state to "committed" and "aborted" to be majority committed but it cannot do that on
  * ephemeralForTest.
  *
- * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft]
+ * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft,
+ * incompatible_with_windows_tls]
  */
 
 (function() {
@@ -21,13 +22,6 @@ load("jstests/replsets/libs/tenant_migration_util.js");
 const x509Options0 = TenantMigrationUtil.makeX509Options("jstests/libs/rs0.pem");
 const x509Options1 = TenantMigrationUtil.makeX509Options("jstests/libs/rs1.pem");
 const x509Options2 = TenantMigrationUtil.makeX509Options("jstests/libs/rs2.pem");
-
-const migrationCertificate0 =
-    TenantMigrationUtil.getCertificateAndPrivateKey("jstests/libs/rs0_tenant_migration.pem");
-const migrationCertificate1 =
-    TenantMigrationUtil.getCertificateAndPrivateKey("jstests/libs/rs1_tenant_migration.pem");
-const migrationCertificate2 =
-    TenantMigrationUtil.getCertificateAndPrivateKey("jstests/libs/rs2_tenant_migration.pem");
 
 const rst0 = new ReplSetTest({nodes: 1, name: 'rst0', nodeOptions: x509Options0});
 const rst1 = new ReplSetTest({nodes: 1, name: 'rst1', nodeOptions: x509Options1});
@@ -60,14 +54,10 @@ const kTenantIdPrefix = "testTenantId";
     const migrationOpts0 = {
         migrationIdString: extractUUIDFromObject(UUID()),
         tenantId: tenantId0,
-        donorCertificateForRecipient: migrationCertificate0,
-        recipientCertificateForDonor: migrationCertificate1,
     };
     const migrationOpts1 = {
         migrationIdString: extractUUIDFromObject(UUID()),
         tenantId: tenantId1,
-        donorCertificateForRecipient: migrationCertificate0,
-        recipientCertificateForDonor: migrationCertificate2,
     };
 
     assert.commandWorked(tenantMigrationTest0.startMigration(migrationOpts0));
@@ -79,8 +69,8 @@ const kTenantIdPrefix = "testTenantId";
         assert.commandWorked(tenantMigrationTest1.waitForMigrationToComplete(migrationOpts1));
 
     // Verify that both migrations succeeded.
-    assert.eq(stateRes0.state, TenantMigrationTest.State.kCommitted);
-    assert.eq(stateRes1.state, TenantMigrationTest.State.kCommitted);
+    assert.eq(stateRes0.state, TenantMigrationTest.DonorState.kCommitted);
+    assert.eq(stateRes1.state, TenantMigrationTest.DonorState.kCommitted);
 
     const connPoolStatsAfter0 = assert.commandWorked(donorPrimary.adminCommand({connPoolStats: 1}));
     // Donor targeted two different replica sets.
@@ -95,12 +85,11 @@ const kTenantIdPrefix = "testTenantId";
     const connPoolStatsAfter1 = assert.commandWorked(donorPrimary.adminCommand({connPoolStats: 1}));
     assert.eq(Object.keys(connPoolStatsAfter1.replicaSets).length, 0);
 
-    // TODO: SERVER-53276 the RSM from recipient rst1 to donor rst0 is not deleted.
-    // assert.eq(
-    //     Object.keys(assert.commandWorked(rst1.getPrimary().adminCommand({connPoolStats:
-    //     1})).replicaSets)
-    //         .length,
-    //     0);
+    assert.eq(Object
+                  .keys(assert.commandWorked(rst1.getPrimary().adminCommand({connPoolStats: 1}))
+                            .replicaSets)
+                  .length,
+              0);
 })();
 
 // Test concurrent incoming migrations from different donors.
@@ -117,14 +106,10 @@ const kTenantIdPrefix = "testTenantId";
     const migrationOpts0 = {
         migrationIdString: extractUUIDFromObject(UUID()),
         tenantId: tenantId0,
-        donorCertificateForRecipient: migrationCertificate0,
-        recipientCertificateForDonor: migrationCertificate2,
     };
     const migrationOpts1 = {
         migrationIdString: extractUUIDFromObject(UUID()),
         tenantId: tenantId1,
-        donorCertificateForRecipient: migrationCertificate1,
-        recipientCertificateForDonor: migrationCertificate2,
     };
 
     assert.commandWorked(tenantMigrationTest0.startMigration(migrationOpts0));
@@ -136,8 +121,8 @@ const kTenantIdPrefix = "testTenantId";
         assert.commandWorked(tenantMigrationTest1.waitForMigrationToComplete(migrationOpts1));
 
     // Verify that both migrations succeeded.
-    assert.eq(stateRes0.state, TenantMigrationTest.State.kCommitted);
-    assert.eq(stateRes1.state, TenantMigrationTest.State.kCommitted);
+    assert.eq(stateRes0.state, TenantMigrationTest.DonorState.kCommitted);
+    assert.eq(stateRes1.state, TenantMigrationTest.DonorState.kCommitted);
 
     // Cleanup.
     assert.commandWorked(tenantMigrationTest0.forgetMigration(migrationOpts0.migrationIdString));
@@ -147,11 +132,9 @@ const kTenantIdPrefix = "testTenantId";
         assert.commandWorked(rst0.getPrimary().adminCommand({connPoolStats: 1}));
     assert.eq(Object.keys(connPoolStatsAfter0.replicaSets).length, 0);
 
-    // TODO: SERVER-53276 the RSM from recipient rst1 to donor rst0 is not deleted in the test
-    // above.
-    //  const connPoolStatsAfter1 =
-    //     assert.commandWorked(rst1.getPrimary().adminCommand({connPoolStats: 1}));
-    //  assert.eq(Object.keys(connPoolStatsAfter1.replicaSets).length, 0);
+    const connPoolStatsAfter1 =
+        assert.commandWorked(rst1.getPrimary().adminCommand({connPoolStats: 1}));
+    assert.eq(Object.keys(connPoolStatsAfter1.replicaSets).length, 0);
 })();
 
 // Test concurrent outgoing migrations to same recipient. Verify that tenant
@@ -174,14 +157,10 @@ const kTenantIdPrefix = "testTenantId";
     const migrationOpts0 = {
         migrationIdString: extractUUIDFromObject(UUID()),
         tenantId: tenantId0,
-        donorCertificateForRecipient: migrationCertificate0,
-        recipientCertificateForDonor: migrationCertificate1,
     };
     const migrationOpts1 = {
         migrationIdString: extractUUIDFromObject(UUID()),
         tenantId: tenantId1,
-        donorCertificateForRecipient: migrationCertificate0,
-        recipientCertificateForDonor: migrationCertificate1,
     };
 
     const donorPrimary = rst0.getPrimary();
@@ -189,7 +168,7 @@ const kTenantIdPrefix = "testTenantId";
     const connPoolStatsBefore = assert.commandWorked(donorPrimary.adminCommand({connPoolStats: 1}));
 
     let blockFp = configureFailPoint(
-        donorPrimary, "pauseTenantMigrationAfterBlockingStarts", {tenantId: tenantId1});
+        donorPrimary, "pauseTenantMigrationBeforeLeavingBlockingState", {tenantId: tenantId1});
     assert.commandWorked(tenantMigrationTest0.startMigration(migrationOpts0));
     assert.commandWorked(tenantMigrationTest1.startMigration(migrationOpts1));
 
@@ -197,7 +176,7 @@ const kTenantIdPrefix = "testTenantId";
     blockFp.wait();
     const stateRes0 =
         assert.commandWorked(tenantMigrationTest0.waitForMigrationToComplete(migrationOpts0));
-    assert(stateRes0.state, TenantMigrationTest.State.kCommitted);
+    assert(stateRes0.state, TenantMigrationTest.DonorState.kCommitted);
 
     // Verify that exactly one RSM was created.
     const connPoolStatsDuringMigration =
@@ -217,7 +196,7 @@ const kTenantIdPrefix = "testTenantId";
     blockFp.off();
     const stateRes1 =
         assert.commandWorked(tenantMigrationTest1.waitForMigrationToComplete(migrationOpts1));
-    assert(stateRes1.state, TenantMigrationTest.State.kCommitted);
+    assert(stateRes1.state, TenantMigrationTest.DonorState.kCommitted);
 
     // Verify that now the RSM is garbage collected after the migration1 is cleaned.
     assert.commandWorked(tenantMigrationTest1.forgetMigration(migrationOpts1.migrationIdString));

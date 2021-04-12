@@ -140,7 +140,12 @@ public:
     /**
      * Helper method to aid in displaying an ExecState for debug or other recreational purposes.
      */
-    static std::string statestr(ExecState s);
+    static std::string stateToStr(ExecState s);
+
+    /**
+     * Throws a user exception if "planExecutorAlwaysFails" is enabled.
+     */
+    static void checkFailPointPlanExecAlwaysFails();
 
     /**
      * A PlanExecutor must be disposed before destruction. In most cases, this will happen
@@ -326,8 +331,8 @@ public:
     virtual Timestamp getLatestOplogTimestamp() const = 0;
 
     /**
-     * If this PlanExecutor is tracking change stream resume tokens, return the most recent token
-     * for the batch that is currently being built. Otherwise, return an empty object.
+     * If this PlanExecutor is tracking change stream or other resume tokens, returns the most
+     * recent token for the batch that is currently being built. Otherwise, returns an empty object.
      */
     virtual BSONObj getPostBatchResumeToken() const = 0;
 

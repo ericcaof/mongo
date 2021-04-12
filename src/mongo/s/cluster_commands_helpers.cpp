@@ -54,7 +54,7 @@
 #include "mongo/s/database_version.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/multi_statement_transaction_requests_sender.h"
-#include "mongo/s/request_types/create_database_gen.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/transaction_router.h"
@@ -143,8 +143,6 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContextWithDefaultsForTarg
 }
 
 namespace {
-
-const auto kAllowImplicitCollectionCreation = "allowImplicitCollectionCreation"_sd;
 
 /**
  * Constructs a requests vector targeting each of the specified shard ids. Each request contains the
@@ -272,12 +270,6 @@ BSONObj appendShardVersion(BSONObj cmdObj, ChunkVersion version) {
     return cmdWithVersionBob.obj();
 }
 
-BSONObj appendAllowImplicitCreate(BSONObj cmdObj, bool allow) {
-    BSONObjBuilder newCmdBuilder(std::move(cmdObj));
-    newCmdBuilder.append(kAllowImplicitCollectionCreation, allow);
-    return newCmdBuilder.obj();
-}
-
 BSONObj applyReadWriteConcern(OperationContext* opCtx,
                               bool appendRC,
                               bool appendWC,
@@ -350,7 +342,9 @@ BSONObj applyReadWriteConcern(OperationContext* opCtx,
                                  cmdObj);
 }
 
-BSONObj applyReadWriteConcern(OperationContext* opCtx, BasicCommand* cmd, const BSONObj& cmdObj) {
+BSONObj applyReadWriteConcern(OperationContext* opCtx,
+                              BasicCommandWithReplyBuilderInterface* cmd,
+                              const BSONObj& cmdObj) {
     const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
     const auto readConcernSupport = cmd->supportsReadConcern(cmdObj, readConcernArgs.getLevel());
     return applyReadWriteConcern(opCtx,
@@ -704,36 +698,6 @@ bool appendEmptyResultSet(OperationContext* opCtx,
 
     uassertStatusOK(status);
     return true;
-}
-
-void createShardDatabase(OperationContext* opCtx, StringData dbName) {
-    auto dbStatus = Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, dbName);
-
-    if (dbStatus == ErrorCodes::NamespaceNotFound) {
-        ConfigsvrCreateDatabase configCreateDatabaseRequest(dbName.toString());
-        configCreateDatabaseRequest.setDbName(NamespaceString::kAdminDb);
-
-        auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-
-        auto createDbResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
-            opCtx,
-            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-            "admin",
-            CommandHelpers::appendMajorityWriteConcern(configCreateDatabaseRequest.toBSON({})),
-            Shard::RetryPolicy::kIdempotent));
-
-        uassertStatusOK(createDbResponse.writeConcernStatus);
-
-        if (createDbResponse.commandStatus != ErrorCodes::NamespaceExists) {
-            uassertStatusOKWithContext(createDbResponse.commandStatus,
-                                       str::stream()
-                                           << "Database " << dbName << " could not be created");
-        }
-
-        dbStatus = Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, dbName);
-    }
-
-    uassertStatusOKWithContext(dbStatus, str::stream() << "Database " << dbName << " not found");
 }
 
 std::set<ShardId> getTargetedShardsForQuery(boost::intrusive_ptr<ExpressionContext> expCtx,

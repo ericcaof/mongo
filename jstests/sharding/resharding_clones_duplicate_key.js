@@ -13,6 +13,7 @@
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/discover_topology.js");
 load("jstests/sharding/libs/resharding_test_fixture.js");
+load("jstests/sharding/libs/resharding_test_util.js");
 
 const reshardingTest = new ReshardingTest({numDonors: 2, numRecipients: 1});
 reshardingTest.setup();
@@ -47,47 +48,31 @@ assert.commandWorked(inputCollection.insert([
     {_id: 21, info: `moves from ${donorShardNames[1]}`, oldKey: 10, newKey: 10, pad: largeStr},
 ]));
 
-function assertEventuallyErrorsLocally(shardConn, shardName) {
-    const localRecipientOpsCollection =
-        shardConn.getCollection("config.localReshardingOperations.recipient");
-
-    assert.soon(
-        () => {
-            return localRecipientOpsCollection.findOne({state: "error"}) !== null;
-        },
-        () => {
-            return "recipient shard " + shardName + " never transitioned to the error state: " +
-                tojson(localRecipientOpsCollection.find().toArray());
-        });
-}
-
 const mongos = inputCollection.getMongo();
 const recipientShardNames = reshardingTest.recipientShardNames;
 
 const topology = DiscoverTopology.findConnectedNodes(mongos);
 const recipient0 = new Mongo(topology.shards[recipientShardNames[0]].primary);
+const configsvr = new Mongo(topology.configsvr.nodes[0]);
 
 const fp = configureFailPoint(recipient0, "removeRecipientDocFailpoint");
 
-// In the current implementation, the reshardCollection command won't ever complete if one of the
-// donor or recipient shards encounters an unrecoverable error. To work around this limitation, we
-// verify the recipient shard transitioned itself into the "error" state as a result of the
-// duplicate key error during resharding's collection cloning.
-//
-// TODO SERVER-50584: Remove the call to interruptReshardingThread() from this test and instead
-// directly assert that the reshardCollection command fails with an error.
-reshardingTest.withReshardingInBackground(  //
+reshardingTest.withReshardingInBackground(
     {
         newShardKeyPattern: {newKey: 1},
         newChunks: [{min: {newKey: MinKey}, max: {newKey: MaxKey}, shard: recipientShardNames[0]}],
     },
     () => {
-        assertEventuallyErrorsLocally(recipient0, recipientShardNames[0]);
-        reshardingTest.interruptReshardingThread();
+        // TODO SERVER-51696: Review if these checks can be made in a cpp unittest instead.
+        ReshardingTestUtil.assertRecipientAbortsLocally(recipient0,
+                                                        recipientShardNames[0],
+                                                        inputCollection.getFullName(),
+                                                        ErrorCodes.DuplicateKey);
+        fp.off();
+        ReshardingTestUtil.assertAllParticipantsReportDoneToCoordinator(
+            configsvr, inputCollection.getFullName());
     },
-    ErrorCodes.Interrupted);
-
-fp.off();
+    {expectedErrorCode: ErrorCodes.DuplicateKey});
 
 const idleCursors = mongos.getDB("admin")
                         .aggregate([

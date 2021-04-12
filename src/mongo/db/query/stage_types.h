@@ -102,6 +102,7 @@ enum StageType {
     STAGE_QUEUED_DATA,
     STAGE_RECORD_STORE_FAST_COUNT,
     STAGE_RETURN_KEY,
+    STAGE_SAMPLE_FROM_TIMESERIES_BUCKET,
     STAGE_SHARDING_FILTER,
     STAGE_SKIP,
 
@@ -113,7 +114,6 @@ enum StageType {
     STAGE_SUBPLAN,
 
     // Stages for running text search.
-    STAGE_TEXT,
     STAGE_TEXT_OR,
     STAGE_TEXT_MATCH,
 
@@ -121,6 +121,8 @@ enum StageType {
     STAGE_TRIAL,
 
     STAGE_UNKNOWN,
+
+    STAGE_UNPACK_TIMESERIES_BUCKET,
 
     STAGE_UPDATE,
 };

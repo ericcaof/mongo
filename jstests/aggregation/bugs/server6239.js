@@ -1,10 +1,7 @@
 // SERVER-6239 reenable $add and $subtract with dates with better semantics
 // Note: error conditions tested also in server6240.js
-// @tags: [
-//   sbe_incompatible,
-// ]
-
 load('jstests/aggregation/extras/utils.js');
+load("jstests/libs/sbe_assert_error_override.js");  // Override error-code-checking APIs.
 
 var millis = 12345;
 var num = 54312;
@@ -25,7 +22,7 @@ function fail(expression, code) {
 
 test({$subtract: ['$date', '$date']}, NumberLong(0));
 test({$subtract: ['$date', '$num']}, new Date(millis - num));
-fail({$subtract: ['$num', '$date']}, 16556);
+fail({$subtract: ['$num', '$date']}, [16556, ErrorCodes.TypeMismatch]);
 
 fail({$add: ['$date', '$date']}, 16612);
 test({$add: ['$date', '$num']}, new Date(millis + num));

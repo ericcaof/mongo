@@ -66,6 +66,7 @@ class UUID {
     // Make the IDL generated parser a friend
     friend class ConfigsvrShardCollectionResponse;
     friend class CommonReshardingMetadata;
+    friend class DonorAbortMigration;
     friend class DonorStartMigration;
     friend class DonorWaitForMigrationToCommit;
     friend class DonorForgetMigration;
@@ -98,6 +99,7 @@ class UUID {
     friend class ResumeIndexInfo;
     friend class ResumeTokenInternal;
     friend class ShardCollectionTypeBase;
+    friend class ShardsvrCleanupReshardCollection;
     friend class ShardsvrShardCollectionResponse;
     friend class ShardsvrRenameCollection;
     friend class TenantMigrationDonorDocument;
@@ -151,6 +153,13 @@ public:
      * Returns whether this string represents a valid UUID.
      */
     static bool isUUIDString(const std::string& s);
+
+    /*
+     * Return the underlying 128-bit array.
+     */
+    std::array<unsigned char, 16> data() const {
+        return _uuid;
+    }
 
     /**
      * Returns a ConstDataRange view of the UUID.

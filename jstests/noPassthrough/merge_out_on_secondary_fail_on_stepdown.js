@@ -2,7 +2,9 @@
  * Tests that when $out/$merge is run on a secondary and the primary steps down, the command
  * will fail with a `NotWritablePrimary` error.
  *
- * @tags: [requires_replication]
+ * @tags: [
+ *   requires_replication,
+ * ]
  */
 (function() {
 "use strict";

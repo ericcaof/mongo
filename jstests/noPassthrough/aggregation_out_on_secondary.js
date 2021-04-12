@@ -3,7 +3,9 @@
  * performs the reads on the secondaries and executes any write commands against the replica set
  * primary.
  *
- * @tags: [requires_replication]
+ * @tags: [
+ *   requires_replication,
+ * ]
  */
 
 (function() {

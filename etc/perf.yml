@@ -1,6 +1,11 @@
 command_type: system
 stepback: false
 
+## Parameters for parameterized builds (see https://github.com/evergreen-ci/evergreen/wiki/Parameterized-Builds)
+parameters:
+  - key: patch_compile_flags
+    description: "Additional SCons flags to be applied during scons compile invocations in this patch"
+
 variables:
   ###
   # Leave this section uncommented to enable compile.
@@ -23,7 +28,7 @@ variables:
   # _skip_compile: &_compile
   #     []
   # _skip_expansions: &_expansion_updates
-  #   - key: mongodb_binary_archive
+  #   - key: mdb_binary_for_server
   #     value: https://mciuploads.s3.amazonaws.com/perf/5f6ca2392fbabe40badf39c4/c39af144b2370be0537410d9bc79be66a1a5f3c7/linux/mongodb-5f6ca2392fbabe40badf39c4.tar.gz
   ###
 
@@ -70,7 +75,6 @@ modules:
   repo: git@github.com:10gen/linkbench2.git
   prefix: ../../src
   branch: master
-  ref: 63207190657737b32eb0e81c5b81ad1b8bad0e5a
 - name: mongo-perf
   repo: git@github.com:mongodb/mongo-perf.git
   prefix: ../../src
@@ -159,10 +163,6 @@ functions:
       type: test
       params:
         script: ./src/dsi/run-dsi determine_failure -m TEST
-    - command: json.send
-      params:
-        name: "perf"
-        file: "./build/LegacyPerfJson/perf.json"
     - command: shell.exec
       type: test
       params:
@@ -170,6 +170,10 @@ functions:
           ./src/dsi/run-dsi analysis
           # detect outliers needs to run, so defer the post_run_check exit status to later
           echo $? > post_run_check.status
+    - command: json.send
+      params:
+        name: "perf"
+        file: "./build/LegacyPerfJson/perf.json"
     - command: shell.exec
       params:
         script: |
@@ -189,23 +193,6 @@ functions:
           set -o verbose
           source ./signal_processing_venv/bin/activate
           detect-changes --config .signal-processing.yml --mongo-repo=./src/mongo -v
-    - command: shell.exec
-      params:
-        script: |
-          set -o verbose
-          source ./signal_processing_venv/bin/activate
-          detect-outliers --config .signal-processing.yml
-    - command: shell.exec
-      type: setup
-      params:
-        script: |
-          set -o verbose
-          filename=rejects.json
-          if [ -s "$filename" ]; then
-            echo "Rejecting task due to the following outliers:"
-            cat "$filename"
-            exit ${detected_outlier_exit_code|0}
-          fi
     - command: shell.exec
       type: test
       params:
@@ -355,7 +342,7 @@ functions:
           set -o errexit
           set -o verbose
           source "${workdir}/compile_venv/bin/activate"
-          python ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} install-core MONGO_VERSION=${version} DESTDIR=$(pwd)/mongodb
+          python ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} install-core MONGO_VERSION=${version} DESTDIR=$(pwd)/mongodb ${patch_compile_flags|}
           mkdir -p mongodb/jstests/hooks
           if [ -d jstests/hooks ]
           then
@@ -495,6 +482,18 @@ tasks:
            exclude_filter: single_threaded,
            threads: "1 2 4 8",
            read_cmd: 'false'}
+- name: query_read_commands
+  depends_on: *_compile
+  commands:
+    - func: f_run_dsi_workload
+      vars:
+        test_control: microbenchmarks
+        test_control_params: |
+          {include_filter_1: query,
+           include_filter_2: core regression,
+           exclude_filter: single_threaded,
+           threads: "1 2 4 8",
+           read_cmd: 'true'}
 - name: views-query
   depends_on: *_compile
   commands:
@@ -742,17 +741,6 @@ buildvariants:
     compile_flags: --ssl --separate-debug MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     mongod_exec_wrapper: &exec_wrapper "numactl --physcpubind=4,5,6,7 -i 1"
     perf_exec_wrapper: &perf_wrapper "numactl --physcpubind=1,2,3 -i 0"
-    mongod_flags: >-
-      --auth
-      --fork
-      --inMemoryEngineConfigString 'eviction=(threads_min=1),'
-      --inMemorySizeGB 60
-      --networkMessageCompressors noop
-      --setParameter diagnosticDataCollectionEnabled=false
-      --setParameter enableTestCommands=1
-      --setParameter ttlMonitorEnabled=false
-      --storageEngine inMemory
-      --syncdelay 0
     use_scons_cache: true
     platform: linux
     infrastructure_provisioning: microbenchmarks
@@ -771,6 +759,7 @@ buildvariants:
   - name: aggregation
   - name: agg-query-comparison
   - name: query
+  - name: query_read_commands
   - name: views-aggregation
   - name: views-query
   - name: where
@@ -796,19 +785,6 @@ buildvariants:
   expansions:
     mongod_exec_wrapper: *exec_wrapper
     perf_exec_wrapper: *perf_wrapper
-    mongod_flags: >-
-      --auth
-      --fork
-      --inMemoryEngineConfigString 'eviction=(threads_min=1),'
-      --inMemorySizeGB 60
-      --networkMessageCompressors noop
-      --oplogSize 30000
-      --replSet test
-      --setParameter diagnosticDataCollectionEnabled=false
-      --setParameter enableTestCommands=1
-      --setParameter ttlMonitorEnabled=false
-      --storageEngine inMemory
-      --syncdelay 0
     platform: linux
     infrastructure_provisioning: microbenchmarks
     mongodb_setup: microbenchmarks_replica

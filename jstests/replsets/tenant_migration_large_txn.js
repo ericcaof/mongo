@@ -5,7 +5,8 @@
  * commit the transaction even if the migration enters the blocking state while the applyOps oplog
  * entries are being written.
  *
- * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft]
+ * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft,
+ * incompatible_with_windows_tls]
  */
 
 (function() {
@@ -62,7 +63,8 @@ const migrationOpts = {
 const donorRstArgs = TenantMigrationUtil.createRstArgs(tenantMigrationTest.getDonorRst());
 
 // Start a migration, and pause it after the donor has majority-committed the initial state doc.
-const dataSyncFp = configureFailPoint(donorPrimary, "pauseTenantMigrationAfterDataSync");
+const dataSyncFp =
+    configureFailPoint(donorPrimary, "pauseTenantMigrationBeforeLeavingDataSyncState");
 const migrationThread =
     new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
 migrationThread.start();
@@ -81,7 +83,7 @@ logApplyOpsForTxnFp.wait();
 dataSyncFp.off();
 assert.soon(
     () => tenantMigrationTest.getTenantMigrationAccessBlocker(donorPrimary, kTenantId).state ===
-        TenantMigrationTest.AccessState.kBlockWritesAndReads);
+        TenantMigrationTest.DonorAccessState.kBlockWritesAndReads);
 logApplyOpsForTxnFp.off();
 assert.commandWorked(migrationThread.returnData());
 

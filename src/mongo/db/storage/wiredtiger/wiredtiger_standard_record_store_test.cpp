@@ -45,7 +45,6 @@
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/kv/kv_engine_test_harness.h"
-#include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/db/storage/record_store_test_harness.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
@@ -91,19 +90,23 @@ public:
 
     ~WiredTigerHarnessHelper() {}
 
-    virtual std::unique_ptr<RecordStore> newNonCappedRecordStore() {
+    virtual std::unique_ptr<RecordStore> newNonCappedRecordStore() override {
         return newNonCappedRecordStore("a.b");
     }
 
     virtual std::unique_ptr<RecordStore> newNonCappedRecordStore(const std::string& ns) {
+        return newNonCappedRecordStore(ns, CollectionOptions());
+    }
+
+    virtual std::unique_ptr<RecordStore> newNonCappedRecordStore(
+        const std::string& ns, const CollectionOptions& collOptions) override {
         WiredTigerRecoveryUnit* ru =
             checked_cast<WiredTigerRecoveryUnit*>(_engine.newRecoveryUnit());
         OperationContextNoop opCtx(ru);
         string uri = WiredTigerKVEngine::kTableUriPrefix + ns;
 
-        const bool prefixed = false;
-        StatusWith<std::string> result = WiredTigerRecordStore::generateCreateString(
-            kWiredTigerEngineName, ns, CollectionOptions(), "", prefixed);
+        StatusWith<std::string> result =
+            WiredTigerRecordStore::generateCreateString(kWiredTigerEngineName, ns, collOptions, "");
         ASSERT_TRUE(result.isOK());
         std::string config = result.getValue();
 
@@ -119,9 +122,9 @@ public:
         params.ident = ns;
         params.engineName = kWiredTigerEngineName;
         params.isCapped = false;
+        params.keyFormat = collOptions.clusteredIndex ? KeyFormat::String : KeyFormat::Long;
+        params.overwrite = collOptions.clusteredIndex ? false : true;
         params.isEphemeral = false;
-        params.cappedMaxSize = -1;
-        params.cappedMaxDocs = -1;
         params.cappedCallback = nullptr;
         params.sizeStorer = nullptr;
         params.isReadOnly = false;
@@ -132,14 +135,7 @@ public:
         return std::move(ret);
     }
 
-    virtual std::unique_ptr<RecordStore> newCappedRecordStore(int64_t cappedSizeBytes,
-                                                              int64_t cappedMaxDocs) final {
-        return newCappedRecordStore("a.b", cappedSizeBytes, cappedMaxDocs);
-    }
-
-    virtual std::unique_ptr<RecordStore> newCappedRecordStore(const std::string& ns,
-                                                              int64_t cappedMaxSize,
-                                                              int64_t cappedMaxDocs) {
+    virtual std::unique_ptr<RecordStore> newOplogRecordStore() {
         WiredTigerRecoveryUnit* ru =
             dynamic_cast<WiredTigerRecoveryUnit*>(_engine.newRecoveryUnit());
         OperationContextNoop opCtx(ru);
@@ -149,9 +145,9 @@ public:
         CollectionOptions options;
         options.capped = true;
 
-        const bool prefixed = false;
-        StatusWith<std::string> result = WiredTigerRecordStore::generateCreateString(
-            kWiredTigerEngineName, ns, options, "", prefixed);
+        const std::string ns = NamespaceString::kRsOplogNamespace.toString();
+        StatusWith<std::string> result =
+            WiredTigerRecordStore::generateCreateString(kWiredTigerEngineName, ns, options, "");
         ASSERT_TRUE(result.isOK());
         std::string config = result.getValue();
 
@@ -167,11 +163,14 @@ public:
         params.ident = ident;
         params.engineName = kWiredTigerEngineName;
         params.isCapped = true;
+        params.keyFormat = KeyFormat::Long;
+        params.overwrite = true;
         params.isEphemeral = false;
-        params.cappedMaxSize = cappedMaxSize;
-        params.cappedMaxDocs = cappedMaxDocs;
+        // Large enough not to exceed capped limits.
+        params.oplogMaxSize = 1024 * 1024 * 1024;
         params.cappedCallback = nullptr;
         params.sizeStorer = nullptr;
+        params.isReadOnly = false;
         params.tracksSizeAdjustments = true;
 
         auto ret = std::make_unique<StandardWiredTigerRecordStore>(&_engine, &opCtx, params);
@@ -185,6 +184,10 @@ public:
 
     virtual WT_CONNECTION* conn() {
         return _engine.getConnection();
+    }
+
+    KVEngine* getEngine() override final {
+        return &_engine;
     }
 
 private:
@@ -255,9 +258,9 @@ TEST(WiredTigerRecordStoreTest, SizeStorer1) {
         params.ident = ident;
         params.engineName = kWiredTigerEngineName;
         params.isCapped = false;
+        params.keyFormat = KeyFormat::Long;
+        params.overwrite = true;
         params.isEphemeral = false;
-        params.cappedMaxSize = -1;
-        params.cappedMaxDocs = -1;
         params.cappedCallback = nullptr;
         params.sizeStorer = &ss;
         params.isReadOnly = false;

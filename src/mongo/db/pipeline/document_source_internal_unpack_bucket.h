@@ -31,98 +31,16 @@
 
 #include <set>
 
+#include "mongo/db/exec/bucket_unpacker.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_match.h"
 
 namespace mongo {
-
-/**
- * Carries parameters for unpacking a bucket.
- */
-struct BucketSpec {
-    // The user-supplied timestamp field name specified during time-series collection creation.
-    std::string timeField;
-
-    // An optional user-supplied metadata field name specified during time-series collection
-    // creation. This field name is used during materialization of metadata fields of a measurement
-    // after unpacking.
-    boost::optional<std::string> metaField;
-
-    // The set of fields provided to the include (or exclude) argument to the
-    // $_internalUnpackBucketStage.
-    std::set<std::string> fieldSet;
-};
-
-/**
- * BucketUnpacker will unpack bucket fields for metadata and the provided fields.
- */
-class BucketUnpacker {
-public:
-    // These are hard-coded constants in the bucket schema.
-    static constexpr StringData kBucketIdFieldName = "_id"_sd;
-    static constexpr StringData kBucketDataFieldName = "data"_sd;
-    static constexpr StringData kBucketMetaFieldName = "meta"_sd;
-
-    // When BucketUnpacker is created with kInclude it must produce measurements that contain the
-    // set of fields. Otherwise, if the kExclude option is used, the measurements will include the
-    // set difference between all fields in the bucket and the provided fields.
-    enum class Behavior { kInclude, kExclude };
-
-    BucketUnpacker(BucketSpec spec, Behavior unpackerBehavior, bool includeTimeField)
-        : _spec(std::move(spec)),
-          _unpackerBehavior(unpackerBehavior),
-          _includeTimeField(includeTimeField) {}
-
-    Document getNext();
-    bool hasNext() const {
-        return _timeFieldIter && _timeFieldIter->more();
-    }
-
-    /**
-     * This resets the unpacker to prepare to unpack a new bucket described by the given document.
-     */
-    void reset(Document&& bucket);
-
-    Behavior behavior() const {
-        return _unpackerBehavior;
-    }
-
-    const BucketSpec& bucketSpec() const {
-        return _spec;
-    }
-
-    const Document& bucket() const {
-        return _bucket;
-    }
-
-private:
-    const BucketSpec _spec;
-    const Behavior _unpackerBehavior;
-
-    // Iterates the timestamp section of the bucket to drive the unpacking iteration.
-    boost::optional<FieldIterator> _timeFieldIter;
-
-    // A flag used to mark that the timestamp value should be materialized in measurements.
-    const bool _includeTimeField;
-
-    // Since the metadata value is the same across all materialized measurements we can cache the
-    // metadata value in the reset phase and use it to materialize the metadata in each measurement.
-    Value _metaValue;
-
-    // The bucket being unpacked.
-    Document _bucket;
-
-    // Iterators used to unpack the columns of the above bucket that are populated during the reset
-    // phase according to the provided 'Behavior' and 'BucketSpec'.
-    std::vector<std::pair<std::string, FieldIterator>> _fieldIters;
-};
-
 class DocumentSourceInternalUnpackBucket : public DocumentSource {
 public:
     static constexpr StringData kStageName = "$_internalUnpackBucket"_sd;
     static constexpr StringData kInclude = "include"_sd;
     static constexpr StringData kExclude = "exclude"_sd;
-    static constexpr StringData kTimeFieldName = "timeField"_sd;
-    static constexpr StringData kMetaFieldName = "metaField"_sd;
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);
@@ -132,6 +50,25 @@ public:
 
     const char* getSourceName() const override {
         return kStageName.rawData();
+    }
+
+    void serializeToArray(
+        std::vector<Value>& array,
+        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+
+    /**
+     * Use 'serializeToArray' above.
+     */
+    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final {
+        MONGO_UNREACHABLE;
+    }
+
+    bool includeMetaField() const {
+        return _bucketUnpacker.includeMetaField();
+    }
+
+    bool includeTimeField() const {
+        return _bucketUnpacker.includeTimeField();
     }
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
@@ -146,15 +83,106 @@ public:
                 ChangeStreamRequirement::kBlacklist};
     }
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    DepsTracker::State getDependencies(DepsTracker* deps) const final {
+        if (_sampleSize) {
+            deps->needRandomGenerator = true;
+        }
+        deps->needWholeDocument = true;
+        return DepsTracker::State::EXHAUSTIVE_ALL;
+    }
 
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         return boost::none;
     };
 
+    BucketUnpacker bucketUnpacker() const {
+        return _bucketUnpacker;
+    }
+
+    Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
+                                                     Pipeline::SourceContainer* container) final;
+
+    /*
+     * Given a $project produced by 'extractOrBuildProjectToInternalize()', attempt to internalize
+     * its top-level fields by updating the state of '_bucketUnpacker'.
+     */
+    void internalizeProject(const BSONObj& project, bool isInclusion);
+
+    /**
+     * Given a SourceContainer and an iterator pointing to $_internalUnpackBucket, extracts or
+     * builds a $project that can be entirely internalized according to the below rules. Returns the
+     * $project and a bool indicating its type (true for inclusion, false for exclusion).
+     *    1. If there is an inclusion projection immediately after $_internalUnpackBucket which can
+     *       be internalized, it will be removed from the pipeline and returned.
+     *    2. Otherwise, if there is a finite dependency set for the rest of the pipeline, an
+     *       inclusion $project representing it and containing only root-level fields will be
+     *       returned. An inclusion $project will be returned here even if there is a viable
+     *       exclusion $project next in the pipeline.
+     *    3. Otherwise, if there is an exclusion projection immediately after $_internalUnpackBucket
+     *       which can be internalized, it will be removed from the pipeline and returned.
+     *    3. Otherwise, an empty BSONObj will be returned.
+     */
+    std::pair<BSONObj, bool> extractOrBuildProjectToInternalize(
+        Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) const;
+
+    /**
+     * Attempts to split 'match' into two stages, where the first is dependent only on the metaField
+     * and the second is the remainder, so that applying them in sequence is equivalent to applying
+     * 'match' once. Will return two intrusive_ptrs to new $match stages. Either pointer may be
+     * null. If the first is non-null, it will have the metaField renamed from the user defined name
+     * to 'kBucketMetaFieldName'.
+     */
+    std::pair<boost::intrusive_ptr<DocumentSourceMatch>, boost::intrusive_ptr<DocumentSourceMatch>>
+    splitMatchOnMetaAndRename(boost::intrusive_ptr<DocumentSourceMatch> match);
+
+    /**
+     * Takes a predicate after $_internalUnpackBucket on a bucketed field as an argument and
+     * attempts to map it to a new predicate on the 'control' field. For example, the predicate
+     * {a: {$gt: 5}} will generate the predicate {control.max.a: {$_internalExprGt: 5}}, which will
+     * be added before the $_internalUnpackBucket stage.
+     *
+     * If the original predicate is on the bucket's timeField we may also create a new predicate
+     * on the '_id' field to assist in index utilization. For example, the predicate
+     * {time: {$lt: new Date(...)}} will generate the following predicate:
+     * {$and: [
+     *      {_id: {$lt: ObjectId(...)}},
+     *      {control.min.time: {$_internalExprLt: new Date(...)}}
+     * ]}
+     *
+     * If the provided predicate is ineligible for this mapping, the function will return a nullptr.
+     */
+    std::unique_ptr<MatchExpression> createPredicatesOnBucketLevelField(
+        const MatchExpression* matchExpr) const;
+
+    /**
+     * Sets the sample size to 'n' and the maximum number of measurements in a bucket to be
+     * 'bucketMaxCount'. Calling this method implicitly changes the behavior from having the stage
+     * unpack every bucket in a collection to sampling buckets to generate a uniform random sample
+     * of size 'n'.
+     */
+    void setSampleParameters(long long n, int bucketMaxCount) {
+        _sampleSize = n;
+        _bucketMaxCount = bucketMaxCount;
+    }
+
+    boost::optional<long long> sampleSize() const {
+        return _sampleSize;
+    }
+
+    /**
+     * If the stage after $_internalUnpackBucket is $project, $addFields, or $set, try to extract
+     * from it computed meta projections and push them pass the current stage. Return true if the
+     * next stage was removed as a result of the optimization.
+     */
+    bool pushDownComputedMetaProjection(Pipeline::SourceContainer::iterator itr,
+                                        Pipeline::SourceContainer* container);
+
 private:
     GetNextResult doGetNext() final;
 
     BucketUnpacker _bucketUnpacker;
+
+    int _bucketMaxCount = 0;
+    boost::optional<long long> _sampleSize;
 };
 }  // namespace mongo

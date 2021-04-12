@@ -39,11 +39,14 @@
 #include "mongo/db/s/resharding_util.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
+
+using namespace fmt::literals;
 
 const ReshardingDonorOplogId kResumeFromBeginning{Timestamp::min(), Timestamp::min()};
 
@@ -63,7 +66,8 @@ repl::MutableOplogEntry makeOplog(const NamespaceString& nss,
         oplogEntry.setObject2(o2Field);
     }
 
-    oplogEntry.setOpTimeAndWallTimeBase(repl::OpTimeAndWallTimeBase({}, {}));
+    oplogEntry.setOpTime({{}, {}});
+    oplogEntry.setWallClockTime({});
     oplogEntry.set_id(Value(oplogId.toBSON()));
 
     return oplogEntry;
@@ -75,21 +79,6 @@ public:
         return Future<void>::makeReady();
     }
 } onInsertAlwaysReady;
-
-class ScopedServerParameterChange {
-public:
-    ScopedServerParameterChange(int* param, int newValue) : _param(param), _originalValue(*_param) {
-        *param = newValue;
-    }
-
-    ~ScopedServerParameterChange() {
-        *_param = _originalValue;
-    }
-
-private:
-    int* const _param;
-    const int _originalValue;
-};
 
 class ReshardingDonorOplogIterTest : public ShardServerTestFixture {
 public:
@@ -183,14 +172,31 @@ public:
         return executor;
     }
 
+    CancelableOperationContextFactory makeCancelableOpCtx() {
+        auto cancelableOpCtxExecutor = std::make_shared<ThreadPool>([] {
+            ThreadPool::Options options;
+            options.poolName = "TestReshardOplogFetcherCancelableOpCtxPool";
+            options.minThreads = 1;
+            options.maxThreads = 1;
+            return options;
+        }());
+
+        return CancelableOperationContextFactory(operationContext()->getCancellationToken(),
+                                                 cancelableOpCtxExecutor);
+    }
+
     auto getNextBatch(ReshardingDonorOplogIterator* iter,
-                      std::shared_ptr<executor::TaskExecutor> executor) {
+                      std::shared_ptr<executor::TaskExecutor> executor,
+                      CancelableOperationContextFactory factory) {
         // There isn't a guarantee that the reference count to `executor` has been decremented after
         // .get() returns. We schedule a trivial task on the task executor to ensure the callback's
         // destructor has run. Otherwise `executor` could end up outliving the ServiceContext and
         // triggering an invariant due to the task executor's thread having a Client still.
         return ExecutorFuture(executor)
-            .then([iter, executor] { return iter->getNextBatch(std::move(executor)); })
+            .then([iter, executor, factory] {
+                return iter->getNextBatch(
+                    std::move(executor), CancellationToken::uncancelable(), factory);
+            })
             .then([](auto x) { return x; })
             .get();
     }
@@ -203,11 +209,12 @@ public:
     }
 
 private:
-    const NamespaceString _oplogNss{"config.localReshardingOplogBuffer.xxx.yyy"};
+    const NamespaceString _oplogNss{"{}.{}xxx.yyy"_format(
+        NamespaceString::kConfigDb, NamespaceString::kReshardingLocalOplogBufferPrefix)};
     const NamespaceString _crudNss{"test.foo"};
     const UUID _uuid{UUID::gen()};
 
-    ScopedServerParameterChange _iteratorBatchSize{&resharding::gReshardingBatchLimitOperations, 1};
+    RAIIServerParameterControllerForTest controller{"reshardingBatchLimitOperations", 1};
 };
 
 TEST_F(ReshardingDonorOplogIterTest, BasicExhaust) {
@@ -225,21 +232,22 @@ TEST_F(ReshardingDonorOplogIterTest, BasicExhaust) {
 
     ReshardingDonorOplogIterator iter(oplogNss(), kResumeFromBeginning, &onInsertAlwaysReady);
     auto executor = makeTaskExecutorForIterator();
+    auto factory = makeCancelableOpCtx();
     auto altClient = makeKillableClient();
     AlternativeClientRegion acr(altClient);
 
-    auto next = getNextBatch(&iter, executor);
+    auto next = getNextBatch(&iter, executor, factory);
     ASSERT_EQ(next.size(), 1U);
     ASSERT_BSONOBJ_EQ(getId(oplog1), getId(next[0]));
 
-    next = getNextBatch(&iter, executor);
+    next = getNextBatch(&iter, executor, factory);
     ASSERT_EQ(next.size(), 1U);
     ASSERT_BSONOBJ_EQ(getId(oplog2), getId(next[0]));
 
-    next = getNextBatch(&iter, executor);
+    next = getNextBatch(&iter, executor, factory);
     ASSERT_TRUE(next.empty());
 
-    next = getNextBatch(&iter, executor);
+    next = getNextBatch(&iter, executor, factory);
     ASSERT_TRUE(next.empty());
 }
 
@@ -257,14 +265,15 @@ TEST_F(ReshardingDonorOplogIterTest, ResumeFromMiddle) {
     ReshardingDonorOplogId resumeToken(Timestamp(2, 4), Timestamp(2, 4));
     ReshardingDonorOplogIterator iter(oplogNss(), resumeToken, &onInsertAlwaysReady);
     auto executor = makeTaskExecutorForIterator();
+    auto factory = makeCancelableOpCtx();
     auto altClient = makeKillableClient();
     AlternativeClientRegion acr(altClient);
 
-    auto next = getNextBatch(&iter, executor);
+    auto next = getNextBatch(&iter, executor, factory);
     ASSERT_EQ(next.size(), 1U);
     ASSERT_BSONOBJ_EQ(getId(oplog2), getId(next[0]));
 
-    next = getNextBatch(&iter, executor);
+    next = getNextBatch(&iter, executor, factory);
     ASSERT_TRUE(next.empty());
 }
 
@@ -314,21 +323,22 @@ TEST_F(ReshardingDonorOplogIterTest, ExhaustWithIncomingInserts) {
 
     ReshardingDonorOplogIterator iter(oplogNss(), kResumeFromBeginning, &insertNotifier);
     auto executor = makeTaskExecutorForIterator();
+    auto factory = makeCancelableOpCtx();
     auto altClient = makeKillableClient();
     AlternativeClientRegion acr(altClient);
 
-    auto next = getNextBatch(&iter, executor);
+    auto next = getNextBatch(&iter, executor, factory);
     ASSERT_EQ(next.size(), 1U);
     ASSERT_BSONOBJ_EQ(getId(oplog1), getId(next[0]));
 
-    next = getNextBatch(&iter, executor);
+    next = getNextBatch(&iter, executor, factory);
     ASSERT_EQ(next.size(), 1U);
     ASSERT_BSONOBJ_EQ(getId(oplog2), getId(next[0]));
 
-    next = getNextBatch(&iter, executor);
+    next = getNextBatch(&iter, executor, factory);
     ASSERT_TRUE(next.empty());
 
-    next = getNextBatch(&iter, executor);
+    next = getNextBatch(&iter, executor, factory);
     ASSERT_TRUE(next.empty());
 
     ASSERT_EQ(insertNotifier.numCalls, 2U);
@@ -348,22 +358,23 @@ TEST_F(ReshardingDonorOplogIterTest, FillsInPreImageOplogEntry) {
 
     ReshardingDonorOplogIterator iter(oplogNss(), kResumeFromBeginning, &onInsertAlwaysReady);
     auto executor = makeTaskExecutorForIterator();
+    auto factory = makeCancelableOpCtx();
     auto altClient = makeKillableClient();
     AlternativeClientRegion acr(altClient);
 
-    auto next = getNextBatch(&iter, executor);
+    auto next = getNextBatch(&iter, executor, factory);
     ASSERT_EQ(next.size(), 1U);
     ASSERT_BSONOBJ_EQ(getId(preImageOp), getId(next[0]));
     ASSERT_BSONOBJ_BINARY_EQ(preImageDoc, next[0].getObject());
 
-    next = getNextBatch(&iter, executor);
+    next = getNextBatch(&iter, executor, factory);
     ASSERT_EQ(next.size(), 1U);
     ASSERT_BSONOBJ_EQ(getId(deleteOp), getId(next[0]));
     ASSERT_TRUE(bool(next[0].getPreImageOp()));
     ASSERT_BSONOBJ_BINARY_EQ(getId(preImageOp), getId(*next[0].getPreImageOp()));
     ASSERT_BSONOBJ_BINARY_EQ(preImageDoc, next[0].getPreImageOp()->getObject());
 
-    next = getNextBatch(&iter, executor);
+    next = getNextBatch(&iter, executor, factory);
     ASSERT_TRUE(next.empty());
 }
 
@@ -381,22 +392,23 @@ TEST_F(ReshardingDonorOplogIterTest, FillsInPostImageOplogEntry) {
 
     ReshardingDonorOplogIterator iter(oplogNss(), kResumeFromBeginning, &onInsertAlwaysReady);
     auto executor = makeTaskExecutorForIterator();
+    auto factory = makeCancelableOpCtx();
     auto altClient = makeKillableClient();
     AlternativeClientRegion acr(altClient);
 
-    auto next = getNextBatch(&iter, executor);
+    auto next = getNextBatch(&iter, executor, factory);
     ASSERT_EQ(next.size(), 1U);
     ASSERT_BSONOBJ_EQ(getId(postImageOp), getId(next[0]));
     ASSERT_BSONOBJ_BINARY_EQ(postImageDoc, next[0].getObject());
 
-    next = getNextBatch(&iter, executor);
+    next = getNextBatch(&iter, executor, factory);
     ASSERT_EQ(next.size(), 1U);
     ASSERT_BSONOBJ_EQ(getId(updateOp), getId(next[0]));
     ASSERT_TRUE(bool(next[0].getPostImageOp()));
     ASSERT_BSONOBJ_BINARY_EQ(getId(postImageOp), getId(*next[0].getPostImageOp()));
     ASSERT_BSONOBJ_BINARY_EQ(postImageDoc, next[0].getPostImageOp()->getObject());
 
-    next = getNextBatch(&iter, executor);
+    next = getNextBatch(&iter, executor, factory);
     ASSERT_TRUE(next.empty());
 }
 

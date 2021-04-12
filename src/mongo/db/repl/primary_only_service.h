@@ -43,7 +43,7 @@
 #include "mongo/executor/scoped_task_executor.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/platform/mutex.h"
-#include "mongo/util/cancelation.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/fail_point.h"
@@ -101,11 +101,8 @@ public:
      */
     class Instance {
     public:
-        friend class PrimaryOnlyService;
-
         virtual ~Instance() = default;
 
-    protected:
         /**
          * This is the main function that PrimaryOnlyService implementations will need to implement,
          * and is where the bulk of the work those services perform is scheduled. All work run for
@@ -119,11 +116,11 @@ public:
          * lifetime by getting a shared_ptr via 'shared_from_this' or else the Instance may be
          * destroyed out from under them.
          *
-         * 2. On stepdown/shutdown of a PrimaryOnlyService, the input cancelation token will be
+         * 2. On stepdown/shutdown of a PrimaryOnlyService, the input cancellation token will be
          * marked canceled.
          */
         virtual SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
-                                     const CancelationToken& token) noexcept = 0;
+                                     const CancellationToken& token) noexcept = 0;
 
         /**
          * This is the function that is called when this running Instance needs to be interrupted.
@@ -141,18 +138,6 @@ public:
         virtual boost::optional<BSONObj> reportForCurrentOp(
             MongoProcessInterface::CurrentOpConnectionsMode connMode,
             MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept = 0;
-
-    private:
-        bool _running = false;
-        boost::optional<SemiFuture<void>> _finishedNotifyFuture;
-
-        // Each instance of a PrimaryOnlyService will own a CancelationSource for memory management
-        // purposes. Any memory associated with an instance's CancelationSource will be cleaned up
-        // upon the destruction of an instance. It must be instantiated from a token from the
-        // CancelationSource of the PrimaryOnlyService class in order to attain a hierarchical
-        // ownership pattern that allows for cancelation token clean up if the PrimaryOnlyService is
-        // shutdown/stepdown.
-        CancelationSource _source;
     };
 
     /**
@@ -188,7 +173,7 @@ public:
         static std::shared_ptr<InstanceType> getOrCreate(OperationContext* opCtx,
                                                          PrimaryOnlyService* service,
                                                          BSONObj initialState) {
-            auto instance = service->getOrCreateInstance(opCtx, std::move(initialState));
+            auto [instance, _] = service->getOrCreateInstance(opCtx, std::move(initialState));
             return checked_pointer_cast<InstanceType>(instance);
         }
     };
@@ -244,15 +229,17 @@ public:
      * Releases the shared_ptr for the given InstanceID (if present) from management by this
      * service. This is called by the OpObserver when a state document in this service's state
      * document collection is deleted, and is the main way that instances get removed from
-     * _instances and deleted.
+     * _activeInstances and deleted.
+     * If 'status' is not OK, it is passed as argument to the interrupt() method on the instance.
      */
-    void releaseInstance(const InstanceID& id);
+    void releaseInstance(const InstanceID& id, Status status);
 
     /**
-     * Releases all Instances from _instances. Called by the OpObserver if this service's state
-     * document collection is dropped.
+     * Releases all Instances from _activeInstances. Called by the OpObserver if this service's
+     * state document collection is dropped. If 'status' is not OK, it is passed as argument to the
+     * interrupt() method on each instance.
      */
-    void releaseAllInstances();
+    void releaseAllInstances(Status status);
 
     /**
      * Returns whether this service is currently running.  This is true only when the node is in
@@ -312,7 +299,7 @@ protected:
     /**
      * Constructs a new Instance object with the given initial state.
      */
-    virtual std::shared_ptr<Instance> constructInstance(BSONObj initialState) const = 0;
+    virtual std::shared_ptr<Instance> constructInstance(BSONObj initialState) = 0;
 
     /**
      * Given an InstanceId returns the corresponding running Instance object, or boost::none if
@@ -324,13 +311,19 @@ protected:
 
     /**
      * Extracts an InstanceID from the _id field of the given 'initialState' object. If an Instance
-     * with the extracted InstanceID already exists in _intances, returns it.  If not, constructs a
-     * new Instance (by calling constructInstance()), registers it in _instances, and returns it.
-     * It is illegal to call this more than once with 'initialState' documents that have the same
-     * _id but are otherwise not completely identical.
+     * with the extracted InstanceID already exists in _activeInstances, returns true and the
+     * instance itself.  If not, constructs a new Instance (by calling constructInstance()),
+     * registers it in _activeInstances, and returns it with the boolean set to false. It is illegal
+     * to call this more than once with 'initialState' documents that have the same _id but are
+     * otherwise not completely identical.
+     *
+     * Returns a pair with an Instance and a boolean, the boolean indicates if the Instance have
+     * been created in this invocation (true) or already existed (false).
+     *
      * Throws NotWritablePrimary if the node is not currently primary.
      */
-    std::shared_ptr<Instance> getOrCreateInstance(OperationContext* opCtx, BSONObj initialState);
+    std::pair<std::shared_ptr<Instance>, bool> getOrCreateInstance(OperationContext* opCtx,
+                                                                   BSONObj initialState);
 
     /**
      * Since, scoped task executor shuts down on stepdown, we might need to run some instance work,
@@ -339,6 +332,57 @@ protected:
     std::shared_ptr<executor::TaskExecutor> getInstanceCleanupExecutor() const;
 
 private:
+    /**
+     * Represents a PrimaryOnlyService::Instance that has already been scheduled to be run.
+     */
+    class ActiveInstance {
+    public:
+        ActiveInstance(std::shared_ptr<Instance> instance,
+                       CancellationSource source,
+                       SemiFuture<void> instanceComplete)
+            : _instance(std::move(instance)),
+              _instanceComplete(std::move(instanceComplete)),
+              _source(std::move(source)) {
+            invariant(_instance);
+        }
+
+        ActiveInstance(const ActiveInstance&) = delete;
+        ActiveInstance& operator=(const ActiveInstance&) = delete;
+
+        ActiveInstance(ActiveInstance&&) = delete;
+        ActiveInstance& operator=(ActiveInstance&&) = delete;
+
+        /**
+         * Blocking call that returns once the instance has finished running.
+         */
+        void waitForCompletion() const {
+            _instanceComplete.wait();
+        }
+
+        std::shared_ptr<Instance> getInstance() const {
+            return _instance;
+        }
+
+        void interrupt(Status s) {
+            _source.cancel();
+            _instance->interrupt(std::move(s));
+        }
+
+    private:
+        const std::shared_ptr<Instance> _instance;
+
+        // A future that will be resolved when the passed in Instance has finished running.
+        const SemiFuture<void> _instanceComplete;
+
+        // Each instance of a PrimaryOnlyService will own a CancellationSource for memory management
+        // purposes. Any memory associated with an instance's CancellationSource will be cleaned up
+        // upon the destruction of an instance. It must be instantiated from a token from the
+        // CancellationSource of the PrimaryOnlyService class in order to attain a hierarchical
+        // ownership pattern that allows for cancellation token clean up if the PrimaryOnlyService
+        // is shutdown/stepdown.
+        CancellationSource _source;
+    };
+
     /*
      * This method is called once the _executor is initialized. This can be called only once
      * in the lifetime of the POS object instance.
@@ -355,9 +399,16 @@ private:
      * state machine collection.
      */
     virtual ExecutorFuture<void> _rebuildService(
-        std::shared_ptr<executor::ScopedTaskExecutor> executor, const CancelationToken& token) {
+        std::shared_ptr<executor::ScopedTaskExecutor> executor, const CancellationToken& token) {
         return ExecutorFuture<void>(**executor, Status::OK());
     };
+
+    /**
+     * Called at the end of the service stepdown procedure.
+     * In order to not block the stepdown procedure, no blocking work must be done in this
+     * function.
+     */
+    virtual void _afterStepDown() {}
 
     /**
      * Called as part of onStepUp.  Queries the state document collection for this
@@ -367,10 +418,16 @@ private:
     void _rebuildInstances(long long term) noexcept;
 
     /**
-     * Schedules work to call the provided instance's 'run' method. Must be called while holding
-     * _mutex.
+     * Schedules work to call the provided instance's 'run' method and inserts the new instance into
+     * the _activeInstances map as a ActiveInstance.
      */
-    void _scheduleRun(WithLock, std::shared_ptr<Instance> instance, InstanceID instanceID);
+    std::shared_ptr<PrimaryOnlyService::Instance> _insertNewInstance(
+        WithLock, std::shared_ptr<Instance> instance, InstanceID instanceID);
+
+    /**
+     * Interrupts all running instances.
+     */
+    void _interruptInstances(WithLock, Status);
 
     ServiceContext* const _serviceContext;
 
@@ -424,15 +481,14 @@ private:
     long long _term = OpTime::kUninitializedTerm;  // (M)
 
     // Map of running instances, keyed by InstanceID.
-    using InstanceMap = SimpleBSONObjUnorderedMap<std::shared_ptr<Instance>>;
-    InstanceMap _instances;  // (M)
+    SimpleBSONObjUnorderedMap<ActiveInstance> _activeInstances;  // (M)
 
     // A set of OpCtxs running on Client threads associated with this PrimaryOnlyService.
     stdx::unordered_set<OperationContext*> _opCtxs;  // (M)
 
-    // CancelationSource used on stepdown/shutdown to cancel work in all running instances of a
+    // CancellationSource used on stepdown/shutdown to cancel work in all running instances of a
     // PrimaryOnlyService.
-    CancelationSource _source;
+    CancellationSource _source;
 };
 
 /**

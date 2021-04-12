@@ -235,8 +235,10 @@ DBCollection.prototype.find = function(query, fields, limit, skip, batchSize, op
             cursor.readPref(readPreference.mode, readPreference.tags);
         }
 
-        const readConcern = session._getSessionAwareClient().getReadConcern(session);
-        if (readConcern !== null) {
+        const client = session._getSessionAwareClient();
+        const readConcern = client.getReadConcern(session);
+        if (readConcern !== null &&
+            client.canUseReadConcern(session, cursor._convertToCommand(true))) {
             cursor.readConcern(readConcern.level);
         }
     }
@@ -1123,8 +1125,10 @@ DBCollection.autocomplete = function(obj) {
  * @return {boolean}
  */
 DBCollection.prototype._isSharded = function() {
+    // Checking for 'dropped: {$ne: true}' to ensure mongo shell compatibility with earlier versions
+    // of the server
     return !!this._db.getSiblingDB("config").collections.countDocuments(
-        {_id: this._fullName, dropped: false});
+        {_id: this._fullName, dropped: {$ne: true}});
 };
 
 /**

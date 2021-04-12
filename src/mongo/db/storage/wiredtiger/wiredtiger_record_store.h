@@ -34,14 +34,13 @@
 #include <string>
 #include <wiredtiger.h>
 
-#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/storage/capped_callback.h"
-#include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_cursor.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_size_storer.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
@@ -74,7 +73,6 @@ class WiredTigerRecordStore : public RecordStore {
     friend class WiredTigerRecordStoreCursorBase;
 
     friend class StandardWiredTigerRecordStore;
-    friend class PrefixedWiredTigerRecordStore;
 
 public:
     /**
@@ -99,17 +97,17 @@ public:
     static StatusWith<std::string> generateCreateString(const std::string& engineName,
                                                         StringData ns,
                                                         const CollectionOptions& options,
-                                                        StringData extraStrings,
-                                                        bool prefixed);
+                                                        StringData extraStrings);
 
     struct Params {
         StringData ns;
         std::string ident;
         std::string engineName;
         bool isCapped;
+        KeyFormat keyFormat;
+        bool overwrite;
         bool isEphemeral;
-        int64_t cappedMaxSize;
-        int64_t cappedMaxDocs;
+        boost::optional<int64_t> oplogMaxSize;
         CappedCallback* cappedCallback;
         WiredTigerSizeStorer* sizeStorer;
         bool isReadOnly;
@@ -127,11 +125,15 @@ public:
     // name of the RecordStore implementation
     virtual const char* name() const;
 
+    virtual KeyFormat keyFormat() const;
+
     virtual long long dataSize(OperationContext* opCtx) const;
 
     virtual long long numRecords(OperationContext* opCtx) const;
 
-    virtual bool isCapped() const;
+    virtual bool selfManagedOplogTruncation() const {
+        return true;
+    }
 
     virtual int64_t storageSize(OperationContext* opCtx,
                                 BSONObjBuilder* extraInfo = nullptr,
@@ -183,10 +185,6 @@ public:
 
     virtual Status compact(OperationContext* opCtx) final;
 
-    virtual bool isInRecordIdOrder() const override {
-        return true;
-    }
-
     virtual void validate(OperationContext* opCtx,
                           ValidateResults* results,
                           BSONObjBuilder* output);
@@ -196,9 +194,6 @@ public:
                                    double scale) const;
 
     virtual void cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive);
-
-    virtual boost::optional<RecordId> oplogStartHack(OperationContext* opCtx,
-                                                     const RecordId& startingPosition) const;
 
     virtual Status oplogDiskLocRegister(OperationContext* opCtx,
                                         const Timestamp& opTime,
@@ -211,15 +206,12 @@ public:
 
     void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) const override;
 
-    Status updateCappedSize(OperationContext* opCtx, long long cappedSize) final;
+    Status updateOplogSize(long long newOplogSize) final;
 
     void setCappedCallback(CappedCallback* cb) {
         stdx::lock_guard<Latch> lk(_cappedCallbackMutex);
         _cappedCallback = cb;
     }
-
-    int64_t cappedMaxDocs() const;
-    int64_t cappedMaxSize() const;
 
     const std::string& getURI() const {
         return _uri;
@@ -279,10 +271,12 @@ public:
         return _oplogStones.get();
     };
 
+    typedef stdx::variant<int64_t, WiredTigerItem> CursorKey;
+
 protected:
     virtual RecordId getKey(WT_CURSOR* cursor) const = 0;
 
-    virtual void setKey(WT_CURSOR* cursor, RecordId id) const = 0;
+    virtual void setKey(WT_CURSOR* cursor, const CursorKey* key) const = 0;
 
 private:
     class RandomCursor;
@@ -290,15 +284,12 @@ private:
     class NumRecordsChange;
     class DataSizeChange;
 
-    static WiredTigerRecoveryUnit* _getRecoveryUnit(OperationContext* opCtx);
-
     Status _insertRecords(OperationContext* opCtx,
                           Record* records,
                           const Timestamp* timestamps,
                           size_t nRecords);
 
     RecordId _nextId(OperationContext* opCtx);
-    bool cappedAndNeedDelete() const;
     RecordData _getData(const WiredTigerCursor& cursor) const;
 
 
@@ -308,16 +299,6 @@ private:
      * initializing the value instead of all at once during startup.
      */
     void _initNextIdIfNeeded(OperationContext* opCtx);
-
-    /**
-     * Position the cursor at the first key. The previously known first key is
-     * provided, as well as an indicator that this is being positioned for
-     * use by a truncate call.
-     */
-    void _positionAtFirstRecordId(OperationContext* opCtx,
-                                  WT_CURSOR* cursor,
-                                  const RecordId& firstKey,
-                                  bool forTruncate) const;
 
     /**
      * Adjusts the record count and data size metadata for this record store, respectively. These
@@ -339,15 +320,6 @@ private:
     void _changeNumRecords(OperationContext* opCtx, int64_t diff);
     void _increaseDataSize(OperationContext* opCtx, int64_t amount);
 
-    /**
-     * Delete records from this record store as needed while _cappedMaxSize or _cappedMaxDocs is
-     * exceeded.
-     *
-     * _inlock version to be called once a lock has been acquired.
-     */
-    int64_t _cappedDeleteAsNeeded(OperationContext* opCtx, const RecordId& justInserted);
-    int64_t _cappedDeleteAsNeeded_inlock(OperationContext* opCtx, const RecordId& justInserted);
-
     const std::string _uri;
     const uint64_t _tableId;  // not persisted
 
@@ -355,28 +327,24 @@ private:
     const std::string _engineName;
     // The capped settings should not be updated once operations have started
     const bool _isCapped;
+    // The format of this RecordStore's RecordId keys.
+    const KeyFormat _keyFormat;
+    // Whether or not to allow writes to overwrite existing records with the same RecordId.
+    const bool _overwrite;
     // True if the storage engine is an in-memory storage engine
     const bool _isEphemeral;
     // True if WiredTiger is logging updates to this table
     const bool _isLogged;
     // True if the namespace of this record store starts with "local.oplog.", and false otherwise.
     const bool _isOplog;
-    int64_t _cappedMaxSize;
-    const int64_t _cappedMaxSizeSlack;  // when to start applying backpressure
-    const int64_t _cappedMaxDocs;
-    RecordId _cappedFirstRecord;
-    AtomicWord<long long> _cappedSleep;
-    AtomicWord<long long> _cappedSleepMS;
+    boost::optional<int64_t> _oplogMaxSize;
+    RecordId _oplogFirstRecord;
 
-    // guards _cappedCallback and _shuttingDown
+    // Guards _cappedCallback and _shuttingDown.
     mutable Mutex _cappedCallbackMutex =
         MONGO_MAKE_LATCH("WiredTigerRecordStore::_cappedCallbackMutex");
     CappedCallback* _cappedCallback;
     bool _shuttingDown;
-
-    // See comment in ::cappedDeleteAsNeeded
-    int _cappedDeleteCheckCount;
-    mutable stdx::timed_mutex _cappedDeleterMutex;
 
     // Protects initialization of the _nextIdNum.
     mutable Mutex _initNextIdMutex = MONGO_MAKE_LATCH("WiredTigerRecordStore::_initNextIdMutex");
@@ -409,35 +377,9 @@ public:
         OperationContext* opCtx, StringData extraConfig) const override;
 
 protected:
-    virtual RecordId getKey(WT_CURSOR* cursor) const;
+    virtual RecordId getKey(WT_CURSOR* cursor) const override;
 
-    virtual void setKey(WT_CURSOR* cursor, RecordId id) const;
-};
-
-class PrefixedWiredTigerRecordStore final : public WiredTigerRecordStore {
-public:
-    PrefixedWiredTigerRecordStore(WiredTigerKVEngine* kvEngine,
-                                  OperationContext* opCtx,
-                                  Params params,
-                                  KVPrefix prefix);
-
-    virtual std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* opCtx,
-                                                            bool forward) const override;
-
-    virtual std::unique_ptr<RecordCursor> getRandomCursorWithOptions(
-        OperationContext* opCtx, StringData extraConfig) const override;
-
-    virtual KVPrefix getPrefix() const {
-        return _prefix;
-    }
-
-protected:
-    virtual RecordId getKey(WT_CURSOR* cursor) const;
-
-    virtual void setKey(WT_CURSOR* cursor, RecordId id) const;
-
-private:
-    KVPrefix _prefix;
+    virtual void setKey(WT_CURSOR* cursor, const CursorKey* key) const override;
 };
 
 class WiredTigerRecordStoreCursorBase : public SeekableRecordCursor {
@@ -449,6 +391,8 @@ public:
     boost::optional<Record> next();
 
     boost::optional<Record> seekExact(const RecordId& id);
+
+    boost::optional<Record> seekNear(const RecordId& start);
 
     void save();
 
@@ -463,16 +407,7 @@ public:
 protected:
     virtual RecordId getKey(WT_CURSOR* cursor) const = 0;
 
-    virtual void setKey(WT_CURSOR* cursor, RecordId id) const = 0;
-
-    /**
-     * Callers must have already checked the return value of a positioning method against
-     * 'WT_NOTFOUND'. This method allows for additional predicates to be considered on a validly
-     * positioned cursor. 'id' is an out parameter. Implementations are not required to fill it
-     * in. It's simply a possible optimization to avoid a future 'getKey' call if 'hasWrongPrefix'
-     * already did one.
-     */
-    virtual bool hasWrongPrefix(WT_CURSOR* cursor, RecordId* id) const = 0;
+    virtual void setKey(WT_CURSOR* cursor, const WiredTigerRecordStore::CursorKey* key) const = 0;
 
     /**
      * Called when restoring a cursor that has not been advanced.
@@ -508,45 +443,10 @@ public:
 protected:
     virtual RecordId getKey(WT_CURSOR* cursor) const override;
 
-    virtual void setKey(WT_CURSOR* cursor, RecordId id) const override;
+    virtual void setKey(WT_CURSOR* cursor,
+                        const WiredTigerRecordStore::CursorKey* key) const override;
 
-    /**
-     * Callers must have already checked the return value of a positioning method against
-     * 'WT_NOTFOUND'. This method allows for additional predicates to be considered on a validly
-     * positioned cursor. 'id' is an out parameter. Implementations are not required to fill it
-     * in. It's simply a possible optimization to avoid a future 'getKey' call if 'hasWrongPrefix'
-     * already did one.
-     */
-    virtual bool hasWrongPrefix(WT_CURSOR* cursor, RecordId* id) const override;
-
-    virtual void initCursorToBeginning(){};
-};
-
-class WiredTigerRecordStorePrefixedCursor final : public WiredTigerRecordStoreCursorBase {
-public:
-    WiredTigerRecordStorePrefixedCursor(OperationContext* opCtx,
-                                        const WiredTigerRecordStore& rs,
-                                        KVPrefix prefix,
-                                        bool forward = true);
-
-protected:
-    virtual RecordId getKey(WT_CURSOR* cursor) const override;
-
-    virtual void setKey(WT_CURSOR* cursor, RecordId id) const override;
-
-    /**
-     * Callers must have already checked the return value of a positioning method against
-     * 'WT_NOTFOUND'. This method allows for additional predicates to be considered on a validly
-     * positioned cursor. 'id' is an out parameter. Implementations are not required to fill it
-     * in. It's simply a possible optimization to avoid a future 'getKey' call if 'hasWrongPrefix'
-     * already did one.
-     */
-    virtual bool hasWrongPrefix(WT_CURSOR* cursor, RecordId* id) const override;
-
-    virtual void initCursorToBeginning() override;
-
-private:
-    KVPrefix _prefix;
+    virtual void initCursorToBeginning() override{};
 };
 
 // WT failpoint to throw write conflict exceptions randomly

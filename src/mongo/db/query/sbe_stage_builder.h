@@ -30,7 +30,7 @@
 #pragma once
 
 #include "mongo/db/exec/sbe/expressions/expression.h"
-#include "mongo/db/exec/sbe/stages/lock_acquisition_callback.h"
+#include "mongo/db/exec/sbe/stages/collection_helpers.h"
 #include "mongo/db/exec/sbe/values/slot.h"
 #include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/exec/trial_period_utils.h"
@@ -44,7 +44,9 @@ namespace mongo::stage_builder {
  * new environment.
  */
 std::unique_ptr<sbe::RuntimeEnvironment> makeRuntimeEnvironment(
-    OperationContext* opCtx, sbe::value::SlotIdGenerator* slotIdGenerator);
+    const CanonicalQuery& cq,
+    OperationContext* opCtx,
+    sbe::value::SlotIdGenerator* slotIdGenerator);
 
 class PlanStageReqs;
 
@@ -116,8 +118,8 @@ public:
 private:
     StringMap<sbe::value::SlotId> _slots;
 
-    // When an index scan produces parts of an index key for a covered projection, this is where
-    // the slots for the produced values are stored.
+    // When an index scan produces parts of an index key for a covered plan, this is where the
+    // slots for the produced values are stored.
     boost::optional<sbe::value::SlotVector> _indexKeySlots;
 };
 
@@ -234,6 +236,10 @@ struct PlanStageData {
     bool shouldTrackLatestOplogTimestamp{false};
     bool shouldTrackResumeToken{false};
     bool shouldUseTailableScan{false};
+
+    // If this execution tree was built as a result of replanning of the cached plan, this string
+    // will include the reason for replanning.
+    std::optional<std::string> replanReason;
 };
 
 /**
@@ -302,13 +308,19 @@ private:
     std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildOr(
         const QuerySolutionNode* root, const PlanStageReqs& reqs);
 
-    std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildText(
+    std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildTextMatch(
         const QuerySolutionNode* root, const PlanStageReqs& reqs);
 
     std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildReturnKey(
         const QuerySolutionNode* root, const PlanStageReqs& reqs);
 
     std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildEof(
+        const QuerySolutionNode* root, const PlanStageReqs& reqs);
+
+    std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildAndHash(
+        const QuerySolutionNode* root, const PlanStageReqs& reqs);
+
+    std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildAndSorted(
         const QuerySolutionNode* root, const PlanStageReqs& reqs);
 
     std::tuple<sbe::value::SlotId, sbe::value::SlotId, std::unique_ptr<sbe::PlanStage>>
@@ -322,6 +334,21 @@ private:
 
     std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildShardFilter(
         const QuerySolutionNode* root, const PlanStageReqs& reqs);
+
+    /**
+     * Constructs an optimized SBE plan for 'filterNode' in the case that the fields of the
+     * 'shardKeyPattern' are provided by 'childIxscan'. In this case, the SBE plan for the child
+     * index scan node will fill out slots for the necessary components of the index key. These
+     * slots can be read directly in order to determine the shard key that should be passed to the
+     * 'shardFilterer'.
+     */
+    std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildShardFilterCovered(
+        const ShardingFilterNode* filterNode,
+        std::unique_ptr<ShardFilterer> shardFilterer,
+        BSONObj shardKeyPattern,
+        BSONObj indexKeyPattern,
+        const QuerySolutionNode* child,
+        PlanStageReqs childReqs);
 
     sbe::value::SlotIdGenerator _slotIdGenerator;
     sbe::value::FrameIdGenerator _frameIdGenerator;

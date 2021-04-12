@@ -99,7 +99,7 @@ void updatePlanCache(
         // In "sometimes cache" mode, we cache unless we hit one of the special cases below.
         canCache = true;
 
-        if (ranking->tieForBest) {
+        if (ranking->tieForBest()) {
             // The winning plan tied with the runner-up and we're using "sometimes cache" mode. We
             // will not write a plan cache entry.
             canCache = false;
@@ -114,8 +114,10 @@ void updatePlanCache(
                 if constexpr (std::is_same_v<PlanStageType, std::unique_ptr<sbe::PlanStage>>) {
                     return std::make_pair(
                         plan_explainer_factory::make(candidates[winnerIdx].root.get(),
+                                                     &candidates[winnerIdx].data,
                                                      candidates[winnerIdx].solution.get()),
                         plan_explainer_factory::make(candidates[runnerUpIdx].root.get(),
+                                                     &candidates[runnerUpIdx].data,
                                                      candidates[runnerUpIdx].solution.get()));
                 } else {
                     static_assert(std::is_same_v<PlanStageType, PlanStage*>);
@@ -139,6 +141,7 @@ void updatePlanCache(
             auto winnerExplainer = [&]() {
                 if constexpr (std::is_same_v<PlanStageType, std::unique_ptr<sbe::PlanStage>>) {
                     return plan_explainer_factory::make(candidates[winnerIdx].root.get(),
+                                                        &candidates[winnerIdx].data,
                                                         candidates[winnerIdx].solution.get());
                 } else {
                     static_assert(std::is_same_v<PlanStageType, PlanStage*>);

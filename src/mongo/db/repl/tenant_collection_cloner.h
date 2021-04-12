@@ -55,6 +55,10 @@ public:
         size_t indexes{0};
         size_t insertedBatches{0};
         size_t receivedBatches{0};
+        long long avgObjSize{0};
+        long long approxTotalDataSize{0};
+        long long approxTotalBytesCopied{0};
+
 
         std::string toString() const;
         BSONObj toBSON() const;
@@ -138,6 +142,31 @@ private:
         }
     };
 
+    class TenantCollectionClonerQueryStage : public TenantCollectionClonerStage {
+    public:
+        TenantCollectionClonerQueryStage(std::string name,
+                                         TenantCollectionCloner* cloner,
+                                         ClonerRunFn stageFunc)
+            : TenantCollectionClonerStage(name, cloner, stageFunc) {}
+
+        bool isTransientError(const Status& status) override {
+            if (isCursorError(status)) {
+                return true;
+            }
+            return TenantCollectionClonerStage::isTransientError(status);
+        }
+
+        static bool isCursorError(const Status& status) {
+            // Our cursor was killed due to changes on the remote collection.
+            // We do not expect the connection to have been closed so we try to resume the stage.
+            if ((status == ErrorCodes::CursorNotFound) || (status == ErrorCodes::OperationFailed) ||
+                (status == ErrorCodes::QueryPlanKilled)) {
+                return true;
+            }
+            return false;
+        }
+    };
+
     /**
      * The preStage sets the start time in _stats.
      */
@@ -153,6 +182,12 @@ private:
      * to generate progress information.
      */
     AfterStageBehavior countStage();
+
+    /**
+     * Stage function that checks to see if the donor collection is empty (and therefore we may
+     * race with createIndexes on empty collections) before running listIndexes.
+     */
+    AfterStageBehavior checkIfDonorCollectionIsEmptyStage();
 
     /**
      * Stage function that gets the index information of the collection on the source to re-create
@@ -212,10 +247,11 @@ private:
     // The size of the batches of documents returned in collection cloning.
     int _collectionClonerBatchSize;  // (R)
 
-    TenantCollectionClonerStage _countStage;             // (R)
-    TenantCollectionClonerStage _listIndexesStage;       // (R)
-    TenantCollectionClonerStage _createCollectionStage;  // (R)
-    TenantCollectionClonerStage _queryStage;             // (R)
+    TenantCollectionClonerStage _countStage;                          // (R)
+    TenantCollectionClonerStage _checkIfDonorCollectionIsEmptyStage;  // (R)
+    TenantCollectionClonerStage _listIndexesStage;                    // (R)
+    TenantCollectionClonerStage _createCollectionStage;               // (R)
+    TenantCollectionClonerQueryStage _queryStage;                     // (R)
 
     ProgressMeter _progressMeter;           // (X) progress meter for this instance.
     std::vector<BSONObj> _readyIndexSpecs;  // (X) Except for _id_
@@ -236,6 +272,9 @@ private:
 
     // The operationTime returned with the listIndexes result.
     Timestamp _operationTime;  // (X)
+
+    // Was the collection empty the first time we checked?
+    bool _donorCollectionWasEmptyBeforeListIndexes = false;  // (X)
 };
 
 }  // namespace repl

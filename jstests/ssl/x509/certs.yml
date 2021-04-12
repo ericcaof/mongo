@@ -299,6 +299,10 @@ certs:
     subjectAltName:
       DNS: ['localhost', '127.0.0.1', '::1']
 
+- name: 'server_no_SAN.pem'
+  description: General purpose server certificate with missing SAN.
+  Subject: {CN: localhost, title: 'Server no SAN attribute'}
+
 # For tenant migration testing.
 - name: 'rs0.pem'
   description: General purpose server certificate file.
@@ -311,36 +315,6 @@ certs:
     extendedKeyUsage: [serverAuth]
     authorityKeyIdentifier: issuer
 
-- name: 'rs0_tenant_migration.pem'
-  description: Client certificate file for tenant migration donor or recipient.
-  Subject:
-    OU: 'rs0_tenant_migration'
-  extensions:
-    basicConstraints: {CA: false}
-    subjectKeyIdentifier: hash
-    keyUsage: [digitalSignature, keyEncipherment]
-    extendedKeyUsage: [clientAuth]
-    mongoRoles:
-    - {role: backup, db: admin}
-    - {role: advanceClusterTimeRole, db: admin}
-
-- name: 'rs0_tenant_migration_expired.pem'
-  description:
-    Client certificate file for tenant migration donor or recipient which has passed its expiration
-    date.
-  not_before: -10000000
-  not_after: -1000000
-  Subject:
-    OU: 'rs0_tenant_migration'
-  extensions:
-    basicConstraints: {CA: false}
-    subjectKeyIdentifier: hash
-    keyUsage: [digitalSignature, keyEncipherment]
-    extendedKeyUsage: [clientAuth]
-    mongoRoles:
-    - {role: backup, db: admin}
-    - {role: advanceClusterTimeRole, db: admin}
-
 - name: 'rs1.pem'
   description: General purpose server certificate file.
   Subject:
@@ -351,63 +325,6 @@ certs:
     keyUsage: [digitalSignature, keyEncipherment]
     extendedKeyUsage: [serverAuth]
     authorityKeyIdentifier: issuer
-
-- name: 'rs1_tenant_migration.pem'
-  description: Client certificate file for tenant migration donor or recipient.
-  Subject:
-    OU: 'rs1_tenant_migration'
-  extensions:
-    basicConstraints: {CA: false}
-    subjectKeyIdentifier: hash
-    keyUsage: [digitalSignature, keyEncipherment]
-    extendedKeyUsage: [clientAuth]
-    mongoRoles:
-    - {role: backup, db: admin}
-    - {role: advanceClusterTimeRole, db: admin}
-
-- name: 'rs1_tenant_migration_expired.pem'
-  description:
-    Client certificate file for tenant migration donor or recipient which has passed its expiration
-    date.
-  not_before: -10000000
-  not_after: -1000000
-  Subject:
-    OU: 'rs1_tenant_migration'
-  extensions:
-    basicConstraints: {CA: false}
-    subjectKeyIdentifier: hash
-    keyUsage: [digitalSignature, keyEncipherment]
-    extendedKeyUsage: [clientAuth]
-    mongoRoles:
-    - {role: backup, db: admin}
-    - {role: advanceClusterTimeRole, db: admin}
-
-- name: 'rs1_tenant_migration_no_backup_role.pem'
-  description:
-    Client certificate file for tenant migration donor or recipient without backup role.
-  Subject:
-    OU: 'rs1_tenant_migration'
-  extensions:
-    basicConstraints: {CA: false}
-    subjectKeyIdentifier: hash
-    keyUsage: [digitalSignature, keyEncipherment]
-    extendedKeyUsage: [clientAuth]
-    mongoRoles:
-    - {role: advanceClusterTimeRole, db: admin}
-
-- name: 'rs1_tenant_migration_no_advance_cluster_time_role.pem'
-  description:
-    Client certificate file for tenant migration donor or recipient without role to advance
-    cluster time.
-  Subject:
-    OU: 'rs1_tenant_migration'
-  extensions:
-    basicConstraints: {CA: false}
-    subjectKeyIdentifier: hash
-    keyUsage: [digitalSignature, keyEncipherment]
-    extendedKeyUsage: [clientAuth]
-    mongoRoles:
-    - {role: backup, db: admin}
 
 - name: 'rs2.pem'
   description: General purpose server certificate file.
@@ -420,18 +337,84 @@ certs:
     extendedKeyUsage: [serverAuth]
     authorityKeyIdentifier: issuer
 
-- name: 'rs2_tenant_migration.pem'
-  description: Client certificate file for tenant migration donor or recipient.
+- name: 'tenant_migration_donor.pem'
+  description: Client certificate file for tenant migration donor.
   Subject:
-    OU: 'rs2_tenant_migration'
+    OU: 'tenant_migration_donor'
   extensions:
     basicConstraints: {CA: false}
     subjectKeyIdentifier: hash
     keyUsage: [digitalSignature, keyEncipherment]
     extendedKeyUsage: [clientAuth]
     mongoRoles:
-    - {role: backup, db: admin}
-    - {role: advanceClusterTimeRole, db: admin}
+    - {role: tenantMigrationDonorRole, db: admin}
+
+- name: 'tenant_migration_donor_expired.pem'
+  description:
+    Client certificate file for tenant migration donor which has passed its expiration date.
+  not_before: -10000000
+  not_after: -1000000
+  Subject:
+    OU: 'tenant_migration_donor'
+  extensions:
+    basicConstraints: {CA: false}
+    subjectKeyIdentifier: hash
+    keyUsage: [digitalSignature, keyEncipherment]
+    extendedKeyUsage: [clientAuth]
+    mongoRoles:
+    - {role: tenantMigrationDonorRole, db: admin}
+
+- name: 'tenant_migration_donor_insufficient_privileges.pem'
+  description: Client certificate file for tenant migration donor without the required privileges.
+  Subject:
+    OU: 'tenant_migration_donor'
+  extensions:
+    basicConstraints: {CA: false}
+    subjectKeyIdentifier: hash
+    keyUsage: [digitalSignature, keyEncipherment]
+    extendedKeyUsage: [clientAuth]
+    mongoRoles:
+    - {role: readAnyDatabase, db: admin}
+
+- name: 'tenant_migration_recipient.pem'
+  description: Client certificate file for tenant migration recipient.
+  Subject:
+    OU: 'tenant_migration_recipient'
+  extensions:
+    basicConstraints: {CA: false}
+    subjectKeyIdentifier: hash
+    keyUsage: [digitalSignature, keyEncipherment]
+    extendedKeyUsage: [clientAuth]
+    mongoRoles:
+    - {role: tenantMigrationRecipientRole, db: admin}
+
+- name: 'tenant_migration_recipient_expired.pem'
+  description:
+    Client certificate file for tenant migration recipient which has passed its expiration date.
+  not_before: -10000000
+  not_after: -1000000
+  Subject:
+    OU: 'tenant_migration_recipient'
+  extensions:
+    basicConstraints: {CA: false}
+    subjectKeyIdentifier: hash
+    keyUsage: [digitalSignature, keyEncipherment]
+    extendedKeyUsage: [clientAuth]
+    mongoRoles:
+    - {role: tenantMigrationRecipientRole, db: admin}
+
+- name: 'tenant_migration_recipient_insufficient_privileges.pem'
+  description:
+    Client certificate file for tenant migration recipient without the required privileges.
+  Subject:
+    OU: 'tenant_migration_recipient'
+  extensions:
+    basicConstraints: {CA: false}
+    subjectKeyIdentifier: hash
+    keyUsage: [digitalSignature, keyEncipherment]
+    extendedKeyUsage: [clientAuth]
+    mongoRoles:
+    - {role: readAnyDatabase, db: admin}
 
 ###
 # Certificates not based on the primary root ca.pem
@@ -562,27 +545,49 @@ certs:
     extendedKeyUsage: [clientAuth]
 
 # Intermediate OCSP tree
-- name: 'intermediate_ca_ocsp.pem'
+- name: 'intermediate_ca_only_ocsp.pem'
   description: CA issued by the primary OCSP CA, which then issues its own server OCSP cert.
   Subject: {CN: 'Intermediate CA for OCSP'}
   Issuer: 'ca_ocsp.pem'
   include_header: false
-  append_cert: 'ca_ocsp.pem'
   output_path: 'jstests/libs/ocsp/'
-  keyfile: 'intermediate_ca_ocsp.key'
-  crtfile: 'intermediate_ca_ocsp.crt'
+  keyfile: 'intermediate_ca_only_ocsp.key'
+  crtfile: 'intermediate_ca_only_ocsp.crt'
   extensions:
     subjectKeyIdentifier: hash
     basicConstraints:
       critical: true
       CA: true
 
-- name: 'server_intermediate_ca_ocsp.pem'
+- name: 'intermediate_ca_with_root_ocsp.pem'
+  description: OCSP CA and OCSP Intermediate appended together
+  output_path: 'jstests/libs/ocsp/'
+  include_header: false
+  append_cert: ['intermediate_ca_only_ocsp.pem', 'ca_ocsp.pem']
+
+- name: 'server_signed_by_intermediate_ca_ocsp.pem'
   description: Server OCSP certificate signed by intermediate CA.
   Subject: {CN: 'Server OCSP Via Intermediate'}
-  Issuer: 'intermediate_ca_ocsp.pem'
+  Issuer: 'intermediate_ca_only_ocsp.pem'
   include_header: false
   output_path: 'jstests/libs/ocsp/'
+  extensions:
+    basicConstraints: {CA: false}
+    subjectAltName:
+      DNS: localhost
+      IP: 127.0.0.1
+    authorityInfoAccess: 'OCSP;URI:http://localhost:8100/status'
+    subjectKeyIdentifier: hash
+    keyUsage: [digitalSignature, keyEncipherment]
+    extendedKeyUsage: [serverAuth, clientAuth]
+
+- name: 'server_and_intermediate_ca_appended_ocsp.pem'
+  description: Server OCSP certificate signed by intermediate CA.
+  Subject: {CN: 'Server OCSP Via Intermediate'}
+  Issuer: 'intermediate_ca_only_ocsp.pem'
+  include_header: false
+  output_path: 'jstests/libs/ocsp/'
+  append_cert: 'intermediate_ca_only_ocsp.pem'
   extensions:
     basicConstraints: {CA: false}
     subjectAltName:

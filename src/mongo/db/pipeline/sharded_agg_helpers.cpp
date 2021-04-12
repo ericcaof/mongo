@@ -79,8 +79,8 @@ Document wrapAggAsExplain(Document aggregateCommand, ExplainOptions::Verbosity v
     MutableDocument explainCommandBuilder;
     explainCommandBuilder["explain"] = Value(aggregateCommand);
     // Downstream host targeting code expects queryOptions at the top level of the command object.
-    explainCommandBuilder[QueryRequest::kUnwrappedReadPrefField] =
-        Value(aggregateCommand[QueryRequest::kUnwrappedReadPrefField]);
+    explainCommandBuilder[query_request_helper::kUnwrappedReadPrefField] =
+        Value(aggregateCommand[query_request_helper::kUnwrappedReadPrefField]);
 
     // readConcern needs to be promoted to the top-level of the request.
     explainCommandBuilder[repl::ReadConcernArgs::kReadConcernFieldName] =
@@ -101,7 +101,7 @@ RemoteCursor openChangeStreamNewShardMonitor(const boost::intrusive_ptr<Expressi
                                              Timestamp startMonitoringAtTime) {
     const auto& configShard = Grid::get(expCtx->opCtx)->shardRegistry()->getConfigShard();
     // Pipeline: {$changeStream: {startAtOperationTime: [now], allowToRunOnConfigDB: true}}
-    AggregateCommand aggReq(
+    AggregateCommandRequest aggReq(
         ShardType::ConfigNS,
         {BSON(DocumentSourceChangeStream::kStageName
               << BSON(DocumentSourceChangeStreamSpec::kStartAtOperationTimeFieldName
@@ -109,7 +109,9 @@ RemoteCursor openChangeStreamNewShardMonitor(const boost::intrusive_ptr<Expressi
                       << DocumentSourceChangeStreamSpec::kAllowToRunOnConfigDBFieldName << true))});
     aggReq.setFromMongos(true);
     aggReq.setNeedsMerge(true);
-    aggReq.setBatchSize(0);
+    SimpleCursorOptions cursor;
+    cursor.setBatchSize(0);
+    aggReq.setCursor(cursor);
     auto cmdObjWithRWC =
         applyReadWriteConcern(expCtx->opCtx,
                               true,             /* appendRC */
@@ -144,19 +146,19 @@ BSONObj genericTransformForShards(MutableDocument&& cmdForShards,
         auto [legacyRuntimeConstants, unusedSerializedVariables] =
             expCtx->variablesParseState.transitionalCompatibilitySerialize(expCtx->variables);
 
-        cmdForShards[AggregateCommand::kLegacyRuntimeConstantsFieldName] =
+        cmdForShards[AggregateCommandRequest::kLegacyRuntimeConstantsFieldName] =
             Value(legacyRuntimeConstants.toBSON());
     } else {
         // Either this is a "modern" cluster or we are a mongos and can assume the shards are
         // "modern" and will understand the 'let' parameter.
-        cmdForShards[AggregateCommand::kLetFieldName] =
+        cmdForShards[AggregateCommandRequest::kLetFieldName] =
             Value(expCtx->variablesParseState.serialize(expCtx->variables));
     }
 
-    cmdForShards[AggregateCommand::kFromMongosFieldName] = Value(expCtx->inMongos);
+    cmdForShards[AggregateCommandRequest::kFromMongosFieldName] = Value(expCtx->inMongos);
 
     if (!collationObj.isEmpty()) {
-        cmdForShards[AggregateCommand::kCollationFieldName] = Value(collationObj);
+        cmdForShards[AggregateCommandRequest::kCollationFieldName] = Value(collationObj);
     }
 
     // If this is a request for an aggregation explain, then we must wrap the aggregate inside an
@@ -294,6 +296,38 @@ void moveFinalUnwindFromShardsToMerger(Pipeline* shardPipe, Pipeline* mergePipe)
            dynamic_cast<DocumentSourceUnwind*>(shardPipe->getSources().back().get())) {
         mergePipe->addInitialSource(shardPipe->popBack());
     }
+}
+
+/**
+ * When the last stage of shard pipeline is $sort, move stages that can run on shards and don't
+ * rename or modify the fields in $sort from merge pipeline. The function starts from the beginning
+ * of the merge pipeline and finds the first consecutive eligible stages.
+ */
+void moveEligibleStreamingStagesBeforeSortOnShards(Pipeline* shardPipe,
+                                                   Pipeline* mergePipe,
+                                                   const BSONObj& sortPattern) {
+    tassert(5363800,
+            "Expected non-empty shardPipe consisting of at least a $sort stage",
+            !shardPipe->getSources().empty());
+    if (!dynamic_cast<DocumentSourceSort*>(shardPipe->getSources().back().get())) {
+        // Expected last stage on the shards to be a $sort.
+        return;
+    }
+    auto sortPaths = sortPattern.getFieldNames<std::set<std::string>>();
+    auto firstMergeStage = mergePipe->getSources().cbegin();
+    std::function<bool(DocumentSource*)> distributedPlanLogicCallback = [](DocumentSource* stage) {
+        return !static_cast<bool>(stage->distributedPlanLogic());
+    };
+    auto [lastUnmodified, renameMap] = semantic_analysis::findLongestViablePrefixPreservingPaths(
+        firstMergeStage, mergePipe->getSources().cend(), sortPaths, distributedPlanLogicCallback);
+    for (const auto& sortPath : sortPaths) {
+        auto pair = renameMap.find(sortPath);
+        if (pair == renameMap.end() || pair->first != pair->second) {
+            return;
+        }
+    }
+    shardPipe->getSources().insert(shardPipe->getSources().end(), firstMergeStage, lastUnmodified);
+    mergePipe->getSources().erase(firstMergeStage, lastUnmodified);
 }
 
 /**
@@ -600,16 +634,18 @@ void abandonCacheIfSentToShards(Pipeline* shardsPipeline) {
 
 std::unique_ptr<Pipeline, PipelineDeleter> targetShardsAndAddMergeCursors(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    stdx::variant<std::unique_ptr<Pipeline, PipelineDeleter>, AggregateCommand> targetRequest,
+    stdx::variant<std::unique_ptr<Pipeline, PipelineDeleter>, AggregateCommandRequest>
+        targetRequest,
     boost::optional<BSONObj> shardCursorsSortSpec) {
     auto&& [aggRequest, pipeline] = [&] {
         return stdx::visit(
             visit_helper::Overloaded{
                 [&](std::unique_ptr<Pipeline, PipelineDeleter>&& pipeline) {
-                    return std::make_pair(AggregateCommand(expCtx->ns, pipeline->serializeToBson()),
-                                          std::move(pipeline));
+                    return std::make_pair(
+                        AggregateCommandRequest(expCtx->ns, pipeline->serializeToBson()),
+                        std::move(pipeline));
                 },
-                [&](AggregateCommand&& aggRequest) {
+                [&](AggregateCommandRequest&& aggRequest) {
                     auto rawPipeline = aggRequest.getPipeline();
                     return std::make_pair(std::move(aggRequest),
                                           Pipeline::parse(std::move(rawPipeline), expCtx));
@@ -620,8 +656,8 @@ std::unique_ptr<Pipeline, PipelineDeleter> targetShardsAndAddMergeCursors(
     invariant(pipeline->getSources().empty() ||
               !dynamic_cast<DocumentSourceMergeCursors*>(pipeline->getSources().front().get()));
 
-    // The default value for 'allowDiskUse' and 'maxTimeMS' in the AggregateCommand may not match
-    // what was set on the originating command, so copy it from the ExpressionContext.
+    // The default value for 'allowDiskUse' and 'maxTimeMS' in the AggregateCommandRequest may not
+    // match what was set on the originating command, so copy it from the ExpressionContext.
     aggRequest.setAllowDiskUse(expCtx->allowDiskUse);
 
     if (auto maxTimeMS = expCtx->opCtx->getRemainingMaxTimeMillis();
@@ -667,7 +703,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> targetShardsAndAddMergeCursors(
 
 std::unique_ptr<Pipeline, PipelineDeleter> runPipelineDirectlyOnSingleShard(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    AggregateCommand request,
+    AggregateCommandRequest request,
     ShardId shardId) {
     invariant(!request.getExplain());
 
@@ -771,6 +807,10 @@ SplitPipeline splitPipeline(std::unique_ptr<Pipeline, PipelineDeleter> pipeline)
 
     // The order in which optimizations are applied can have significant impact on the efficiency of
     // the final pipeline. Be Careful!
+    if (inputsSort) {
+        moveEligibleStreamingStagesBeforeSortOnShards(
+            shardsPipeline.get(), mergePipeline.get(), *inputsSort);
+    }
     moveFinalUnwindFromShardsToMerger(shardsPipeline.get(), mergePipeline.get());
     propagateDocLimitToShards(shardsPipeline.get(), mergePipeline.get());
     limitFieldsSentFromShardsToMerger(shardsPipeline.get(), mergePipeline.get());
@@ -791,7 +831,7 @@ BSONObj createPassthroughCommandForShard(
     // Create the command for the shards.
     MutableDocument targetedCmd(serializedCommand);
     if (pipeline) {
-        targetedCmd[AggregateCommand::kPipelineFieldName] = Value(pipeline->serialize());
+        targetedCmd[AggregateCommandRequest::kPipelineFieldName] = Value(pipeline->serialize());
     }
 
     return genericTransformForShards(
@@ -809,12 +849,12 @@ BSONObj createCommandForTargetedShards(const boost::intrusive_ptr<ExpressionCont
     // has defaulted any arguments or otherwise changed the spec. For example, $listSessions may
     // have detected a logged in user and appended that user name to the $listSessions spec to
     // send to the shards.
-    targetedCmd[AggregateCommand::kPipelineFieldName] =
+    targetedCmd[AggregateCommandRequest::kPipelineFieldName] =
         Value(splitPipeline.shardsPipeline->serialize());
 
     // When running on many shards with the exchange we may not need merging.
     if (needsMerge) {
-        targetedCmd[AggregateCommand::kNeedsMergeFieldName] = Value(true);
+        targetedCmd[AggregateCommandRequest::kNeedsMergeFieldName] = Value(true);
 
         // If there aren't any stages like $out in the pipeline being sent to the shards, remove the
         // write concern. The write concern should only be applied when there are writes performed
@@ -827,10 +867,10 @@ BSONObj createCommandForTargetedShards(const boost::intrusive_ptr<ExpressionCont
         }
     }
 
-    targetedCmd[AggregateCommand::kBatchSizeFieldName] =
+    targetedCmd[AggregateCommandRequest::kCursorFieldName] =
         Value(DOC(aggregation_request_helper::kBatchSizeField << 0));
 
-    targetedCmd[AggregateCommand::kExchangeFieldName] =
+    targetedCmd[AggregateCommandRequest::kExchangeFieldName] =
         exchangeSpec ? Value(exchangeSpec->exchangeSpec.toBSON()) : Value();
 
     return genericTransformForShards(
@@ -853,7 +893,7 @@ DispatchShardPipelineResults dispatchShardPipeline(
     // pipeline; if not, we retain the existing pipeline.
     // - Call establishShardCursors to dispatch the aggregation to the targeted shards.
     // - Stale shard version errors are thrown up to the top-level handler, causing a retry on the
-    // entire aggregation commmand.
+    // entire aggregation command.
     auto cursors = std::vector<RemoteCursor>();
     auto shardResults = std::vector<AsyncRequestsSender::Response>();
     auto opCtx = expCtx->opCtx;
@@ -1163,7 +1203,7 @@ BSONObj targetShardsForExplain(Pipeline* ownedPipeline) {
         return stages;
     }();
 
-    AggregateCommand aggRequest(expCtx->ns, rawStages);
+    AggregateCommandRequest aggRequest(expCtx->ns, rawStages);
     LiteParsedPipeline liteParsedPipeline(aggRequest);
     auto hasChangeStream = liteParsedPipeline.hasChangeStream();
     auto shardDispatchResults =

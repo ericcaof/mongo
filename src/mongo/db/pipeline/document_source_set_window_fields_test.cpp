@@ -36,6 +36,7 @@
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_source_set_window_fields.h"
 #include "mongo/unittest/unittest.h"
 
@@ -46,47 +47,67 @@ namespace {
 using DocumentSourceSetWindowFieldsTest = AggregationContextFixture;
 
 TEST_F(DocumentSourceSetWindowFieldsTest, FailsToParseInvalidArgumentTypes) {
-    auto spec = BSON("$setWindowFields"
+    auto spec = BSON("$_internalSetWindowFields"
                      << "invalid");
     ASSERT_THROWS_CODE(
-        DocumentSourceSetWindowFields::createFromBson(spec.firstElement(), getExpCtx()),
+        DocumentSourceInternalSetWindowFields::createFromBson(spec.firstElement(), getExpCtx()),
         AssertionException,
         ErrorCodes::FailedToParse);
 
-    spec = BSON("$setWindowFields" << BSON("sortBy"
-                                           << "invalid sort spec"));
+    spec = BSON("$_internalSetWindowFields" << BSON("sortBy"
+                                                    << "invalid sort spec"));
     ASSERT_THROWS_CODE(
-        DocumentSourceSetWindowFields::createFromBson(spec.firstElement(), getExpCtx()),
+        DocumentSourceInternalSetWindowFields::createFromBson(spec.firstElement(), getExpCtx()),
         AssertionException,
         ErrorCodes::TypeMismatch);
 
-    spec = BSON("$setWindowFields" << BSON("output"
-                                           << "invalid"));
+    spec = BSON("$_internalSetWindowFields" << BSON("output"
+                                                    << "invalid"));
     ASSERT_THROWS_CODE(
-        DocumentSourceSetWindowFields::createFromBson(spec.firstElement(), getExpCtx()),
+        DocumentSourceInternalSetWindowFields::createFromBson(spec.firstElement(), getExpCtx()),
         AssertionException,
         ErrorCodes::TypeMismatch);
 
-    spec = BSON("$setWindowFields"
+    spec = BSON("$_internalSetWindowFields"
                 << BSON("partitionBy" << BSON("$notAnExpression" << 1) << "output" << BSONObj()));
     ASSERT_THROWS_CODE(
-        DocumentSourceSetWindowFields::createFromBson(spec.firstElement(), getExpCtx()),
+        DocumentSourceInternalSetWindowFields::createFromBson(spec.firstElement(), getExpCtx()),
         AssertionException,
         ErrorCodes::InvalidPipelineOperator);
 
-    spec = BSON("$setWindowFields" << BSON("unknown_parameter" << 1));
+    spec = BSON("$_internalSetWindowFields" << BSON("unknown_parameter" << 1));
     ASSERT_THROWS_CODE(
-        DocumentSourceSetWindowFields::createFromBson(spec.firstElement(), getExpCtx()),
+        DocumentSourceInternalSetWindowFields::createFromBson(spec.firstElement(), getExpCtx()),
         AssertionException,
         40415);
 }
 
+TEST_F(DocumentSourceSetWindowFieldsTest, FailsToParseIfArgumentsAreRepeated) {
+    auto spec = fromjson(R"(
+        {$_internalSetWindowFields: {partitionBy: '$state', sortBy: {city: 1}, output: {mySum:
+        {$sum: '$pop', $max: '$pop', window: {documents: [-10, 0]}}}}})");
+    ASSERT_THROWS_CODE(
+        DocumentSourceInternalSetWindowFields::createFromBson(spec.firstElement(), getExpCtx()),
+        AssertionException,
+        ErrorCodes::FailedToParse);
+}
+
+TEST_F(DocumentSourceSetWindowFieldsTest, FailsToParseIfWindowFieldHasExtraArgument) {
+    auto spec = fromjson(R"(
+        {$_internalSetWindowFields: {partitionBy: '$state', sortBy: {city: 1}, output: {mySum:
+        {$sum: '$pop', window: {documents: [0, 10], document: [0,8]} }}}})");
+    ASSERT_THROWS_CODE(
+        DocumentSourceInternalSetWindowFields::createFromBson(spec.firstElement(), getExpCtx()),
+        AssertionException,
+        ErrorCodes::FailedToParse);
+}
+
 TEST_F(DocumentSourceSetWindowFieldsTest, SuccessfullyParsesAndReserializes) {
     auto spec = fromjson(R"(
-        {$setWindowFields: {partitionBy: '$state', sortBy: {city: 1}, output: {mySum: {$sum: 
-        {input: '$pop', documents: [-10, 0]}}}}})");
+        {$_internalSetWindowFields: {partitionBy: '$state', sortBy: {city: 1}, output: {mySum:
+        {$sum: '$pop', window: {documents: [-10, 0]}}}}})");
     auto parsedStage =
-        DocumentSourceSetWindowFields::createFromBson(spec.firstElement(), getExpCtx());
+        DocumentSourceInternalSetWindowFields::createFromBson(spec.firstElement(), getExpCtx());
     std::vector<Value> serializedArray;
     parsedStage->serializeToArray(serializedArray);
     ASSERT_BSONOBJ_EQ(serializedArray[0].getDocument().toBson(), spec);
@@ -94,11 +115,23 @@ TEST_F(DocumentSourceSetWindowFieldsTest, SuccessfullyParsesAndReserializes) {
 
 TEST_F(DocumentSourceSetWindowFieldsTest, FailsToParseIfFeatureFlagDisabled) {
     auto spec = fromjson(R"(
-        {$setWindowFields: {partitionBy: '$state', sortBy: {city: 1}, output: {mySum: {$sum: 
-        {input: '$pop', documents: [-10, 0]}}}}})");
+        {$_internalSetWindowFields: {partitionBy: '$state', sortBy: {city: 1}, output: {mySum:
+        {$sum: '$pop', window: {documents: [-10, 0]}}}}})");
     // By default, the unit test will have the feature flag disabled.
     ASSERT_THROWS_CODE(
         Pipeline::parse(std::vector<BSONObj>({spec}), getExpCtx()), AssertionException, 16436);
+}
+
+TEST_F(DocumentSourceSetWindowFieldsTest, HandlesEmptyInputCorrectly) {
+    auto spec = fromjson(R"(
+        {$_internalSetWindowFields: {partitionBy: '$state', sortBy: {city: 1}, output: {mySum:
+        {$sum: '$pop', window: {documents: ["unbounded", 0]}}}}})");
+    auto parsedStage =
+        DocumentSourceInternalSetWindowFields::createFromBson(spec.firstElement(), getExpCtx());
+    const auto mock = DocumentSourceMock::createForTest(getExpCtx());
+    parsedStage->setSource(mock.get());
+    ASSERT_EQ((int)DocumentSource::GetNextResult::ReturnStatus::kEOF,
+              (int)parsedStage->getNext().getStatus());
 }
 
 }  // namespace

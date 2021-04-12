@@ -89,7 +89,7 @@ public:
 
         // External uuid when not accessible via collection
         // Set for actions kDropped, kRecreated. boost::none otherwise.
-        OptionalCollectionUUID externalUUID;
+        boost::optional<UUID> externalUUID;
 
         // New namespace this collection has been renamed to
         // Set for action kRenamed. Default constructed otherwise.
@@ -992,7 +992,7 @@ std::shared_ptr<Collection> CollectionCatalog::deregisterCollection(OperationCon
     _collections.erase(ns);
     _catalog.erase(uuid);
 
-    coll->onDeregisterFromCatalog();
+    coll->onDeregisterFromCatalog(opCtx);
 
     auto collRid = ResourceId(RESOURCE_COLLECTION, ns.ns());
     removeResource(collRid, ns.ns());
@@ -1085,19 +1085,27 @@ void CollectionCatalog::addResource(const ResourceId& rid, const std::string& en
 
 CollectionCatalogStasher::CollectionCatalogStasher(OperationContext* opCtx)
     : _opCtx(opCtx), _stashed(false) {}
+
 CollectionCatalogStasher::CollectionCatalogStasher(OperationContext* opCtx,
                                                    std::shared_ptr<const CollectionCatalog> catalog)
     : _opCtx(opCtx), _stashed(true) {
     invariant(catalog);
     CollectionCatalog::stash(_opCtx, std::move(catalog));
 }
-CollectionCatalogStasher::~CollectionCatalogStasher() {
-    reset();
-}
 
 CollectionCatalogStasher::CollectionCatalogStasher(CollectionCatalogStasher&& other)
     : _opCtx(other._opCtx), _stashed(other._stashed) {
     other._stashed = false;
+}
+
+CollectionCatalogStasher::~CollectionCatalogStasher() {
+    if (_opCtx->isLockFreeReadsOp()) {
+        // Leave the catalog stashed on the opCtx because there is another Stasher instance still
+        // using it.
+        return;
+    }
+
+    reset();
 }
 
 void CollectionCatalogStasher::stash(std::shared_ptr<const CollectionCatalog> catalog) {

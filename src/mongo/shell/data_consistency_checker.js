@@ -57,7 +57,8 @@ var CollInfos = class {
                 ns: ns,
                 host: this.conn.host,
                 UUID: collInfoRaw.info.uuid,
-                count: coll.find().itcount()
+                count: coll.find().itcount(),
+                raw: collInfoRaw,
             };
         }
 
@@ -177,14 +178,16 @@ var {DataConsistencyChecker} = (function() {
             return {docsWithDifferentContents, docsMissingOnFirst, docsMissingOnSecond};
         }
 
-        static getCollectionDiffUsingSessions(sourceSession,
-                                              syncingSession,
-                                              dbName,
-                                              collNameOrUUID) {
+        static getCollectionDiffUsingSessions(
+            sourceSession, syncingSession, dbName, collNameOrUUID, readAtClusterTime) {
             const sourceDB = sourceSession.getDatabase(dbName);
             const syncingDB = syncingSession.getDatabase(dbName);
 
             const commandObj = {find: collNameOrUUID, sort: {_id: 1}};
+            if (readAtClusterTime !== undefined) {
+                commandObj.readConcern = {level: "snapshot", atClusterTime: readAtClusterTime};
+            }
+
             const sourceCursor = new DBCommandCursor(sourceDB, sourceDB.runCommand(commandObj));
             const syncingCursor = new DBCommandCursor(syncingDB, syncingDB.runCommand(commandObj));
             const diff = this.getDiff(sourceCursor, syncingCursor);
@@ -320,7 +323,25 @@ var {DataConsistencyChecker} = (function() {
                         // from index specs in 4.4.
                         if (sourceInfo.idIndex) {
                             delete sourceInfo.idIndex.ns;
+                        }
+                        if (syncingInfo.idIndex) {
                             delete syncingInfo.idIndex.ns;
+                        }
+
+                        // TODO: SERVER-54967 Remove workaround for comparing size
+                        let sizeDeleted = false;
+                        let sourceSize = sourceInfo.options.size;
+                        let syncingSize = syncingInfo.options.size;
+
+                        // Compare 'size' field in 'options' field outside of bsonBinaryEqual as it
+                        // could be saved as a NumberDecimal or NumberLong in versions 4.4 and
+                        // before.
+                        if (jsTest.options().useRandomBinVersionsWithinReplicaSet &&
+                            sourceInfo.options.size == syncingInfo.options.size &&
+                            sourceInfo.options.size !== syncingInfo.options.size) {
+                            delete sourceInfo.options.size;
+                            delete syncingInfo.options.size;
+                            sizeDeleted = true;
                         }
 
                         if (!bsonBinaryEqual(syncingInfo, sourceInfo)) {
@@ -332,6 +353,13 @@ var {DataConsistencyChecker} = (function() {
                                                     syncingCollInfos,
                                                     syncingInfo.name);
                             success = false;
+                        }
+
+                        // Deleted sizes must be added back to prevent comparison between nodes that
+                        // have not had their size removed.
+                        if (sizeDeleted) {
+                            sourceInfo.options.size = sourceSize;
+                            syncingInfo.options.size = syncingSize;
                         }
                     }
                 });

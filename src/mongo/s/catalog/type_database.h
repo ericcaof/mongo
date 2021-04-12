@@ -55,7 +55,7 @@ public:
     DatabaseType(const std::string& dbName,
                  const ShardId& primaryShard,
                  bool sharded,
-                 DatabaseVersion);
+                 DatabaseVersion dbVersion);
 
     DatabaseType() = default;
 
@@ -111,7 +111,7 @@ public:
 private:
     std::string _name;
     ShardId _primary;
-    bool _sharded;
+    bool _sharded{false};
     DatabaseVersion _version;
 };
 

@@ -149,11 +149,11 @@ TEST_F(OplogBufferCollectionTest, StartupWithUserProvidedNamespaceCreatesCollect
     testStartupCreatesCollection(_opCtx.get(), _storageInterface, makeNamespace(_agent));
 }
 
-DEATH_TEST_REGEX_F(
-    OplogBufferCollectionTest,
-    StartupWithOplogNamespaceTriggersFatalAssertion,
-    "Fatal assertion.*40154.*Location28838: cannot create a non-capped oplog collection") {
-    testStartupCreatesCollection(_opCtx.get(), _storageInterface, NamespaceString("local.oplog.Z"));
+TEST_F(OplogBufferCollectionTest, StartupWithOplogNamespaceTriggersUassert) {
+    ASSERT_THROWS_CODE(testStartupCreatesCollection(
+                           _opCtx.get(), _storageInterface, NamespaceString("local.oplog.Z")),
+                       DBException,
+                       28838);
 }
 
 TEST_F(OplogBufferCollectionTest, ShutdownDropsCollection) {
@@ -837,6 +837,22 @@ DEATH_TEST_REGEX_F(OplogBufferCollectionTest,
     };
     ASSERT_EQUALS(oplogBuffer.getCount(), 0UL);
     oplogBuffer.push(_opCtx.get(), oplog.begin(), oplog.end());
+}
+
+TEST_F(OplogBufferCollectionTest, PreloadAllNonBlockingSucceeds) {
+    auto nss = makeNamespace(_agent);
+    OplogBufferCollection oplogBuffer(_storageInterface, nss);
+
+    oplogBuffer.startup(_opCtx.get());
+    const std::vector<BSONObj> oplog = {
+        makeOplogEntry(2),
+        makeOplogEntry(1),
+    };
+    ASSERT_EQUALS(oplogBuffer.getCount(), 0UL);
+    oplogBuffer.preload(_opCtx.get(), oplog.begin(), oplog.end());
+    ASSERT_EQUALS(oplogBuffer.getCount(), 2UL);
+    ASSERT_NOT_EQUALS(oplogBuffer.getSize(), 0UL);
+    ASSERT_EQUALS(Timestamp(2, 2), oplogBuffer.getLastPushedTimestamp());
 }
 
 

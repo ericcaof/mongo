@@ -269,8 +269,7 @@ public:
      */
     Status initSSLContext(SCHANNEL_CRED* cred,
                           const SSLParams& params,
-                          const TransientSSLParams& transientParams,
-                          ConnectionDirection direction) override final;
+                          ConnectionDirection direction) final;
 
     SSLConnectionInterface* connect(Socket* socket) final;
 
@@ -393,12 +392,21 @@ SSLConnectionWindows::~SSLConnectionWindows() {}
 // Global variable indicating if this is a server or a client instance
 bool isSSLServer = false;
 
+std::shared_ptr<SSLManagerInterface> SSLManagerInterface::create(
+    const SSLParams& params,
+    const std::optional<TransientSSLParams>& transientSSLParams,
+    bool isServer) {
+    return std::make_shared<SSLManagerWindows>(params, isServer);
+}
+
 std::shared_ptr<SSLManagerInterface> SSLManagerInterface::create(const SSLParams& params,
                                                                  bool isServer) {
     return std::make_shared<SSLManagerWindows>(params, isServer);
 }
 
 namespace {
+
+StatusWith<std::vector<std::string>> getSubjectAlternativeNames(PCCERT_CONTEXT cert);
 
 SSLManagerWindows::SSLManagerWindows(const SSLParams& params, bool isServer)
     : _weakValidation(params.sslWeakCertificateValidation),
@@ -416,8 +424,7 @@ SSLManagerWindows::SSLManagerWindows(const SSLParams& params, bool isServer)
 
     uassertStatusOK(_loadCertificates(params));
 
-    uassertStatusOK(
-        initSSLContext(&_clientCred, params, TransientSSLParams(), ConnectionDirection::kOutgoing));
+    uassertStatusOK(initSSLContext(&_clientCred, params, ConnectionDirection::kOutgoing));
 
     // Certificates may not have been loaded. This typically occurs in unit tests.
     if (_clientCertificates[0] != nullptr) {
@@ -427,8 +434,7 @@ SSLManagerWindows::SSLManagerWindows(const SSLParams& params, bool isServer)
 
     // SSL server specific initialization
     if (isServer) {
-        uassertStatusOK(initSSLContext(
-            &_serverCred, params, TransientSSLParams(), ConnectionDirection::kIncoming));
+        uassertStatusOK(initSSLContext(&_serverCred, params, ConnectionDirection::kIncoming));
 
         if (_serverCertificates[0] != nullptr) {
             SSLX509Name subjectName;
@@ -437,6 +443,16 @@ SSLManagerWindows::SSLManagerWindows(const SSLParams& params, bool isServer)
                                      &subjectName,
                                      &_sslConfiguration.serverCertificateExpirationDate));
             uassertStatusOK(_sslConfiguration.setServerSubjectName(std::move(subjectName)));
+
+            auto swSans = getSubjectAlternativeNames(_serverCertificates[0]);
+            const bool hasSan = swSans.isOK() && (0 != swSans.getValue().size());
+            if (!hasSan) {
+                LOGV2_WARNING_OPTIONS(
+                    551192,
+                    {logv2::LogTag::kStartupWarnings},
+                    "Server certificate has no compatible Subject Alternative Name. "
+                    "This may prevent TLS clients from connecting");
+            }
         }
 
         // Monitor the server certificate's expiration
@@ -1345,7 +1361,6 @@ Status SSLManagerWindows::_loadCertificates(const SSLParams& params) {
 
 Status SSLManagerWindows::initSSLContext(SCHANNEL_CRED* cred,
                                          const SSLParams& params,
-                                         const TransientSSLParams& transientParams,
                                          ConnectionDirection direction) {
 
     memset(cred, 0, sizeof(*cred));
@@ -1440,7 +1455,6 @@ SSLConnectionInterface* SSLManagerWindows::accept(Socket* socket,
 void SSLManagerWindows::_handshake(SSLConnectionWindows* conn, bool client) {
     initSSLContext(conn->_cred,
                    getSSLGlobalParams(),
-                   TransientSSLParams(),
                    client ? SSLManagerInterface::ConnectionDirection::kOutgoing
                           : SSLManagerInterface::ConnectionDirection::kIncoming);
 

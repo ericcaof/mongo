@@ -33,6 +33,7 @@
 
 #include "mongo/db/exec/projection_executor.h"
 #include "mongo/db/exec/projection_node.h"
+#include "mongo/db/pipeline/expression_walker.h"
 
 namespace mongo::projection_executor {
 /**
@@ -74,6 +75,39 @@ public:
     boost::optional<size_t> maxFieldsToProject() const override {
         return _children.size() + _projectedFields.size();
     }
+
+    // The following two methods extract from the InclusionNode computed projections that depend
+    // only on the 'oldName' field. We need two versions for $project and $addFields, due to
+    // different functionality: we need to replace the fields in $project to not lose them, and we
+    // can just remove them from $addFields.
+    /**
+     * Returns a pair of <BSONObj, bool>. The BSONObj contains extracted computed projections that
+     * depend only on the 'oldName' field and is empty if no such projection exists. In the
+     * extracted expressions the 'oldName' is substituted for the 'newName'. If a projection name
+     * is in the 'reservedNames' set, it is ineligible for extraction. Each extracted computed
+     * projection is replaced with a projected field or with an identity projection.
+     * The returned boolean flag is always false meaning that the original projection is not empty
+     * and cannot be deleted.
+     */
+    std::pair<BSONObj, bool> extractComputedProjectionsInProject(
+        const StringData& oldName,
+        const StringData& newName,
+        const std::set<StringData>& reservedNames);
+
+    /**
+     * Returns a pair of <BSONObj, bool>. The BSONObj contains extracted computed projections that
+     * depend only on the 'oldName' field and is empty if no such projection exists. In the
+     * extracted expressions the 'oldName' is substituted for the 'newName'. If a projection name
+     * is in the 'reservedNames' set, it is ineligible for extraction. To preserve the original
+     * field order the extraction stops when reaching a field which cannot be extracted. The
+     * extracted projections are removed from the node.
+     * The returned boolean flag is true if the original projection has become empty after the
+     * extraction and can be deleted by the caller.
+     */
+    std::pair<BSONObj, bool> extractComputedProjectionsInAddFields(
+        const StringData& oldName,
+        const StringData& newName,
+        const std::set<StringData>& reservedNames);
 
 protected:
     // For inclusions, we can apply an optimization here by simply appending to the output document
@@ -169,6 +203,9 @@ public:
         boost::optional<ExplainOptions::Verbosity> explain) const final {
         MutableDocument output;
 
+        // The InclusionNode tree in '_root' will always have a top-level _id node if _id is to be
+        // included. If the _id node is not present, then explicitly set {_id: false} to avoid
+        // ambiguity in the expected behavior of the serialized projection.
         _root->serialize(explain, &output);
         if (output.peek()["_id"].missing()) {
             output.addField("_id", Value{false});
@@ -238,6 +275,13 @@ public:
         }
 
         return exhaustivePaths;
+    }
+
+    std::pair<BSONObj, bool> extractComputedProjections(
+        const StringData& oldName,
+        const StringData& newName,
+        const std::set<StringData>& reservedNames) final {
+        return _root->extractComputedProjectionsInProject(oldName, newName, reservedNames);
     }
 
 private:

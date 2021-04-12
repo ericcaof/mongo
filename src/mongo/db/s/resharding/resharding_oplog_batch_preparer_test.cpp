@@ -34,27 +34,13 @@
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/s/resharding/resharding_oplog_batch_preparer.h"
 #include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
 
 using OplogBatch = ReshardingOplogBatchPreparer::OplogBatchToPrepare;
-
-class ScopedServerParameterChange {
-public:
-    ScopedServerParameterChange(int* param, int newValue) : _param(param), _originalValue(*_param) {
-        *param = newValue;
-    }
-
-    ~ScopedServerParameterChange() {
-        *_param = _originalValue;
-    }
-
-private:
-    int* const _param;
-    const int _originalValue;
-};
 
 class ReshardingOplogBatchPreparerTest : public unittest::Test {
 protected:
@@ -74,7 +60,8 @@ protected:
 
         // These are unused by ReshardingOplogBatchPreparer but required by IDL parsing.
         op.setNss({});
-        op.setOpTimeAndWallTimeBase({{}, {}});
+        op.setOpTime({{}, {}});
+        op.setWallClockTime({});
 
         return {op.toBSON()};
     }
@@ -108,7 +95,8 @@ protected:
 
         // These are unused by ReshardingOplogBatchPreparer but required by IDL parsing.
         op.setNss({});
-        op.setOpTimeAndWallTimeBase({{}, {}});
+        op.setOpTime({{}, {}});
+        op.setWallClockTime({});
 
         return {op.toBSON()};
     }
@@ -128,7 +116,8 @@ protected:
 
         // These are unused by ReshardingOplogBatchPreparer but required by IDL parsing.
         op.setNss({});
-        op.setOpTimeAndWallTimeBase({{}, {}});
+        op.setOpTime({{}, {}});
+        op.setWallClockTime({});
 
         return {op.toBSON()};
     }
@@ -154,8 +143,8 @@ protected:
     static constexpr size_t kNumWriterVectors = 2;
 
 private:
-    ScopedServerParameterChange _numWriterVectors{&resharding::gReshardingWriterThreadCount,
-                                                  int(kNumWriterVectors)};
+    RAIIServerParameterControllerForTest controller{"reshardingOplogBatchTaskCount",
+                                                    int(kNumWriterVectors)};
 };
 
 TEST_F(ReshardingOplogBatchPreparerTest, AssignsCrudOpsToWriterVectorsById) {
@@ -385,7 +374,8 @@ TEST_F(ReshardingOplogBatchPreparerTest, DiscardsNoops) {
         op.setOpType(repl::OpTypeEnum::kNoop);
         op.setObject({});
         op.setNss({});
-        op.setOpTimeAndWallTimeBase({{}, {}});
+        op.setOpTime({{}, {}});
+        op.setWallClockTime({});
         batch.emplace_back(op.toBSON());
     }
 

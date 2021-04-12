@@ -45,11 +45,13 @@
 #include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/sort.h"
 #include "mongo/db/exec/subplan.h"
-#include "mongo/db/exec/text.h"
+#include "mongo/db/exec/text_match.h"
 #include "mongo/db/exec/trial_stage.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/query/explain.h"
-#include "mongo/util/str.h"
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/record_id_helpers.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
@@ -83,8 +85,8 @@ void addStageSummaryStr(const PlanStage* stage, StringBuilder& sb) {
         const IndexScanStats* spec = static_cast<const IndexScanStats*>(specific);
         const KeyPattern keyPattern{spec->keyPattern};
         sb << " " << keyPattern;
-    } else if (STAGE_TEXT == stage->stageType()) {
-        const TextStats* spec = static_cast<const TextStats*>(specific);
+    } else if (STAGE_TEXT_MATCH == stage->stageType()) {
+        const TextMatchStats* spec = static_cast<const TextMatchStats*>(specific);
         const KeyPattern keyPattern{spec->indexPrefix};
         sb << " " << keyPattern;
     }
@@ -100,8 +102,11 @@ void flattenExecTree(const PlanStage* root, std::vector<const PlanStage*>* flatt
     if (root->stageType() == STAGE_MULTI_PLAN) {
         // Only add the winning plan from a MultiPlanStage.
         auto mps = static_cast<const MultiPlanStage*>(root);
-        const PlanStage* winningStage = mps->getChildren()[mps->bestPlanIdx()].get();
-        return flattenExecTree(winningStage, flattened);
+        auto bestPlanIdx = mps->bestPlanIdx();
+        tassert(3420001, "Trying to explain MultiPlanStage without best plan", bestPlanIdx);
+        const auto winningStage = mps->getChildren()[*bestPlanIdx].get();
+        flattenExecTree(winningStage, flattened);
+        return;
     }
 
     const auto& children = root->getChildren();
@@ -111,13 +116,20 @@ void flattenExecTree(const PlanStage* root, std::vector<const PlanStage*>* flatt
 }
 
 /**
- * Traverse the tree rooted at 'root', and add all tree nodes into the list 'flattened'.
+ * Traverses the tree rooted at 'root', and adds all tree nodes into the list 'flattened'.
+ * If there is a MultiPlanStage node, follows the subplan at 'planIdx'.
  */
-void flattenStatsTree(const PlanStageStats* root, std::vector<const PlanStageStats*>* flattened) {
-    invariant(root->stageType != STAGE_MULTI_PLAN);
+void flattenStatsTree(const PlanStageStats* root,
+                      const boost::optional<size_t> planIdx,
+                      std::vector<const PlanStageStats*>* flattened) {
+    if (STAGE_MULTI_PLAN == root->stageType) {
+        // Skip the MultiPlanStage, and continue with its planIdx child
+        tassert(3420002, "Invalid child plan index", planIdx && planIdx < root->children.size());
+        root = root->children[*planIdx].get();
+    }
     flattened->push_back(root);
     for (auto&& child : root->children) {
-        flattenStatsTree(child.get(), flattened);
+        flattenStatsTree(child.get(), planIdx, flattened);
     }
 }
 
@@ -167,19 +179,28 @@ size_t getDocsExamined(StageType type, const SpecificStats* specific) {
 
 /**
  * Converts the stats tree 'stats' into a corresponding BSON object containing explain information.
+ * If there is a MultiPlanStage node, skip that node, and follow the subplan at 'planIdx'.
  *
  * Generates the BSON stats at a verbosity specified by 'verbosity'.
  */
 void statsToBSON(const PlanStageStats& stats,
                  ExplainOptions::Verbosity verbosity,
+                 const boost::optional<size_t> planIdx,
                  BSONObjBuilder* bob,
                  BSONObjBuilder* topLevelBob) {
     invariant(bob);
     invariant(topLevelBob);
 
     // Stop as soon as the BSON object we're building exceeds the limit.
-    if (topLevelBob->len() > kMaxExplainStatsBSONSizeMB) {
+    if (topLevelBob->len() > internalQueryExplainSizeThresholdBytes.load()) {
         bob->append("warning", "stats tree exceeded BSON size limit for explain");
+        return;
+    }
+
+    if (STAGE_MULTI_PLAN == stats.stageType) {
+        tassert(3420003, "Invalid child plan index", planIdx && planIdx < stats.children.size());
+        const PlanStageStats* childStage = stats.children[*planIdx].get();
+        statsToBSON(*childStage, verbosity, planIdx, bob, topLevelBob);
         return;
     }
 
@@ -193,18 +214,18 @@ void statsToBSON(const PlanStageStats& stats,
 
     // Some top-level exec stats get pulled out of the root stage.
     if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-        bob->appendNumber("nReturned", stats.common.advanced);
+        bob->appendNumber("nReturned", static_cast<long long>(stats.common.advanced));
         // Include executionTimeMillis if it was recorded.
         if (stats.common.executionTimeMillis) {
             bob->appendNumber("executionTimeMillisEstimate", *stats.common.executionTimeMillis);
         }
 
-        bob->appendNumber("works", stats.common.works);
-        bob->appendNumber("advanced", stats.common.advanced);
-        bob->appendNumber("needTime", stats.common.needTime);
-        bob->appendNumber("needYield", stats.common.needYield);
-        bob->appendNumber("saveState", stats.common.yields);
-        bob->appendNumber("restoreState", stats.common.unyields);
+        bob->appendNumber("works", static_cast<long long>(stats.common.works));
+        bob->appendNumber("advanced", static_cast<long long>(stats.common.advanced));
+        bob->appendNumber("needTime", static_cast<long long>(stats.common.needTime));
+        bob->appendNumber("needYield", static_cast<long long>(stats.common.needYield));
+        bob->appendNumber("saveState", static_cast<long long>(stats.common.yields));
+        bob->appendNumber("restoreState", static_cast<long long>(stats.common.unyields));
         if (stats.common.failed)
             bob->appendBool("failed", stats.common.failed);
         bob->appendNumber("isEOF", stats.common.isEOF);
@@ -215,12 +236,12 @@ void statsToBSON(const PlanStageStats& stats,
         AndHashStats* spec = static_cast<AndHashStats*>(stats.specific.get());
 
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("memUsage", spec->memUsage);
-            bob->appendNumber("memLimit", spec->memLimit);
+            bob->appendNumber("memUsage", static_cast<long long>(spec->memUsage));
+            bob->appendNumber("memLimit", static_cast<long long>(spec->memLimit));
 
             for (size_t i = 0; i < spec->mapAfterChild.size(); ++i) {
                 bob->appendNumber(std::string(str::stream() << "mapAfterChild_" << i),
-                                  spec->mapAfterChild[i]);
+                                  static_cast<long long>(spec->mapAfterChild[i]));
             }
         }
     } else if (STAGE_AND_SORTED == stats.stageType) {
@@ -229,20 +250,20 @@ void statsToBSON(const PlanStageStats& stats,
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             for (size_t i = 0; i < spec->failedAnd.size(); ++i) {
                 bob->appendNumber(std::string(str::stream() << "failedAnd_" << i),
-                                  spec->failedAnd[i]);
+                                  static_cast<long long>(spec->failedAnd[i]));
             }
         }
     } else if (STAGE_COLLSCAN == stats.stageType) {
         CollectionScanStats* spec = static_cast<CollectionScanStats*>(stats.specific.get());
         bob->append("direction", spec->direction > 0 ? "forward" : "backward");
-        if (spec->minTs) {
-            bob->append("minTs", *(spec->minTs));
+        if (spec->minRecord) {
+            record_id_helpers::appendToBSONAs(*spec->minRecord, bob, "minRecord");
         }
-        if (spec->maxTs) {
-            bob->append("maxTs", *(spec->maxTs));
+        if (spec->maxRecord) {
+            record_id_helpers::appendToBSONAs(*spec->maxRecord, bob, "maxRecord");
         }
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("docsExamined", spec->docsTested);
+            bob->appendNumber("docsExamined", static_cast<long long>(spec->docsTested));
         }
     } else if (STAGE_COUNT == stats.stageType) {
         CountStats* spec = static_cast<CountStats*>(stats.specific.get());
@@ -255,7 +276,7 @@ void statsToBSON(const PlanStageStats& stats,
         CountScanStats* spec = static_cast<CountScanStats*>(stats.specific.get());
 
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("keysExamined", spec->keysExamined);
+            bob->appendNumber("keysExamined", static_cast<long long>(spec->keysExamined));
         }
 
         bob->append("keyPattern", spec->keyPattern);
@@ -272,17 +293,16 @@ void statsToBSON(const PlanStageStats& stats,
         bob->appendBool("isPartial", spec->isPartial);
         bob->append("indexVersion", spec->indexVersion);
 
-        BSONObjBuilder indexBoundsBob;
+        BSONObjBuilder indexBoundsBob(bob->subobjStart("indexBounds"));
         indexBoundsBob.append("startKey", spec->startKey);
         indexBoundsBob.append("startKeyInclusive", spec->startKeyInclusive);
         indexBoundsBob.append("endKey", spec->endKey);
         indexBoundsBob.append("endKeyInclusive", spec->endKeyInclusive);
-        bob->append("indexBounds", indexBoundsBob.obj());
     } else if (STAGE_DELETE == stats.stageType) {
         DeleteStats* spec = static_cast<DeleteStats*>(stats.specific.get());
 
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("nWouldDelete", spec->docsDeleted);
+            bob->appendNumber("nWouldDelete", static_cast<long long>(spec->docsDeleted));
         }
     } else if (STAGE_DISTINCT_SCAN == stats.stageType) {
         DistinctScanStats* spec = static_cast<DistinctScanStats*>(stats.specific.get());
@@ -302,14 +322,15 @@ void statsToBSON(const PlanStageStats& stats,
         bob->append("indexVersion", spec->indexVersion);
         bob->append("direction", spec->direction > 0 ? "forward" : "backward");
 
-        if ((topLevelBob->len() + spec->indexBounds.objsize()) > kMaxExplainStatsBSONSizeMB) {
+        if ((topLevelBob->len() + spec->indexBounds.objsize()) >
+            internalQueryExplainSizeThresholdBytes.load()) {
             bob->append("warning", "index bounds omitted due to BSON size limit for explain");
         } else {
             bob->append("indexBounds", spec->indexBounds);
         }
 
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("keysExamined", spec->keysExamined);
+            bob->appendNumber("keysExamined", static_cast<long long>(spec->keysExamined));
         }
     } else if (STAGE_ENSURE_SORTED == stats.stageType) {
         EnsureSortedStats* spec = static_cast<EnsureSortedStats*>(stats.specific.get());
@@ -320,8 +341,8 @@ void statsToBSON(const PlanStageStats& stats,
     } else if (STAGE_FETCH == stats.stageType) {
         FetchStats* spec = static_cast<FetchStats*>(stats.specific.get());
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("docsExamined", spec->docsExamined);
-            bob->appendNumber("alreadyHasObj", spec->alreadyHasObj);
+            bob->appendNumber("docsExamined", static_cast<long long>(spec->docsExamined));
+            bob->appendNumber("alreadyHasObj", static_cast<long long>(spec->alreadyHasObj));
         }
     } else if (STAGE_GEO_NEAR_2D == stats.stageType || STAGE_GEO_NEAR_2DSPHERE == stats.stageType) {
         NearStats* spec = static_cast<NearStats*>(stats.specific.get());
@@ -347,8 +368,8 @@ void statsToBSON(const PlanStageStats& stats,
     } else if (STAGE_IDHACK == stats.stageType) {
         IDHackStats* spec = static_cast<IDHackStats*>(stats.specific.get());
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("keysExamined", spec->keysExamined);
-            bob->appendNumber("docsExamined", spec->docsExamined);
+            bob->appendNumber("keysExamined", static_cast<long long>(spec->keysExamined));
+            bob->appendNumber("docsExamined", static_cast<long long>(spec->docsExamined));
         }
     } else if (STAGE_IXSCAN == stats.stageType) {
         IndexScanStats* spec = static_cast<IndexScanStats*>(stats.specific.get());
@@ -368,28 +389,29 @@ void statsToBSON(const PlanStageStats& stats,
         bob->append("indexVersion", spec->indexVersion);
         bob->append("direction", spec->direction > 0 ? "forward" : "backward");
 
-        if ((topLevelBob->len() + spec->indexBounds.objsize()) > kMaxExplainStatsBSONSizeMB) {
+        if ((topLevelBob->len() + spec->indexBounds.objsize()) >
+            internalQueryExplainSizeThresholdBytes.load()) {
             bob->append("warning", "index bounds omitted due to BSON size limit for explain");
         } else {
             bob->append("indexBounds", spec->indexBounds);
         }
 
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("keysExamined", spec->keysExamined);
-            bob->appendNumber("seeks", spec->seeks);
-            bob->appendNumber("dupsTested", spec->dupsTested);
-            bob->appendNumber("dupsDropped", spec->dupsDropped);
+            bob->appendNumber("keysExamined", static_cast<long long>(spec->keysExamined));
+            bob->appendNumber("seeks", static_cast<long long>(spec->seeks));
+            bob->appendNumber("dupsTested", static_cast<long long>(spec->dupsTested));
+            bob->appendNumber("dupsDropped", static_cast<long long>(spec->dupsDropped));
         }
     } else if (STAGE_OR == stats.stageType) {
         OrStats* spec = static_cast<OrStats*>(stats.specific.get());
 
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("dupsTested", spec->dupsTested);
-            bob->appendNumber("dupsDropped", spec->dupsDropped);
+            bob->appendNumber("dupsTested", static_cast<long long>(spec->dupsTested));
+            bob->appendNumber("dupsDropped", static_cast<long long>(spec->dupsDropped));
         }
     } else if (STAGE_LIMIT == stats.stageType) {
         LimitStats* spec = static_cast<LimitStats*>(stats.specific.get());
-        bob->appendNumber("limitAmount", spec->limit);
+        bob->appendNumber("limitAmount", static_cast<long long>(spec->limit));
     } else if (isProjectionStageType(stats.stageType)) {
         ProjectionStats* spec = static_cast<ProjectionStats*>(stats.specific.get());
         bob->append("transformBy", spec->projObj);
@@ -400,28 +422,38 @@ void statsToBSON(const PlanStageStats& stats,
             bob->appendNumber("nCounted", spec->nCounted);
             bob->appendNumber("nSkipped", spec->nSkipped);
         }
+    } else if (STAGE_SAMPLE_FROM_TIMESERIES_BUCKET == stats.stageType) {
+        SampleFromTimeseriesBucketStats* spec =
+            static_cast<SampleFromTimeseriesBucketStats*>(stats.specific.get());
+
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
+            bob->appendNumber("nBucketsDiscarded", static_cast<long long>(spec->nBucketsDiscarded));
+            bob->appendNumber("dupsTested", static_cast<long long>(spec->dupsTested));
+            bob->appendNumber("dupsDropped", static_cast<long long>(spec->dupsDropped));
+        }
     } else if (STAGE_SHARDING_FILTER == stats.stageType) {
         ShardingFilterStats* spec = static_cast<ShardingFilterStats*>(stats.specific.get());
 
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("chunkSkips", spec->chunkSkips);
+            bob->appendNumber("chunkSkips", static_cast<long long>(spec->chunkSkips));
         }
     } else if (STAGE_SKIP == stats.stageType) {
         SkipStats* spec = static_cast<SkipStats*>(stats.specific.get());
-        bob->appendNumber("skipAmount", spec->skip);
+        bob->appendNumber("skipAmount", static_cast<long long>(spec->skip));
     } else if (isSortStageType(stats.stageType)) {
         SortStats* spec = static_cast<SortStats*>(stats.specific.get());
         bob->append("sortPattern", spec->sortPattern);
-        bob->appendIntOrLL("memLimit", spec->maxMemoryUsageBytes);
+        bob->appendNumber("memLimit", static_cast<long long>(spec->maxMemoryUsageBytes));
 
         if (spec->limit > 0) {
-            bob->appendIntOrLL("limitAmount", spec->limit);
+            bob->appendNumber("limitAmount", static_cast<long long>(spec->limit));
         }
 
         bob->append("type", stats.stageType == STAGE_SORT_SIMPLE ? "simple" : "default");
 
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendIntOrLL("totalDataSizeSorted", spec->totalDataSizeBytes);
+            bob->appendNumber("totalDataSizeSorted",
+                              static_cast<long long>(spec->totalDataSizeBytes));
             bob->appendBool("usedDisk", (spec->spills > 0));
         }
     } else if (STAGE_SORT_MERGE == stats.stageType) {
@@ -429,35 +461,40 @@ void statsToBSON(const PlanStageStats& stats,
         bob->append("sortPattern", spec->sortPattern);
 
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("dupsTested", spec->dupsTested);
-            bob->appendNumber("dupsDropped", spec->dupsDropped);
+            bob->appendNumber("dupsTested", static_cast<long long>(spec->dupsTested));
+            bob->appendNumber("dupsDropped", static_cast<long long>(spec->dupsDropped));
         }
-    } else if (STAGE_TEXT == stats.stageType) {
-        TextStats* spec = static_cast<TextStats*>(stats.specific.get());
+    } else if (STAGE_TEXT_MATCH == stats.stageType) {
+        TextMatchStats* spec = static_cast<TextMatchStats*>(stats.specific.get());
 
         bob->append("indexPrefix", spec->indexPrefix);
         bob->append("indexName", spec->indexName);
         bob->append("parsedTextQuery", spec->parsedTextQuery);
         bob->append("textIndexVersion", spec->textIndexVersion);
-    } else if (STAGE_TEXT_MATCH == stats.stageType) {
-        TextMatchStats* spec = static_cast<TextMatchStats*>(stats.specific.get());
 
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("docsRejected", spec->docsRejected);
+            bob->appendNumber("docsRejected", static_cast<long long>(spec->docsRejected));
         }
     } else if (STAGE_TEXT_OR == stats.stageType) {
         TextOrStats* spec = static_cast<TextOrStats*>(stats.specific.get());
 
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("docsExamined", spec->fetches);
+            bob->appendNumber("docsExamined", static_cast<long long>(spec->fetches));
+        }
+    } else if (STAGE_UNPACK_TIMESERIES_BUCKET == stats.stageType) {
+        UnpackTimeseriesBucketStats* spec =
+            static_cast<UnpackTimeseriesBucketStats*>(stats.specific.get());
+
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
+            bob->appendNumber("nBucketsUnpacked", static_cast<long long>(spec->nBucketsUnpacked));
         }
     } else if (STAGE_UPDATE == stats.stageType) {
         UpdateStats* spec = static_cast<UpdateStats*>(stats.specific.get());
 
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("nMatched", spec->nMatched);
-            bob->appendNumber("nWouldModify", spec->nModified);
-            bob->appendNumber("nWouldUpsert", spec->nUpserted);
+            bob->appendNumber("nMatched", static_cast<long long>(spec->nMatched));
+            bob->appendNumber("nWouldModify", static_cast<long long>(spec->nModified));
+            bob->appendNumber("nWouldUpsert", static_cast<long long>(spec->nUpserted));
         }
     }
 
@@ -470,9 +507,8 @@ void statsToBSON(const PlanStageStats& stats,
     // the output more readable by saving a level of nesting. Name the field 'inputStage'
     // rather than 'inputStages'.
     if (1 == stats.children.size()) {
-        BSONObjBuilder childBob;
-        statsToBSON(*stats.children[0], verbosity, &childBob, topLevelBob);
-        bob->append("inputStage", childBob.obj());
+        BSONObjBuilder childBob(bob->subobjStart("inputStage"));
+        statsToBSON(*stats.children[0], verbosity, planIdx, &childBob, topLevelBob);
         return;
     }
 
@@ -482,12 +518,20 @@ void statsToBSON(const PlanStageStats& stats,
     BSONArrayBuilder childrenBob(bob->subarrayStart("inputStages"));
     for (size_t i = 0; i < stats.children.size(); ++i) {
         BSONObjBuilder childBob(childrenBob.subobjStart());
-        statsToBSON(*stats.children[i], verbosity, &childBob, topLevelBob);
+        statsToBSON(*stats.children[i], verbosity, planIdx, &childBob, topLevelBob);
     }
     childrenBob.doneFast();
 }
 
-PlanSummaryStats collectExecutionStatsSummary(const PlanStageStats* stats) {
+PlanSummaryStats collectExecutionStatsSummary(const PlanStageStats* stats,
+                                              const boost::optional<size_t> planIdx) {
+    if (STAGE_MULTI_PLAN == stats->stageType) {
+        tassert(3420004, "Invalid child plan index", planIdx && planIdx < stats->children.size());
+        // Skip the MultiPlanStage when it is at the top of the plan, and extract stats from
+        // its child of interest to the caller.
+        stats = stats->children[*planIdx].get();
+    }
+
     PlanSummaryStats summary;
     summary.nReturned = stats->common.advanced;
 
@@ -497,11 +541,12 @@ PlanSummaryStats collectExecutionStatsSummary(const PlanStageStats* stats) {
 
     // Flatten the stats tree into a list.
     std::vector<const PlanStageStats*> statsNodes;
-    flattenStatsTree(stats, &statsNodes);
+    flattenStatsTree(stats, planIdx, &statsNodes);
 
     // Iterate over all stages in the tree and get the total number of keys/docs examined.
     // These are just aggregations of information already available in the stats tree.
     for (size_t i = 0; i < statsNodes.size(); ++i) {
+        tassert(3420005, "Unexpected MultiPlanStage", STAGE_MULTI_PLAN != statsNodes[i]->stageType);
         summary.totalKeysExamined +=
             getKeysExamined(statsNodes[i]->stageType, statsNodes[i]->specific.get());
         summary.totalDocsExamined +=
@@ -536,8 +581,13 @@ void appendMultikeyPaths(const BSONObj& keyPattern,
     subMultikeyPaths.doneFast();
 }
 
+const PlanExplainer::ExplainVersion& PlanExplainerImpl::getVersion() const {
+    static const ExplainVersion kExplainVersion = "1";
+    return kExplainVersion;
+}
+
 bool PlanExplainerImpl::isMultiPlan() const {
-    return getStageByType(_root, StageType::STAGE_MULTI_PLAN) != nullptr;
+    return getStageByType(_root, STAGE_MULTI_PLAN) != nullptr;
 }
 
 std::string PlanExplainerImpl::getPlanSummary() const {
@@ -550,6 +600,8 @@ std::string PlanExplainerImpl::getPlanSummary() const {
 
     for (size_t i = 0; i < stages.size(); i++) {
         if (stages[i]->getChildren().empty()) {
+            tassert(
+                3420006, "Unexpected MultiPlanStage", STAGE_MULTI_PLAN != stages[i]->stageType());
             // This is a leaf node. Add to the plan summary string accordingly. Unless
             // this is the first leaf we've seen, add a delimiting string first.
             if (seenLeaf) {
@@ -562,6 +614,34 @@ std::string PlanExplainerImpl::getPlanSummary() const {
     }
 
     return sb.str();
+}
+
+/**
+ * Returns a pointer to a MultiPlanStage under 'root', or null if this plan has no such stage.
+ */
+MultiPlanStage* getMultiPlanStage(PlanStage* root) {
+    if (!root) {
+        return nullptr;
+    }
+    auto stage = getStageByType(root, STAGE_MULTI_PLAN);
+    tassert(3420007,
+            "Found stage must be MultiPlanStage",
+            stage == nullptr || stage->stageType() == STAGE_MULTI_PLAN);
+    auto mps = static_cast<MultiPlanStage*>(stage);
+    return mps;
+}
+
+/**
+ * If 'root' has a MultiPlanStage returns the index of its best plan. Otherwise returns an
+ * initialized value.
+ */
+const boost::optional<size_t> getWinningPlanIdx(PlanStage* root) {
+    if (auto mps = getMultiPlanStage(root); mps) {
+        auto planIdx = mps->bestPlanIdx();
+        tassert(3420008, "Trying to get stats of a MultiPlanStage without winning plan", planIdx);
+        return planIdx;
+    }
+    return {};
 }
 
 void PlanExplainerImpl::getSummaryStats(PlanSummaryStats* statsOut) const {
@@ -614,10 +694,10 @@ void PlanExplainerImpl::getSummaryStats(PlanSummaryStats* statsOut) const {
             const DistinctScanStats* distinctScanStats =
                 static_cast<const DistinctScanStats*>(distinctScan->getSpecificStats());
             statsOut->indexesUsed.insert(distinctScanStats->indexName);
-        } else if (STAGE_TEXT == stages[i]->stageType()) {
-            const TextStage* textStage = static_cast<const TextStage*>(stages[i]);
-            const TextStats* textStats =
-                static_cast<const TextStats*>(textStage->getSpecificStats());
+        } else if (STAGE_TEXT_MATCH == stages[i]->stageType()) {
+            const TextMatchStage* textStage = static_cast<const TextMatchStage*>(stages[i]);
+            const TextMatchStats* textStats =
+                static_cast<const TextMatchStats*>(textStage->getSpecificStats());
             statsOut->indexesUsed.insert(textStats->indexName);
         } else if (STAGE_GEO_NEAR_2D == stages[i]->stageType() ||
                    STAGE_GEO_NEAR_2DSPHERE == stages[i]->stageType()) {
@@ -645,46 +725,43 @@ void PlanExplainerImpl::getSummaryStats(PlanSummaryStats* statsOut) const {
 
 PlanExplainer::PlanStatsDetails PlanExplainerImpl::getWinningPlanStats(
     ExplainOptions::Verbosity verbosity) const {
-    auto stage = getStageByType(_root, StageType::STAGE_MULTI_PLAN);
-    invariant(stage == nullptr || stage->stageType() == StageType::STAGE_MULTI_PLAN);
-    auto mps = static_cast<MultiPlanStage*>(stage);
-
-    auto&& [stats, summary] =
-        [&]() -> std::pair<std::unique_ptr<PlanStageStats>, boost::optional<PlanSummaryStats>> {
-        auto stats =
-            mps ? std::move(mps->getStats()->children[mps->bestPlanIdx()]) : _root->getStats();
-
+    const auto winningPlanIdx = getWinningPlanIdx(_root);
+    auto&& [stats, summary] = [&]()
+        -> std::pair<std::unique_ptr<PlanStageStats>, const boost::optional<PlanSummaryStats>> {
+        auto stats = _root->getStats();
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            return {std::move(stats), collectExecutionStatsSummary(stats.get())};
+            return {std::move(stats), collectExecutionStatsSummary(stats.get(), winningPlanIdx)};
         }
 
         return {std::move(stats), boost::none};
     }();
 
     BSONObjBuilder bob;
-    statsToBSON(*stats, verbosity, &bob, &bob);
+    statsToBSON(*stats, verbosity, winningPlanIdx, &bob, &bob);
     return {bob.obj(), std::move(summary)};
 }
 
 std::vector<PlanExplainer::PlanStatsDetails> PlanExplainerImpl::getRejectedPlansStats(
     ExplainOptions::Verbosity verbosity) const {
-    auto stage = getStageByType(_root, StageType::STAGE_MULTI_PLAN);
-    invariant(stage == nullptr || stage->stageType() == StageType::STAGE_MULTI_PLAN);
-    auto mps = static_cast<MultiPlanStage*>(stage);
-
     std::vector<PlanStatsDetails> res;
+    auto mps = getMultiPlanStage(_root);
+    if (nullptr == mps) {
+        return res;
+    }
+    auto bestPlanIdx = mps->bestPlanIdx();
 
+    tassert(3420009, "Trying to get stats of a MultiPlanStage without winning plan", bestPlanIdx);
+
+    const auto mpsStats = mps->getStats();
     // Get the stats from the trial period for all the plans.
-    if (mps) {
-        const auto mpsStats = mps->getStats();
-        for (size_t i = 0; i < mpsStats->children.size(); ++i) {
-            if (i != static_cast<size_t>(mps->bestPlanIdx())) {
-                BSONObjBuilder bob;
-                statsToBSON(*mpsStats->children[i], verbosity, &bob, &bob);
-                res.push_back({bob.obj(),
-                               {verbosity >= ExplainOptions::Verbosity::kExecStats,
-                                collectExecutionStatsSummary(mpsStats->children[i].get())}});
-            }
+    for (size_t i = 0; i < mpsStats->children.size(); ++i) {
+        if (i != *bestPlanIdx) {
+            BSONObjBuilder bob;
+            auto stats = _root->getStats();
+            statsToBSON(*stats, verbosity, i, &bob, &bob);
+            res.push_back({bob.obj(),
+                           {verbosity >= ExplainOptions::Verbosity::kExecStats,
+                            collectExecutionStatsSummary(stats.get(), i)}});
         }
     }
 
@@ -695,17 +772,20 @@ std::vector<PlanExplainer::PlanStatsDetails> PlanExplainerImpl::getCachedPlanSta
     const PlanCacheEntry::DebugInfo& debugInfo, ExplainOptions::Verbosity verbosity) const {
     const auto& decision = *debugInfo.decision;
     std::vector<PlanStatsDetails> res;
+    auto winningPlanIdx = getWinningPlanIdx(_root);
+
     for (auto&& stats : decision.getStats<PlanStageStats>().candidatePlanStats) {
         BSONObjBuilder bob;
-        statsToBSON(*stats, verbosity, &bob, &bob);
+        statsToBSON(*stats, verbosity, winningPlanIdx, &bob, &bob);
         res.push_back({bob.obj(),
                        {verbosity >= ExplainOptions::Verbosity::kExecStats,
-                        collectExecutionStatsSummary(stats.get())}});
+                        collectExecutionStatsSummary(stats.get(), winningPlanIdx)}});
     }
     return res;
 }
 
 PlanStage* getStageByType(PlanStage* root, StageType type) {
+    tassert(3420010, "Can't find a stage in a NULL plan root", root != nullptr);
     if (root->stageType() == type) {
         return root;
     }

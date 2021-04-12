@@ -1,6 +1,8 @@
 /**
- * Tests that a collection with alloMigrations: false in config.collections prohibits committing a
+ * Tests that a collection with allowMigrations: false in config.collections prohibits committing a
  * moveChunk and disables the balancer.
+ * Also tests that the _configsvrSetAllowMigrations commands updates the 'allowMigrations' field and
+ * bumps the collection version.
  *
  * @tags: [
  *   requires_fcv_47,
@@ -11,6 +13,8 @@
 
 load('jstests/libs/fail_point_util.js');
 load('jstests/libs/parallel_shell_helpers.js');
+load("jstests/sharding/libs/find_chunks_util.js");
+load("jstests/sharding/libs/shard_versioning_util.js");
 
 const st = new ShardingTest({config: 1, shards: 2});
 const configDB = st.s.getDB("config");
@@ -62,7 +66,8 @@ const setUpDb = function setUpDatabaseAndEnableSharding() {
 // for collA.
 //
 // collBSetParams specify the field(s) that will be set on the collB in config.collections.
-const testBalancer = function testAllowMigrationsFalseDisablesBalancer(collBSetParams) {
+const testBalancer = function testAllowMigrationsFalseDisablesBalancer(allowMigrations,
+                                                                       collBSetNoBalanceParam) {
     setUpDb();
 
     const collAName = "collA";
@@ -90,22 +95,33 @@ const testBalancer = function testAllowMigrationsFalseDisablesBalancer(collBSetP
             st.s0.adminCommand({balancerCollectionStatus: coll.getFullName()}));
         assert.eq(balancerStatus.balancerCompliant, false);
         assert.eq(balancerStatus.firstComplianceViolation, 'chunksImbalance');
-        assert.eq(
-            4, configDB.chunks.find({ns: coll.getFullName(), shard: st.shard0.shardName}).count());
+        assert.eq(4,
+                  findChunksUtil
+                      .findChunksByNs(configDB, coll.getFullName(), {shard: st.shard0.shardName})
+                      .count());
     }
 
-    jsTestLog(
-        `Disabling balancing of ${collB.getFullName()} with parameters ${tojson(collBSetParams)}`);
+    jsTestLog(`Disabling balancing of ${collB.getFullName()} with allowMigrations ${
+        allowMigrations} and parameters ${tojson(collBSetNoBalanceParam)}`);
     assert.commandWorked(
-        configDB.collections.update({_id: collB.getFullName()}, {$set: collBSetParams}));
+        configDB.collections.update({_id: collB.getFullName()}, {$set: collBSetNoBalanceParam}));
+    assert.commandWorked(st.configRS.getPrimary().adminCommand({
+        _configsvrSetAllowMigrations: collB.getFullName(),
+        allowMigrations: allowMigrations,
+        writeConcern: {w: "majority"}
+    }));
 
     st.startBalancer();
     assert.soon(() => {
         st.awaitBalancerRound();
         const shard0Chunks =
-            configDB.chunks.find({ns: collA.getFullName(), shard: st.shard0.shardName}).itcount();
+            findChunksUtil
+                .findChunksByNs(configDB, collA.getFullName(), {shard: st.shard0.shardName})
+                .itcount();
         const shard1Chunks =
-            configDB.chunks.find({ns: collA.getFullName(), shard: st.shard1.shardName}).itcount();
+            findChunksUtil
+                .findChunksByNs(configDB, collA.getFullName(), {shard: st.shard1.shardName})
+                .itcount();
         jsTestLog(`shard0 chunks ${shard0Chunks}, shard1 chunks ${shard1Chunks}`);
         return shard0Chunks == 2 && shard1Chunks == 2;
     }, `Balancer failed to balance ${collA.getFullName()}`, 1000 * 60 * 10);
@@ -120,14 +136,51 @@ const testBalancer = function testAllowMigrationsFalseDisablesBalancer(collBSetP
         assert.commandWorked(st.s.adminCommand({balancerCollectionStatus: collB.getFullName()}));
     assert.eq(collBBalanceStatus.balancerCompliant, false);
     assert.eq(collBBalanceStatus.firstComplianceViolation, 'chunksImbalance');
-    assert.eq(4,
-              configDB.chunks.find({ns: collB.getFullName(), shard: st.shard0.shardName}).count());
+    assert.eq(
+        4,
+        findChunksUtil.findChunksByNs(configDB, collB.getFullName(), {shard: st.shard0.shardName})
+            .count());
+};
+
+const testConfigsvrSetAllowMigrationsCommand = function() {
+    setUpDb();
+
+    const collName = "foo";
+    const ns = dbName + "." + collName;
+
+    assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {x: 1}}));
+
+    ShardVersioningUtil.assertCollectionVersionEquals(st.shard0, ns, Timestamp(1, 0));
+
+    // Use _configsvrSetAllowMigrations to forbid migrations from happening
+    assert.commandWorked(st.configRS.getPrimary().adminCommand(
+        {_configsvrSetAllowMigrations: ns, allowMigrations: false, writeConcern: {w: "majority"}}));
+
+    // Check that allowMigrations has been set to 'false' on the configsvr config.collections.
+    assert.eq(false, configDB.collections.findOne({_id: ns}).allowMigrations);
+
+    // Check that the collection version has been bumped and the shard has refreshed.
+    ShardVersioningUtil.assertCollectionVersionEquals(st.shard0, ns, Timestamp(2, 0));
+
+    // Use _configsvrSetAllowMigrations to allow migrations to happen
+    assert.commandWorked(st.configRS.getPrimary().adminCommand(
+        {_configsvrSetAllowMigrations: ns, allowMigrations: true, writeConcern: {w: "majority"}}));
+
+    // Check that allowMigrations has been unset (that implies migrations are allowed) on the
+    // configsvr config.collections.
+    assert.eq(undefined, configDB.collections.findOne({_id: ns}).allowMigrations);
+
+    // Check that the collection version has been bumped and the shard has refreshed.
+    ShardVersioningUtil.assertCollectionVersionEquals(st.shard0, ns, Timestamp(3, 0));
 };
 
 // Test cases that should disable the balancer.
-testBalancer({allowMigrations: false});
-testBalancer({allowMigrations: false, noBalance: false});
-testBalancer({allowMigrations: false, noBalance: true});
+testBalancer(false /* allowMigrations */, {});
+testBalancer(false /* allowMigrations */, {noBalance: false});
+testBalancer(false /* allowMigrations */, {noBalance: true});
+
+// Test the _configsvrSetAllowMigrations internal command
+testConfigsvrSetAllowMigrationsCommand();
 
 st.stop();
 })();

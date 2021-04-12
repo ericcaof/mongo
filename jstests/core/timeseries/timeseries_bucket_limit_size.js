@@ -1,13 +1,11 @@
 /**
  * Tests maximum size of measurements held in each bucket in a time-series buckets collection.
  * @tags: [
- *     assumes_unsharded_collection,         # TODO(SERVER-53816): remove
- *     does_not_support_causal_consistency,  # TODO(SERVER-53819): remove
+ *     assumes_no_implicit_collection_creation_after_drop,
  *     does_not_support_stepdowns,
  *     requires_fcv_49,
  *     requires_find_command,
  *     requires_getmore,
- *     sbe_incompatible,
  * ]
  */
 (function() {
@@ -20,8 +18,7 @@ if (!TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo())) {
     return;
 }
 
-const testDB = db.getSiblingDB(jsTestName());
-assert.commandWorked(testDB.dropDatabase());
+const collNamePrefix = 'timeseries_bucket_limit_size_';
 
 const timeFieldName = 'time';
 
@@ -34,19 +31,20 @@ const numDocs = 2;
 const largeValue = 'x'.repeat((bucketMaxSizeKB - 1) * 1024);
 
 const runTest = function(numDocsPerInsert) {
-    const coll = testDB.getCollection('t_' + numDocsPerInsert);
-    const bucketsColl = testDB.getCollection('system.buckets.' + coll.getName());
+    const coll = db.getCollection(collNamePrefix + numDocsPerInsert);
+    const bucketsColl = db.getCollection('system.buckets.' + coll.getName());
     coll.drop();
 
     assert.commandWorked(
-        testDB.createCollection(coll.getName(), {timeseries: {timeField: timeFieldName}}));
-    assert.contains(bucketsColl.getName(), testDB.getCollectionNames());
+        db.createCollection(coll.getName(), {timeseries: {timeField: timeFieldName}}));
+    assert.contains(bucketsColl.getName(), db.getCollectionNames());
 
     let docs = [];
     for (let i = 0; i < numDocs; i++) {
         docs.push({_id: i, [timeFieldName]: ISODate(), x: largeValue});
         if ((i + 1) % numDocsPerInsert === 0) {
-            assert.commandWorked(coll.insert(docs), 'failed to insert docs: ' + tojson(docs));
+            assert.commandWorked(coll.insert(docs, {ordered: false}),
+                                 'failed to insert docs: ' + tojson(docs));
             docs = [];
         }
     }

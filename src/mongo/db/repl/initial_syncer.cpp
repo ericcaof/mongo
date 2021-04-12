@@ -60,7 +60,7 @@
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/sync_source_selector.h"
-#include "mongo/db/repl/tenant_migration_donor_util.h"
+#include "mongo/db/repl/tenant_migration_access_blocker_util.h"
 #include "mongo/db/repl/transaction_oplog_application.h"
 #include "mongo/db/session_txn_record_gen.h"
 #include "mongo/executor/task_executor.h"
@@ -122,6 +122,9 @@ MONGO_FAIL_POINT_DEFINE(initialSyncFassertIfApplyingBatchFails);
 
 // Failpoint which causes the initial sync function to hang before stopping the oplog fetcher.
 MONGO_FAIL_POINT_DEFINE(initialSyncHangBeforeCompletingOplogFetching);
+
+// Failpoint which causes the initial sync function to hang before choosing a sync source.
+MONGO_FAIL_POINT_DEFINE(initialSyncHangBeforeChoosingSyncSource);
 
 // Failpoints for synchronization, shared with cloners.
 extern FailPoint initialSyncFuzzerSynchronizationPoint1;
@@ -437,7 +440,7 @@ void InitialSyncer::_appendInitialSyncProgressMinimal_inlock(BSONObjBuilder* bob
                               (long long)remainingInitialSyncEstimatedMillis);
         }
     }
-    bob->appendNumber("appliedOps", _initialSyncState->appliedOps);
+    bob->appendNumber("appliedOps", static_cast<long long>(_initialSyncState->appliedOps));
     if (!_initialSyncState->beginApplyingTimestamp.isNull()) {
         bob->append("initialSyncOplogStart", _initialSyncState->beginApplyingTimestamp);
     }
@@ -560,7 +563,7 @@ void InitialSyncer::_tearDown_inlock(OperationContext* opCtx,
     const bool orderedCommit = true;
     _storage->oplogDiskLocRegister(opCtx, initialDataTimestamp, orderedCommit);
 
-    tenant_migration_donor::recoverTenantMigrationAccessBlockers(opCtx);
+    tenant_migration_access_blocker::recoverTenantMigrationAccessBlockers(opCtx);
     reconstructPreparedTransactions(opCtx, repl::OplogApplication::Mode::kInitialSync);
 
     _replicationProcess->getConsistencyMarkers()->setInitialSyncIdIfNotSet(opCtx);
@@ -676,6 +679,11 @@ void InitialSyncer::_chooseSyncSourceCallback(
     std::uint32_t chooseSyncSourceAttempt,
     std::uint32_t chooseSyncSourceMaxAttempts,
     std::shared_ptr<OnCompletionGuard> onCompletionGuard) noexcept try {
+    if (MONGO_unlikely(initialSyncHangBeforeChoosingSyncSource.shouldFail())) {
+        LOGV2(5284800, "initialSyncHangBeforeChoosingSyncSource fail point enabled");
+        initialSyncHangBeforeChoosingSyncSource.pauseWhileSet();
+    }
+
     stdx::unique_lock<Latch> lock(_mutex);
     // Cancellation should be treated the same as other errors. In this case, the most likely cause
     // of a failed _chooseSyncSourceCallback() task is a cancellation triggered by
@@ -1685,10 +1693,6 @@ void InitialSyncer::_finishInitialSyncAttempt(const StatusWith<OpTimeAndWallTime
     LOGV2(21191, "Initial sync attempt finishing up");
 
     stdx::lock_guard<Latch> lock(_mutex);
-    LOGV2(21192,
-          "Initial Sync Attempt Statistics: {statistics}",
-          "Initial Sync Attempt Statistics",
-          "statistics"_attr = redact(_getInitialSyncProgress_inlock()));
 
     auto runTime = _initialSyncState ? _initialSyncState->timer.millis() : 0;
     int rollBackId = -1;
@@ -1702,6 +1706,12 @@ void InitialSyncer::_finishInitialSyncAttempt(const StatusWith<OpTimeAndWallTime
             durationCount<Milliseconds>(_sharedData->getTotalTimeUnreachable(sdLock));
     }
 
+    if (MONGO_unlikely(failAndHangInitialSync.shouldFail())) {
+        LOGV2(21193, "failAndHangInitialSync fail point enabled");
+        failAndHangInitialSync.pauseWhileSet();
+        result = Status(ErrorCodes::InternalError, "failAndHangInitialSync fail point enabled");
+    }
+
     _stats.initialSyncAttemptInfos.emplace_back(
         InitialSyncer::InitialSyncAttemptInfo{runTime,
                                               result.getStatus(),
@@ -1710,24 +1720,26 @@ void InitialSyncer::_finishInitialSyncAttempt(const StatusWith<OpTimeAndWallTime
                                               operationsRetried,
                                               totalTimeUnreachableMillis});
 
-    if (MONGO_unlikely(failAndHangInitialSync.shouldFail())) {
-        LOGV2(21193, "failAndHangInitialSync fail point enabled");
-        failAndHangInitialSync.pauseWhileSet();
-        result = Status(ErrorCodes::InternalError, "failAndHangInitialSync fail point enabled");
+    if (!result.isOK()) {
+        // This increments the number of failed attempts for the current initial sync request.
+        ++_stats.failedInitialSyncAttempts;
+        // This increments the number of failed attempts across all initial sync attempts since
+        // process startup.
+        initialSyncFailedAttempts.increment();
     }
+
+    bool hasRetries = _stats.failedInitialSyncAttempts < _stats.maxFailedInitialSyncAttempts;
+
+    LOGV2(21192,
+          "Initial sync status: {status}, initial sync attempt statistics: {statistics}",
+          "Initial sync status and statistics",
+          "status"_attr = result.isOK() ? "successful" : (hasRetries ? "in_progress" : "failed"),
+          "statistics"_attr = redact(_getInitialSyncProgress_inlock()));
 
     if (result.isOK()) {
         // Scope guard will invoke _finishCallback().
         return;
     }
-
-
-    // This increments the number of failed attempts for the current initial sync request.
-    ++_stats.failedInitialSyncAttempts;
-
-    // This increments the number of failed attempts across all initial sync attempts since process
-    // startup.
-    initialSyncFailedAttempts.increment();
 
     LOGV2_ERROR(21200,
                 "Initial sync attempt failed -- attempts left: "
@@ -1739,7 +1751,7 @@ void InitialSyncer::_finishInitialSyncAttempt(const StatusWith<OpTimeAndWallTime
                 "error"_attr = redact(result.getStatus()));
 
     // Check if need to do more retries.
-    if (_stats.failedInitialSyncAttempts >= _stats.maxFailedInitialSyncAttempts) {
+    if (!hasRetries) {
         LOGV2_FATAL_CONTINUE(21202,
                              "The maximum number of retries have been exhausted for initial sync");
 
@@ -1766,7 +1778,6 @@ void InitialSyncer::_finishInitialSyncAttempt(const StatusWith<OpTimeAndWallTime
 
     if (!status.isOK()) {
         result = status;
-
         // Scope guard will invoke _finishCallback().
         return;
     }

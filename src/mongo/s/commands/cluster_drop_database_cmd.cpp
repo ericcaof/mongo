@@ -92,7 +92,7 @@ public:
                     [opCtx, dbName] { Grid::get(opCtx)->catalogCache()->purgeDatabase(dbName); });
 
                 // Send it to the primary shard
-                ShardsvrDropDatabase dropDatabaseCommand(1);
+                ShardsvrDropDatabase dropDatabaseCommand;
                 dropDatabaseCommand.setDbName(dbName);
 
                 auto cmdResponse = executeCommandAgainstDatabasePrimary(
@@ -106,20 +106,10 @@ public:
 
                 const auto remoteResponse = uassertStatusOK(cmdResponse.swResponse);
                 uassertStatusOK(getStatusFromCommandResult(remoteResponse.data));
-
-                BSONObjBuilder result;
-                CommandHelpers::filterCommandReplyForPassthrough(remoteResponse.data, &result);
-                auto resultObj = result.obj();
-                uassertStatusOK(getStatusFromCommandResult(resultObj));
-                // Ensure our reply conforms to the IDL-defined reply structure.
-                return DropDatabaseReply::parse({"dropDatabase"}, resultObj);
             } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
-                // If the namespace isn't found, treat the drop as a success but inform about the
-                // failure.
-                DropDatabaseReply reply;
-                reply.setInfo("database does not exist"_sd);
-                return reply;
+                // If the namespace isn't found, treat the drop as a success
             }
+            return {};
         }
     };
 } clusterDropDatabaseCmd;

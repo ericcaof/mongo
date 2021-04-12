@@ -5,7 +5,6 @@ load('jstests/concurrency/fsm_libs/cluster.js');
 load('jstests/concurrency/fsm_libs/parse_config.js');
 load('jstests/concurrency/fsm_libs/thread_mgr.js');
 load('jstests/concurrency/fsm_utils/name_utils.js');  // for uniqueCollName and uniqueDBName
-load('jstests/concurrency/fsm_utils/setup_teardown_functions.js');
 
 var runner = (function() {
     function validateExecutionMode(mode) {
@@ -252,9 +251,7 @@ var runner = (function() {
 
         res.databases.forEach(function(dbInfo) {
             if (!Array.contains(blacklist, dbInfo.name)) {
-                var res = db.getSiblingDB(dbInfo.name).dropDatabase();
-                assert.commandWorked(res);
-                assert.eq(dbInfo.name, res.dropped);
+                assert.commandWorked(db.getSiblingDB(dbInfo.name).dropDatabase());
             }
         });
     }
@@ -401,18 +398,6 @@ var runner = (function() {
         // Threads.
         Object.defineProperty(
             config.data, 'threadCount', {enumerable: true, value: config.threadCount});
-    }
-
-    function useDropDistLockFailPoint(cluster, clusterOptions) {
-        assert(cluster.isSharded(), 'cluster is not sharded');
-
-        // For sharded clusters, enable a fail point that allows dropCollection to wait longer
-        // to acquire the distributed lock. This prevents tests from failing if the distributed
-        // lock is already held by the balancer or by a workload operation. The increased wait
-        // is shorter than the distributed-lock-takeover period because otherwise the node
-        // would be assumed to be down and the lock would be overtaken.
-        clusterOptions.setupFunctions.config.push(increaseDropDistLockTimeout);
-        clusterOptions.teardownFunctions.config.push(resetDropDistLockTimeout);
     }
 
     function loadWorkloadContext(workloads, context, executionOptions, applyMultipliers) {
@@ -644,9 +629,6 @@ var runner = (function() {
         var threadMgr = new ThreadManager(clusterOptions, executionMode);
 
         var cluster = new Cluster(clusterOptions);
-        if (cluster.isSharded()) {
-            useDropDistLockFailPoint(cluster, clusterOptions);
-        }
         cluster.setup();
 
         // Clean up the state left behind by other tests in the concurrency suite

@@ -35,14 +35,11 @@
 #include "mongo/bson/oid.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/ops/find_and_modify_command_gen.h"
 #include "mongo/db/s/dist_lock_catalog.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
-
-struct ReadPreferenceSetting;
 
 class DistLockCatalogImpl final : public DistLockCatalog {
 public:
@@ -71,8 +68,6 @@ public:
                                        Date_t time,
                                        StringData why) override;
 
-    Status unlock(OperationContext* opCtx, const OID& lockSessionID) override;
-
     Status unlock(OperationContext* opCtx, const OID& lockSessionID, StringData name) override;
 
     Status unlockAll(OperationContext* opCtx, const std::string& processID) override;
@@ -86,15 +81,6 @@ public:
     Status stopPing(OperationContext* opCtx, StringData processId) override;
 
 private:
-    Status _unlock(OperationContext* opCtx, const write_ops::FindAndModifyCommand& request);
-
-    StatusWith<std::vector<BSONObj>> _findOnConfig(OperationContext* opCtx,
-                                                   const ReadPreferenceSetting& readPref,
-                                                   const NamespaceString& nss,
-                                                   const BSONObj& query,
-                                                   const BSONObj& sort,
-                                                   boost::optional<long long> limit);
-
     // These are not static to avoid initialization order fiasco.
     const NamespaceString _lockPingNS;
     const NamespaceString _locksNS;

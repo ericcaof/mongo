@@ -51,8 +51,6 @@ public:
         : MatchExpression(matchType, std::move(annotation)),
           _elementPath(path, leafArrBehavior, nonLeafArrayBehavior) {}
 
-    virtual ~PathMatchExpression() {}
-
     bool matches(const MatchableDocument* doc, MatchDetails* details = nullptr) const final {
         MatchableDocument::IteratorHolder cursor(doc, &_elementPath);
         while (cursor->more()) {
@@ -68,8 +66,12 @@ public:
         return false;
     }
 
-    const StringData path() const final {
+    const StringData path() const override final {
         return _elementPath.fieldRef().dottedField();
+    }
+
+    const FieldRef* fieldRef() const override final {
+        return &(_elementPath.fieldRef());
     }
 
     /**

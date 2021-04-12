@@ -33,7 +33,6 @@
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/ops/write_ops.h"
-#include "mongo/db/ops/write_ops_parsers.h"
 #include "mongo/db/ops/write_ops_parsers_test_helpers.h"
 #include "mongo/unittest/unittest.h"
 
@@ -49,7 +48,7 @@ TEST(CommandWriteOpsParsers, CommonFields_BypassDocumentValidation) {
         for (bool seq : {false, true}) {
             auto request = toOpMsg("foo", cmd, seq);
             auto op = InsertOp::parse(request);
-            ASSERT_EQ(op.getWriteCommandBase().getBypassDocumentValidation(),
+            ASSERT_EQ(op.getWriteCommandRequestBase().getBypassDocumentValidation(),
                       shouldBypassDocumentValidationForCommand(cmd));
         }
     }
@@ -63,7 +62,7 @@ TEST(CommandWriteOpsParsers, CommonFields_Ordered) {
         for (bool seq : {false, true}) {
             auto request = toOpMsg("foo", cmd, seq);
             auto op = InsertOp::parse(request);
-            ASSERT_EQ(op.getWriteCommandBase().getOrdered(), ordered);
+            ASSERT_EQ(op.getWriteCommandRequestBase().getOrdered(), ordered);
         }
     }
 }
@@ -214,8 +213,8 @@ TEST(CommandWriteOpsParsers, SingleInsert) {
         auto request = toOpMsg(ns.db(), cmd, seq);
         const auto op = InsertOp::parse(request);
         ASSERT_EQ(op.getNamespace().ns(), ns.ns());
-        ASSERT(!op.getWriteCommandBase().getBypassDocumentValidation());
-        ASSERT(op.getWriteCommandBase().getOrdered());
+        ASSERT(!op.getWriteCommandRequestBase().getBypassDocumentValidation());
+        ASSERT(op.getWriteCommandRequestBase().getOrdered());
         ASSERT_EQ(op.getDocuments().size(), 1u);
         ASSERT_BSONOBJ_EQ(op.getDocuments()[0], obj);
     }
@@ -239,8 +238,8 @@ TEST(CommandWriteOpsParsers, RealMultiInsert) {
         auto request = toOpMsg(ns.db(), cmd, seq);
         const auto op = InsertOp::parse(request);
         ASSERT_EQ(op.getNamespace().ns(), ns.ns());
-        ASSERT(!op.getWriteCommandBase().getBypassDocumentValidation());
-        ASSERT(op.getWriteCommandBase().getOrdered());
+        ASSERT(!op.getWriteCommandRequestBase().getBypassDocumentValidation());
+        ASSERT(op.getWriteCommandRequestBase().getOrdered());
         ASSERT_EQ(op.getDocuments().size(), 2u);
         ASSERT_BSONOBJ_EQ(op.getDocuments()[0], obj0);
         ASSERT_BSONOBJ_EQ(op.getDocuments()[1], obj1);
@@ -259,8 +258,8 @@ TEST(CommandWriteOpsParsers, MultiInsertWithStmtId) {
         auto request = toOpMsg(ns.db(), cmd, seq);
         const auto op = InsertOp::parse(request);
         ASSERT_EQ(op.getNamespace().ns(), ns.ns());
-        ASSERT(!op.getWriteCommandBase().getBypassDocumentValidation());
-        ASSERT(op.getWriteCommandBase().getOrdered());
+        ASSERT(!op.getWriteCommandRequestBase().getBypassDocumentValidation());
+        ASSERT(op.getWriteCommandRequestBase().getOrdered());
         ASSERT_EQ(op.getDocuments().size(), 2u);
         ASSERT_BSONOBJ_EQ(op.getDocuments()[0], obj0);
         ASSERT_BSONOBJ_EQ(op.getDocuments()[1], obj1);
@@ -279,8 +278,8 @@ TEST(CommandWriteOpsParsers, MultiInsertWithStmtIdsArray) {
         auto request = toOpMsg(ns.db(), cmd, seq);
         const auto op = InsertOp::parse(request);
         ASSERT_EQ(op.getNamespace().ns(), ns.ns());
-        ASSERT(!op.getWriteCommandBase().getBypassDocumentValidation());
-        ASSERT(op.getWriteCommandBase().getOrdered());
+        ASSERT(!op.getWriteCommandRequestBase().getBypassDocumentValidation());
+        ASSERT(op.getWriteCommandRequestBase().getOrdered());
         ASSERT_EQ(op.getDocuments().size(), 2u);
         ASSERT_BSONOBJ_EQ(op.getDocuments()[0], obj0);
         ASSERT_BSONOBJ_EQ(op.getDocuments()[1], obj1);
@@ -289,7 +288,7 @@ TEST(CommandWriteOpsParsers, MultiInsertWithStmtIdsArray) {
     }
 }
 
-TEST(CommandWriteOpsParsers, Update) {
+TEST(CommandWriteOpsParsers, UpdateCommandRequest) {
     const auto ns = NamespaceString("test", "foo");
     const BSONObj query = BSON("x" << 1);
     const BSONObj update = BSON("$inc" << BSON("x" << 1));
@@ -306,8 +305,8 @@ TEST(CommandWriteOpsParsers, Update) {
                 auto request = toOpMsg(ns.db(), cmd, seq);
                 auto op = UpdateOp::parse(request);
                 ASSERT_EQ(op.getNamespace().ns(), ns.ns());
-                ASSERT(!op.getWriteCommandBase().getBypassDocumentValidation());
-                ASSERT_EQ(op.getWriteCommandBase().getOrdered(), true);
+                ASSERT(!op.getWriteCommandRequestBase().getBypassDocumentValidation());
+                ASSERT_EQ(op.getWriteCommandRequestBase().getOrdered(), true);
                 ASSERT_EQ(op.getUpdates().size(), 1u);
                 ASSERT_BSONOBJ_EQ(op.getUpdates()[0].getQ(), query);
 
@@ -343,8 +342,8 @@ TEST(CommandWriteOpsParsers, UpdateWithPipeline) {
                 auto request = toOpMsg(ns.db(), cmd, seq);
                 auto op = UpdateOp::parse(request);
                 ASSERT_EQ(op.getNamespace().ns(), ns.ns());
-                ASSERT(!op.getWriteCommandBase().getBypassDocumentValidation());
-                ASSERT_EQ(op.getWriteCommandBase().getOrdered(), true);
+                ASSERT(!op.getWriteCommandRequestBase().getBypassDocumentValidation());
+                ASSERT_EQ(op.getWriteCommandRequestBase().getOrdered(), true);
                 ASSERT_EQ(op.getUpdates().size(), 1u);
                 ASSERT_BSONOBJ_EQ(op.getUpdates()[0].getQ(), query["q"].Obj());
 
@@ -376,8 +375,8 @@ TEST(CommandWriteOpsParsers, Remove) {
             auto request = toOpMsg(ns.db(), cmd, seq);
             auto op = DeleteOp::parse(request);
             ASSERT_EQ(op.getNamespace().ns(), ns.ns());
-            ASSERT(!op.getWriteCommandBase().getBypassDocumentValidation());
-            ASSERT_EQ(op.getWriteCommandBase().getOrdered(), true);
+            ASSERT(!op.getWriteCommandRequestBase().getBypassDocumentValidation());
+            ASSERT_EQ(op.getWriteCommandRequestBase().getOrdered(), true);
             ASSERT_EQ(op.getDeletes().size(), 1u);
             ASSERT_BSONOBJ_EQ(op.getDeletes()[0].getQ(), query);
             ASSERT_BSONOBJ_EQ(write_ops::collationOf(op.getDeletes()[0]), collation);
@@ -409,8 +408,8 @@ TEST(LegacyWriteOpsParsers, SingleInsert) {
             makeInsertMessage(ns, obj, continueOnError ? InsertOption_ContinueOnError : 0);
         const auto op = InsertOp::parseLegacy(message);
         ASSERT_EQ(op.getNamespace().ns(), ns);
-        ASSERT(!op.getWriteCommandBase().getBypassDocumentValidation());
-        ASSERT_EQ(!op.getWriteCommandBase().getOrdered(), continueOnError);
+        ASSERT(!op.getWriteCommandRequestBase().getBypassDocumentValidation());
+        ASSERT_EQ(!op.getWriteCommandRequestBase().getOrdered(), continueOnError);
         ASSERT_EQ(op.getDocuments().size(), 1u);
         ASSERT_BSONOBJ_EQ(op.getDocuments()[0], obj);
     }
@@ -437,15 +436,15 @@ TEST(LegacyWriteOpsParsers, RealMultiInsert) {
             ns, objs.data(), objs.size(), continueOnError ? InsertOption_ContinueOnError : 0);
         const auto op = InsertOp::parseLegacy(message);
         ASSERT_EQ(op.getNamespace().ns(), ns);
-        ASSERT(!op.getWriteCommandBase().getBypassDocumentValidation());
-        ASSERT_EQ(!op.getWriteCommandBase().getOrdered(), continueOnError);
+        ASSERT(!op.getWriteCommandRequestBase().getBypassDocumentValidation());
+        ASSERT_EQ(!op.getWriteCommandRequestBase().getOrdered(), continueOnError);
         ASSERT_EQ(op.getDocuments().size(), 2u);
         ASSERT_BSONOBJ_EQ(op.getDocuments()[0], obj0);
         ASSERT_BSONOBJ_EQ(op.getDocuments()[1], obj1);
     }
 }
 
-TEST(LegacyWriteOpsParsers, Update) {
+TEST(LegacyWriteOpsParsers, UpdateCommandRequest) {
     const std::string ns = "test.foo";
     const BSONObj query = BSON("x" << 1);
     const BSONObj update = BSON("$inc" << BSON("x" << 1));
@@ -458,8 +457,8 @@ TEST(LegacyWriteOpsParsers, Update) {
                                                  (multi ? UpdateOption_Multi : 0));
             const auto op = UpdateOp::parseLegacy(message);
             ASSERT_EQ(op.getNamespace().ns(), ns);
-            ASSERT(!op.getWriteCommandBase().getBypassDocumentValidation());
-            ASSERT_EQ(op.getWriteCommandBase().getOrdered(), true);
+            ASSERT(!op.getWriteCommandRequestBase().getBypassDocumentValidation());
+            ASSERT_EQ(op.getWriteCommandRequestBase().getOrdered(), true);
             ASSERT_EQ(op.getUpdates().size(), 1u);
             ASSERT_BSONOBJ_EQ(op.getUpdates()[0].getQ(), query);
             ASSERT_BSONOBJ_EQ(op.getUpdates()[0].getU().getUpdateClassic(), update);
@@ -486,8 +485,8 @@ TEST(LegacyWriteOpsParsers, UpdateWithArrayUpdateFieldIsParsedAsReplacementStyle
                                                  (multi ? UpdateOption_Multi : 0));
             const auto op = UpdateOp::parseLegacy(message);
             ASSERT_EQ(op.getNamespace().ns(), ns);
-            ASSERT(!op.getWriteCommandBase().getBypassDocumentValidation());
-            ASSERT_EQ(op.getWriteCommandBase().getOrdered(), true);
+            ASSERT(!op.getWriteCommandRequestBase().getBypassDocumentValidation());
+            ASSERT_EQ(op.getWriteCommandRequestBase().getOrdered(), true);
             ASSERT_EQ(op.getUpdates().size(), 1u);
             ASSERT_BSONOBJ_EQ(op.getUpdates()[0].getQ(), query);
             ASSERT(op.getUpdates()[0].getU().type() ==
@@ -506,12 +505,91 @@ TEST(LegacyWriteOpsParsers, Remove) {
         auto message = makeRemoveMessage(ns, query, (multi ? 0 : RemoveOption_JustOne));
         const auto op = DeleteOp::parseLegacy(message);
         ASSERT_EQ(op.getNamespace().ns(), ns);
-        ASSERT(!op.getWriteCommandBase().getBypassDocumentValidation());
-        ASSERT_EQ(op.getWriteCommandBase().getOrdered(), true);
+        ASSERT(!op.getWriteCommandRequestBase().getBypassDocumentValidation());
+        ASSERT_EQ(op.getWriteCommandRequestBase().getOrdered(), true);
         ASSERT_EQ(op.getDeletes().size(), 1u);
         ASSERT_BSONOBJ_EQ(op.getDeletes()[0].getQ(), query);
         ASSERT_EQ(op.getDeletes()[0].getMulti(), multi);
     }
+}
+
+/**
+ * Test OpTime serializer and deserializer when OpTime does not have term initailized.
+ */
+TEST(OpTimeSerdes, OpTimeWithoutTerm) {
+    const auto fieldName = "opTime";
+    repl::OpTime opTime(Timestamp(10, 20), repl::OpTime::kUninitializedTerm);
+    BSONObjBuilder bob;
+
+    write_ops::opTimeSerializerWithTermCheck(opTime, "opTime", &bob);
+
+    auto bsonObj = bob.done();
+    auto bsonElem = bsonObj[fieldName];
+
+    ASSERT_FALSE(bsonElem.eoo());
+
+    repl::OpTime retOpTime = write_ops::opTimeParser(bsonElem);
+
+    ASSERT_EQ(opTime.getTimestamp(), retOpTime.getTimestamp());
+    ASSERT_EQ(opTime.getTerm(), retOpTime.getTerm());
+}
+
+/**
+ * Test OpTime serializer and deserializer when OpTime have term initailized.
+ */
+TEST(OpTimeSerdes, OpTimeWithTerm) {
+    const auto fieldName = "opTime";
+    repl::OpTime opTime(Timestamp(10, 20), 10);
+    BSONObjBuilder bob;
+
+    write_ops::opTimeSerializerWithTermCheck(opTime, "opTime", &bob);
+
+    auto bsonObj = bob.done();
+    auto bsonElem = bsonObj[fieldName];
+
+    ASSERT_FALSE(bsonElem.eoo());
+
+    repl::OpTime retOpTime = write_ops::opTimeParser(bsonElem);
+
+    ASSERT_EQ(opTime.getTimestamp(), retOpTime.getTimestamp());
+    ASSERT_EQ(opTime.getTerm(), retOpTime.getTerm());
+}
+
+/**
+ * Test OpTime deserializer by directly passing Timestamp to the OpTime deserializer.
+ */
+TEST(OpTimeSerdes, DeserializeWithTimestamp) {
+    const auto fieldName = "opTime";
+    Timestamp timestamp(10, 20);
+    BSONObjBuilder bob;
+
+    bob.append(fieldName, timestamp);
+
+    auto bsonObj = bob.done();
+    auto bsonElem = bsonObj[fieldName];
+
+    ASSERT_FALSE(bsonElem.eoo());
+
+    repl::OpTime retOpTime = write_ops::opTimeParser(bsonElem);
+
+    ASSERT_EQ(timestamp, retOpTime.getTimestamp());
+    ASSERT_EQ(repl::OpTime::kUninitializedTerm, retOpTime.getTerm());
+}
+
+/**
+ * Test OpTime deserializer by passing invalid BSON type.
+ */
+TEST(OpTimeSerdes, DeserializeWithInvalidBSONType) {
+    const auto fieldName = "opTime";
+    BSONObjBuilder bob;
+
+    bob.append(fieldName, 100);
+
+    auto bsonObj = bob.done();
+    auto bsonElem = bsonObj[fieldName];
+
+    ASSERT_FALSE(bsonElem.eoo());
+    ASSERT_THROWS_CODE(write_ops::opTimeParser(bsonElem), DBException, ErrorCodes::TypeMismatch);
 }
 
 }  // namespace

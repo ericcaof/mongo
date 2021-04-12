@@ -56,14 +56,13 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/s/migration_util.h"
-#include "mongo/db/s/range_deletion_task_gen.h"
 #include "mongo/db/s/sharding_statistics.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/remove_saver.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/logv2/log.h"
-#include "mongo/util/cancelation.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/future_util.h"
 
 namespace mongo {
@@ -357,7 +356,7 @@ ExecutorFuture<void> deleteRangeInBatches(const std::shared_ptr<executor::TaskEx
                 ErrorCodes::isNotPrimaryError(swNumDeleted.getStatus());
         })
         .withDelayBetweenIterations(delayBetweenBatches)
-        .on(executor, CancelationToken::uncancelable())
+        .on(executor, CancellationToken::uncancelable())
         .ignoreValue();
 }
 
@@ -407,12 +406,73 @@ ExecutorFuture<void> waitForDeletionsToMajorityReplicate(
 
         // Asynchronously wait for majority write concern.
         return WaitForMajorityService::get(opCtx->getServiceContext())
-            .waitUntilMajority(clientOpTime)
+            .waitUntilMajority(clientOpTime, CancellationToken::uncancelable())
             .thenRunOn(executor);
     });
 }
 
+std::vector<RangeDeletionTask> getPersistentRangeDeletionTasks(OperationContext* opCtx,
+                                                               const NamespaceString& nss) {
+    std::vector<RangeDeletionTask> tasks;
+
+    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
+    auto query = QUERY(RangeDeletionTask::kNssFieldName << nss.ns());
+
+    store.forEach(opCtx, query, [&](const RangeDeletionTask& deletionTask) {
+        tasks.push_back(std::move(deletionTask));
+        return true;
+    });
+
+    return tasks;
+}
+
 }  // namespace
+
+void snapshotRangeDeletionsForRename(OperationContext* opCtx,
+                                     const NamespaceString& fromNss,
+                                     const NamespaceString& toNss) {
+    auto rangeDeletionTasks = getPersistentRangeDeletionTasks(opCtx, fromNss);
+    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionForRenameNamespace);
+    for (auto& task : rangeDeletionTasks) {
+        task.setNss(toNss);  // Associate task to the new namespace
+        store.add(opCtx, task);
+    }
+}
+
+void restoreRangeDeletionTasksForRename(OperationContext* opCtx, const NamespaceString& nss) {
+    PersistentTaskStore<RangeDeletionTask> rangeDeletionsForRenameStore(
+        NamespaceString::kRangeDeletionForRenameNamespace);
+    PersistentTaskStore<RangeDeletionTask> rangeDeletionsStore(
+        NamespaceString::kRangeDeletionNamespace);
+
+    const auto query = QUERY(RangeDeletionTask::kNssFieldName << nss.ns());
+
+    // Remove eventual leftovers from a previously uncompleted restore
+    rangeDeletionsStore.remove(opCtx, query);
+
+    rangeDeletionsForRenameStore.forEach(opCtx, query, [&](const RangeDeletionTask& deletionTask) {
+        auto task = deletionTask;
+        task.setId(UUID::gen());  // Assign a new id to prevent duplicate key errors
+        rangeDeletionsStore.add(opCtx, task);
+        return true;
+    });
+}
+
+void deleteRangeDeletionTasksForRename(OperationContext* opCtx,
+                                       const NamespaceString& fromNss,
+                                       const NamespaceString& toNss) {
+    // Delete range deletion tasks associated to the source collection
+    PersistentTaskStore<RangeDeletionTask> rangeDeletionsStore(
+        NamespaceString::kRangeDeletionNamespace);
+    rangeDeletionsStore.remove(opCtx, QUERY(RangeDeletionTask::kNssFieldName << fromNss.ns()));
+
+    // Delete already restored snapshots associated to the target collection
+    PersistentTaskStore<RangeDeletionTask> rangeDeletionsForRenameStore(
+        NamespaceString::kRangeDeletionForRenameNamespace);
+    rangeDeletionsForRenameStore.remove(opCtx,
+                                        QUERY(RangeDeletionTask::kNssFieldName << toNss.ns()));
+}
+
 
 SharedSemiFuture<void> removeDocumentsInRange(
     const std::shared_ptr<executor::TaskExecutor>& executor,

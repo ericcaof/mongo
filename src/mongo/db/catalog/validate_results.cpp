@@ -42,10 +42,12 @@ void ValidateResults::appendToResultObj(BSONObjBuilder* resultObj, bool debuggin
     resultObj->append("extraIndexEntries", extraIndexEntries);
     resultObj->append("missingIndexEntries", missingIndexEntries);
 
-    // Need to convert RecordId to int64_t to append to BSONObjBuilder
+    // Need to convert RecordId to a printable type.
     BSONArrayBuilder builder;
-    for (RecordId corruptRecord : corruptRecords) {
-        builder.append(corruptRecord.repr());
+    for (const RecordId& corruptRecord : corruptRecords) {
+        BSONObjBuilder objBuilder;
+        corruptRecord.serializeToken("", &objBuilder);
+        builder.append(objBuilder.done().firstElement());
     }
     resultObj->append("corruptRecords", builder.arr());
 

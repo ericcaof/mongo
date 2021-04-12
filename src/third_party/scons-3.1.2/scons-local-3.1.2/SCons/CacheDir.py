@@ -32,6 +32,7 @@ import json
 import os
 import stat
 import sys
+import uuid
 
 import SCons
 import SCons.Action
@@ -43,6 +44,7 @@ cache_debug = False
 cache_force = False
 cache_show = False
 cache_readonly = False
+cache_tmp_uuid = uuid.uuid4().hex
 
 def CacheRetrieveFunc(target, source, env):
     t = target[0]
@@ -59,7 +61,7 @@ def CacheRetrieveFunc(target, source, env):
         if fs.islink(cachefile):
             fs.symlink(fs.readlink(cachefile), t.get_internal_path())
         else:
-            env.copy_from_cache(cachefile, t.get_internal_path())
+            cd.copy_from_cache(env, cachefile, t.get_internal_path())
             try:
                 os.utime(cachefile, None)
             except OSError:
@@ -104,7 +106,7 @@ def CachePushFunc(target, source, env):
 
     cd.CacheDebug('CachePush(%s):  pushing to %s\n', t, cachefile)
 
-    tempfile = cachefile+'.tmp'+str(os.getpid())
+    tempfile = f"{cachefile}.tmp{cache_tmp_uuid}"
     errfmt = "Unable to copy %s to cache. Cache file is %s"
 
     if not fs.isdir(cachedir):
@@ -121,7 +123,7 @@ def CachePushFunc(target, source, env):
         if fs.islink(t.get_internal_path()):
             fs.symlink(fs.readlink(t.get_internal_path()), tempfile)
         else:
-            fs.copy2(t.get_internal_path(), tempfile)
+            cd.copy_to_cache(env, t.get_internal_path(), tempfile)
         fs.rename(tempfile, cachefile)
         st = fs.stat(t.get_internal_path())
         fs.chmod(cachefile, stat.S_IMODE(st[stat.ST_MODE]) | stat.S_IWRITE)
@@ -277,6 +279,20 @@ class CacheDir(object):
             self.debugFP.write("requests: %d, hits: %d, misses: %d, hit rate: %.2f%%\n" %
                                (self.requests, self.hits, self.misses, self.hit_ratio))
 
+    @classmethod
+    def copy_from_cache(cls, env, src, dst):
+        if env.cache_timestamp_newer:
+            return env.fs.copy(src, dst)
+        else:
+            return env.fs.copy2(src, dst)
+
+    @classmethod
+    def copy_to_cache(cls, env, src, dst):
+        try:
+            return env.fs.copy2(src, dst)
+        except AttributeError as ex:
+            raise EnvironmentError from ex
+
     @property
     def hit_ratio(self):
         return (100.0 * self.hits / self.requests if self.requests > 0 else 100)
@@ -290,6 +306,12 @@ class CacheDir(object):
 
     def is_readonly(self):
         return cache_readonly
+
+    def get_cachedir_csig(self, node):
+        cachedir, cachefile = self.cachepath(node)
+        if cachefile and os.path.exists(cachefile):
+            return SCons.Util.MD5filesignature(cachefile, \
+                SCons.Node.FS.File.md5_chunksize * 1024)
 
     def cachepath(self, node):
         """

@@ -1,7 +1,6 @@
 // @tags: [
 //   assumes_balancer_off,
-//   requires_getmore,
-//   sbe_incompatible,
+//   requires_getmore
 // ]
 
 t = db.index_check2;
@@ -39,9 +38,9 @@ assert.eq(120, t.find(q2).itcount(), "q2 a");
 assert.eq(60, t.find(q3).itcount(), "q3 a");
 
 // We expect these queries to use index scans over { tags: 1 }.
-assert(isIxscan(db, t.find(q1).explain().queryPlanner.winningPlan), "e1");
-assert(isIxscan(db, t.find(q2).explain().queryPlanner.winningPlan), "e2");
-assert(isIxscan(db, t.find(q3).explain().queryPlanner.winningPlan), "e3");
+assert(isIxscan(db, getWinningPlan(t.find(q1).explain().queryPlanner)), "e1");
+assert(isIxscan(db, getWinningPlan(t.find(q2).explain().queryPlanner)), "e2");
+assert(isIxscan(db, getWinningPlan(t.find(q3).explain().queryPlanner)), "e3");
 
 scanned1 = t.find(q1).explain("executionStats").executionStats.totalKeysExamined;
 scanned2 = t.find(q2).explain("executionStats").executionStats.totalKeysExamined;

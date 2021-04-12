@@ -39,48 +39,73 @@ structs:
     DonorShardEntry:
         description: "Represents a donor shard for a particular resharding operation on the
                       coordinator."
-        inline_chained_structs: true
-        chained_structs:
-            MinFetchTimestamp: MinFetchTimestampStruct
         generate_comparison_operators: false
-        strict: true
+        # Use strict:false to avoid complications around upgrade/downgrade. This isn't technically
+        # required for resharding because durable state from all resharding operations is cleaned up
+        # before the upgrade or downgrade can complete.
+        strict: false
         fields:
             id: shard_id
-            state:
-                type: DonorState
-                optional: true
+            # We intentionally have the mutable state nested in a subobject to make it easy to
+            # overwrite with a single $set.
+            mutableState: DonorShardContext
 
     RecipientShardEntry:
         description: "Represents a recipient shard for a particular resharding operation on the
                       coordinator."
-        inline_chained_structs: true
-        chained_structs:
-            StrictConsistencyTimestamp: StrictConsistencyTimestampStruct
         generate_comparison_operators: false
-        strict: true
+        # Use strict:false to avoid complications around upgrade/downgrade. This isn't technically
+        # required for resharding because durable state from all resharding operations is cleaned up
+        # before the upgrade or downgrade can complete.
+        strict: false
         fields:
             id: shard_id
-            state:
-                type: RecipientState
-                optional: true
+            # We intentionally have the mutable state nested in a subobject to make it easy to
+            # overwrite with a single $set.
+            mutableState: RecipientShardContext
 
     ReshardingCoordinatorDocument:
         description: "Represents a resharding operation on the coordinator."
         inline_chained_structs: true
         chained_structs:
             CommonReshardingMetadata: CommonReshardingMetadata
-            FetchTimestamp: FetchTimestampStruct
+            ReshardingApproxCopySize: ReshardingApproxCopySizeStruct
+            AbortReason: AbortReasonStruct
         generate_comparison_operators: false
-        strict: true
+        # Use strict:false to avoid complications around upgrade/downgrade. This isn't technically
+        # required for resharding because durable state from all resharding operations is cleaned up
+        # before the upgrade or downgrade can complete.
+        strict: false
         fields:
-            tempReshardingNss:
-                type: namespacestring
-                description: "The namespace of the temporary resharding collection that exists on
-                            recipient shards."
             state: CoordinatorState
+            cloneTimestamp:
+                type: timestamp
+                description: "The timestamp for the snapshot read while cloning from the donors."
+                optional: true
             donorShards:
                 type: array<DonorShardEntry>
                 description: "The list of all donor shards for this resharding operation."
             recipientShards:
                 type: array<RecipientShardEntry>
                 description: "The list of all recipient shards for this resharding operation."
+            zones:
+                type: array<object_owned>
+                description: "The zones associated with the new shard key."
+                optional: true
+            numInitialChunks:
+                type: long
+                description: "The number of chunks the new collection should have after resharding."
+                optional: true
+            presetReshardedChunks:
+                type: array<object_owned>
+                description: >-
+                    Mapping of chunk ranges to be used as the initial split output. This is only
+                    for testing purposes.
+                optional: true
+            active:
+                type: bool
+                description: >-
+                    Dummy field that always has the same value (true) to have a unique
+                    index on in order to prevent multiple resharding operations from being active at
+                    the same time.
+                default: true

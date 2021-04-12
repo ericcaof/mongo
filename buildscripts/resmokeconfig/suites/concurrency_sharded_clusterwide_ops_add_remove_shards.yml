@@ -8,6 +8,7 @@ selector:
   - requires_replication
   # mongos has no system.profile collection.
   - requires_profiling
+  - does_not_support_add_remove_shards
 
 executor:
   archive:
@@ -19,9 +20,6 @@ executor:
   config:
     shell_options:
       readMode: commands
-      global_vars:
-        TestData:
-          usingReplicaSetShards: true
   hooks:
   - class: CheckReplDBHashInBackground
   - class: CheckReplDBHash

@@ -46,6 +46,7 @@ public:
                     std::unique_ptr<CanonicalQuery> cq,
                     sbe::CandidatePlans candidates,
                     const CollectionPtr& collection,
+                    bool returnOwnedBson,
                     NamespaceString nss,
                     bool isOpen,
                     std::unique_ptr<PlanYieldPolicySBE> yieldPolicy);
@@ -72,7 +73,7 @@ public:
     ExecState getNextDocument(Document* objOut, RecordId* dlOut) override;
 
     bool isEOF() override {
-        return _state == State::kClosed;
+        return isMarkedAsKilled() || (_stash.empty() && _root->getCommonStats()->isEOF);
     }
 
     long long executeCount() override {
@@ -133,19 +134,17 @@ private:
     OperationContext* _opCtx;
 
     NamespaceString _nss;
+    const bool _mustReturnOwnedBson;
 
     // CompileCtx owns the instance pointed by _env, so we must keep it around.
-    sbe::RuntimeEnvironment* _env{nullptr};
-    sbe::CompileCtx _ctx;
     const std::unique_ptr<sbe::PlanStage> _root;
+    stage_builder::PlanStageData _rootData;
     std::unique_ptr<QuerySolution> _solution;
 
     sbe::value::SlotAccessor* _result{nullptr};
     sbe::value::SlotAccessor* _resultRecordId{nullptr};
     sbe::value::SlotAccessor* _oplogTs{nullptr};
     boost::optional<sbe::value::SlotId> _resumeRecordIdSlot;
-    bool _shouldTrackLatestOplogTimestamp{false};
-    bool _shouldTrackResumeToken{false};
 
     std::queue<std::pair<BSONObj, boost::optional<RecordId>>> _stash;
 
@@ -174,5 +173,6 @@ sbe::PlanState fetchNext(sbe::PlanStage* root,
                          sbe::value::SlotAccessor* resultSlot,
                          sbe::value::SlotAccessor* recordIdSlot,
                          BSONObj* out,
-                         RecordId* dlOut);
+                         RecordId* dlOut,
+                         bool returnOwnedBson);
 }  // namespace mongo

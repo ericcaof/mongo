@@ -9,30 +9,34 @@ var IndexBuildTest = class {
      * Starts an index build in a separate mongo shell process with given options.
      * Ensures the index build worked or failed with one of the expected failures.
      */
-    static startIndexBuild(conn, ns, keyPattern, options, expectedFailures, commitQuorum) {
+    static startIndexBuild(conn, ns, keyPattern, options, expectedFailures, commitQuorum, authDoc) {
         options = options || {};
         expectedFailures = expectedFailures || [];
-        // The default for the commit quorum parameter to Collection.createIndexes() should be
-        // left as undefined if 'commitQuorum' is omitted. This is because we need to differentiate
-        // between undefined (which uses the default in the server) and 0 which disables the commit
-        // quorum.
-        const commitQuorumStr = (commitQuorum === undefined ? '' : ', ' + tojson(commitQuorum));
 
-        if (Array.isArray(keyPattern)) {
-            return startParallelShell(
-                'const coll = db.getMongo().getCollection("' + ns + '");' +
-                    'assert.commandWorkedOrFailedWithCode(coll.createIndexes(' +
-                    JSON.stringify(keyPattern) + ', ' + tojson(options) + commitQuorumStr + '), ' +
-                    JSON.stringify(expectedFailures) + ');',
-                conn.port);
-        } else {
-            return startParallelShell('const coll = db.getMongo().getCollection("' + ns + '");' +
-                                          'assert.commandWorkedOrFailedWithCode(coll.createIndex(' +
-                                          tojson(keyPattern) + ', ' + tojson(options) +
-                                          commitQuorumStr + '), ' +
-                                          JSON.stringify(expectedFailures) + ');',
-                                      conn.port);
-        }
+        const args = [ns, keyPattern, options, expectedFailures, commitQuorum, authDoc];
+        let func = function(args) {
+            const [ns, keyPattern, options, expectedFailures, commitQuorum, authDoc] = args;
+            // If authDoc is specified, then the index build is being started on a server that has
+            // auth enabled. Be sure to authenticate the new shell client with the provided
+            // credentials.
+            if (authDoc) {
+                assert(db.getSiblingDB('admin').auth(authDoc.user, authDoc.pwd));
+            }
+            const keyPatterns = (Array.isArray(keyPattern) ? keyPattern : [keyPattern]);
+            const coll = db.getMongo().getCollection(ns);
+            // The default for the commit quorum parameter to Collection.createIndexes() should be
+            // left as undefined if 'commitQuorum' is omitted. This is because we need to
+            // differentiate between undefined (which uses the default in the server) and 0 which
+            // disables the commit quorum.
+            if (commitQuorum !== undefined) {
+                assert.commandWorkedOrFailedWithCode(
+                    coll.createIndexes(keyPatterns, options, commitQuorum), expectedFailures);
+            } else {
+                assert.commandWorkedOrFailedWithCode(coll.createIndexes(keyPatterns, options),
+                                                     expectedFailures);
+            }
+        };
+        return startParallelShell(funWithArgs(func, args), conn.port);
     }
 
     /**
@@ -134,6 +138,28 @@ var IndexBuildTest = class {
         if (onOperationFn) {
             onOperationFn(op);
         }
+    }
+
+    /**
+     * Returns true if the passed in collection is clustered.
+     */
+    static isCollectionClustered(coll) {
+        const res = assert.commandWorked(
+            coll.getDB().runCommand({listCollections: 1, filter: {name: coll.getName()}}));
+        assert.eq(1, res.cursor.firstBatch.length);
+
+        const collInfo = res.cursor.firstBatch[0];
+        return collInfo.options.hasOwnProperty("clusteredIndex");
+    }
+
+    static assertIndexesIdHelper(coll, numIndexes, readyIndexes, notReadyIndexes, options) {
+        if (!IndexBuildTest.isCollectionClustered(coll)) {
+            numIndexes++;
+            readyIndexes.concat("_id_");
+        }
+
+        return IndexBuildTest.assertIndexes(
+            coll, numIndexes, readyIndexes, notReadyIndexes, options);
     }
 
     /**
@@ -253,7 +279,7 @@ const ResumableIndexBuildTest = class {
             indexNamesFlatSinglePerBuild[i] = indexNames[i][0];
             buildUUIDs[i] = extractUUIDFromObject(
                 IndexBuildTest
-                    .assertIndexes(coll, indexNamesFlat.length + 1, ["_id_"], indexNamesFlat, {
+                    .assertIndexesIdHelper(coll, indexNamesFlat.length, [], indexNamesFlat, {
                         includeBuildUUIDs: true
                     })[indexNames[i][0]]
                     .buildUUID);
@@ -371,11 +397,9 @@ const ResumableIndexBuildTest = class {
         const indexNamesFlat = ResumableIndexBuildTest.flatten(indexNames);
         let indexes;
         assert.soonNoExcept(function() {
-            indexes = IndexBuildTest.assertIndexes(coll,
-                                                   indexNamesFlat.length + 1,
-                                                   ["_id_"],
-                                                   indexNamesFlat,
-                                                   {includeBuildUUIDs: true});
+            indexes = IndexBuildTest.assertIndexesIdHelper(
+                coll, indexNamesFlat.length, [], indexNamesFlat, {includeBuildUUIDs: true});
+
             return true;
         });
 
@@ -430,8 +454,7 @@ const ResumableIndexBuildTest = class {
                 namespace: coll.getFullName()
             });
         }
-
-        IndexBuildTest.assertIndexes(coll, indexNames.length + 1, indexNames.concat("_id_"));
+        IndexBuildTest.assertIndexesIdHelper(coll, indexNames.length, indexNames);
     }
 
     /**
@@ -447,7 +470,8 @@ const ResumableIndexBuildTest = class {
                    failPointsIteration,
                    shouldComplete = true,
                    failPointAfterStartup,
-                   runBeforeStartup) {
+                   runBeforeStartup,
+                   options) {
         clearRawMongoProgramOutput();
 
         const buildUUIDs = ResumableIndexBuildTest.generateFailPointsData(
@@ -507,8 +531,8 @@ const ResumableIndexBuildTest = class {
                 ["failpoint." + failPointAfterStartup]: tojson({mode: "alwaysOn"}),
             });
         }
-
-        rst.start(conn, {noCleanData: true, setParameter: setParameter});
+        const defaultOptions = {noCleanData: true, setParameter: setParameter};
+        rst.start(conn, Object.assign(defaultOptions, options || {}));
 
         if (shouldComplete) {
             // Ensure that the index builds were completed upon the node starting back up.
@@ -629,7 +653,8 @@ const ResumableIndexBuildTest = class {
                expectedResumePhases,
                resumeChecks,
                sideWrites = [],
-               postIndexBuildInserts = []) {
+               postIndexBuildInserts = [],
+               restartOptions) {
         const primary = rst.getPrimary();
 
         if (!ResumableIndexBuildTest.resumableIndexBuildsEnabled(primary)) {
@@ -646,8 +671,16 @@ const ResumableIndexBuildTest = class {
                 ResumableIndexBuildTest.createIndexesFails(db, collName, indexSpecs, indexNames);
             }, coll, indexSpecs, indexNames, sideWrites, {hangBeforeBuildingIndex: true});
 
-        const buildUUIDs = ResumableIndexBuildTest.restart(
-            rst, primary, coll, indexNames, failPoints, failPointsIteration);
+        const buildUUIDs = ResumableIndexBuildTest.restart(rst,
+                                                           primary,
+                                                           coll,
+                                                           indexNames,
+                                                           failPoints,
+                                                           failPointsIteration,
+                                                           true,
+                                                           undefined,
+                                                           undefined,
+                                                           restartOptions);
 
         for (const awaitCreateIndex of awaitCreateIndexes) {
             awaitCreateIndex();
@@ -702,7 +735,8 @@ const ResumableIndexBuildTest = class {
 
         const buildUUID = extractUUIDFromObject(
             IndexBuildTest
-                .assertIndexes(coll, 2, ["_id_"], [indexName], {includeBuildUUIDs: true})[indexName]
+                .assertIndexesIdHelper(
+                    coll, 1, [], [indexName], {includeBuildUUIDs: true})[indexName]
                 .buildUUID);
 
         clearRawMongoProgramOutput();

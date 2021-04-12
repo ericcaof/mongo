@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
 #include "mongo/platform/basic.h"
 
@@ -77,8 +77,9 @@ UUID getCollectionUuid(OperationContext* opCtx, const NamespaceString& nss) {
 // are in a resharding operation so that we are guaranteed that migrations are suspended.
 bool documentBelongsToMe(OperationContext* opCtx,
                          CollectionShardingState* css,
+                         const ScopedCollectionDescription& collDesc,
                          const BSONObj& doc) {
-    auto currentKeyPattern = ShardKeyPattern(css->getCollectionDescription(opCtx).getKeyPattern());
+    auto currentKeyPattern = ShardKeyPattern(collDesc.getKeyPattern());
     auto ownershipFilter = css->getOwnershipFilter(
         opCtx, CollectionShardingState::OrphanCleanupPolicy::kAllowOrphanCleanup);
 
@@ -88,20 +89,24 @@ bool documentBelongsToMe(OperationContext* opCtx,
 
 DonorShardEntry makeDonorShard(ShardId shardId,
                                DonorStateEnum donorState,
-                               boost::optional<Timestamp> minFetchTimestamp) {
-    DonorShardEntry entry(shardId);
-    entry.setState(donorState);
-    emplaceMinFetchTimestampIfExists(entry, minFetchTimestamp);
-    return entry;
+                               boost::optional<Timestamp> minFetchTimestamp,
+                               boost::optional<Status> abortReason) {
+    DonorShardContext donorCtx;
+    donorCtx.setState(donorState);
+    emplaceMinFetchTimestampIfExists(donorCtx, minFetchTimestamp);
+    emplaceAbortReasonIfExists(donorCtx, abortReason);
+
+    return DonorShardEntry{std::move(shardId), std::move(donorCtx)};
 }
 
 RecipientShardEntry makeRecipientShard(ShardId shardId,
                                        RecipientStateEnum recipientState,
-                                       boost::optional<Timestamp> strictConsistencyTimestamp) {
-    RecipientShardEntry entry(shardId);
-    entry.setState(recipientState);
-    emplaceStrictConsistencyTimestampIfExists(entry, strictConsistencyTimestamp);
-    return entry;
+                                       boost::optional<Status> abortReason) {
+    RecipientShardContext recipientCtx;
+    recipientCtx.setState(recipientState);
+    emplaceAbortReasonIfExists(recipientCtx, abortReason);
+
+    return RecipientShardEntry{std::move(shardId), std::move(recipientCtx)};
 }
 
 UUID getCollectionUUIDFromChunkManger(const NamespaceString& originalNss, const ChunkManager& cm) {
@@ -120,54 +125,20 @@ NamespaceString constructTemporaryReshardingNss(StringData db, const UUID& sourc
                                        sourceUuid.toString()));
 }
 
-void tellShardsToRefresh(OperationContext* opCtx,
-                         const std::vector<ShardId>& shardIds,
-                         const NamespaceString& nss,
-                         std::shared_ptr<executor::TaskExecutor> executor) {
-    auto cmd = _flushRoutingTableCacheUpdatesWithWriteConcern(nss);
-    cmd.setSyncFromConfig(true);
-    cmd.setDbName(nss.db());
-    auto cmdObj =
-        cmd.toBSON(BSON(WriteConcernOptions::kWriteConcernField << WriteConcernOptions::Majority));
+std::set<ShardId> getRecipientShards(OperationContext* opCtx,
+                                     const NamespaceString& sourceNss,
+                                     const UUID& reshardingUUID) {
+    const auto& tempNss = constructTemporaryReshardingNss(sourceNss.db(), reshardingUUID);
+    auto* catalogCache = Grid::get(opCtx)->catalogCache();
+    auto cm = uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, tempNss));
 
-    std::vector<AsyncRequestsSender::Request> requests;
-    for (const auto& shardId : shardIds) {
-        requests.emplace_back(shardId, cmdObj);
-    }
+    uassert(ErrorCodes::NamespaceNotSharded,
+            str::stream() << "Expected collection " << tempNss << " to be sharded",
+            cm.isSharded());
 
-    if (!requests.empty()) {
-        // The _flushRoutingTableCacheUpdatesWithWriteConcern command will fail with a
-        // QueryPlanKilled error response if the config.cache.chunks collection is dropped
-        // concurrently. The config.cache.chunks collection is dropped by the shard when it detects
-        // the sharded collection's epoch having changed. We use kIdempotentOrCursorInvalidated so
-        // the ARS automatically retries in that situation.
-        AsyncRequestsSender ars(opCtx,
-                                executor,
-                                "admin",
-                                requests,
-                                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                                Shard::RetryPolicy::kIdempotentOrCursorInvalidated);
-
-        while (!ars.done()) {
-            // Retrieve the responses and throw at the first failure.
-            auto response = ars.next();
-
-            auto generateErrorContext = [&]() -> std::string {
-                return str::stream()
-                    << "Unable to _flushRoutingTableCacheUpdatesWithWriteConcern for namespace "
-                    << nss.ns() << " on " << response.shardId;
-            };
-
-            auto shardResponse =
-                uassertStatusOKWithContext(std::move(response.swResponse), generateErrorContext());
-
-            auto status = getStatusFromCommandResult(shardResponse.data);
-            uassertStatusOKWithContext(status, generateErrorContext());
-
-            auto wcStatus = getWriteConcernStatusFromCommandResult(shardResponse.data);
-            uassertStatusOKWithContext(wcStatus, generateErrorContext());
-        }
-    }
+    std::set<ShardId> recipients;
+    cm.getAllShardIds(&recipients);
+    return recipients;
 }
 
 void checkForHolesAndOverlapsInChunks(std::vector<ReshardedChunk>& chunks,
@@ -206,7 +177,6 @@ void validateReshardedChunks(const std::vector<mongo::BSONObj>& chunks,
             Grid::get(opCtx)->shardRegistry()->getShard(opCtx, chunk.getRecipientShardId()));
         validChunks.push_back(chunk);
     }
-
     checkForHolesAndOverlapsInChunks(validChunks, keyPattern);
 }
 
@@ -215,7 +185,7 @@ Timestamp getHighestMinFetchTimestamp(const std::vector<DonorShardEntry>& donorS
 
     auto maxMinFetchTimestamp = Timestamp::min();
     for (auto& donor : donorShards) {
-        auto donorFetchTimestamp = donor.getMinFetchTimestamp();
+        auto donorFetchTimestamp = donor.getMutableState().getMinFetchTimestamp();
         uassert(4957300,
                 "All donors must have a minFetchTimestamp, but donor {} does not."_format(
                     donor.getId()),
@@ -295,26 +265,28 @@ void createSlimOplogView(OperationContext* opCtx, Database* db) {
 }
 
 BSONObj getSlimOplogPipeline() {
-    return BSON("$project" << BSON(
-                    "_id"
-                    << "$ts"
-                    << "op" << 1 << "o"
-                    << BSON("applyOps" << BSON("ui" << 1 << "destinedRecipient" << 1)) << "ts" << 1
-                    << "prevOpTime.ts"
-                    << BSON("$cond" << BSON("if" << BSON("$eq" << BSON_ARRAY(BSON("$type"
-                                                                                  << "$stmtId")
-                                                                             << "missing"))
-                                                 << "then"
-                                                 << "$prevOpTime.ts"
-                                                 << "else" << Timestamp::min()))));
+    return fromjson(
+        "{$project: {\
+            _id: '$ts',\
+            op: 1,\
+            o: {\
+                applyOps: {ui: 1, destinedRecipient: 1},\
+                abortTransaction: 1\
+            },\
+            ts: 1,\
+            'prevOpTime.ts': {$cond: {\
+                if: {$eq: [{$type: '$stmtId'}, 'missing']},\
+                then: '$prevOpTime.ts',\
+                else: Timestamp(0, 0)\
+            }}\
+        }}");
 }
 
 std::unique_ptr<Pipeline, PipelineDeleter> createOplogFetchingPipelineForResharding(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const ReshardingDonorOplogId& startAfter,
     UUID collUUID,
-    const ShardId& recipientShard,
-    bool doesDonorOwnMinKeyChunk) {
+    const ShardId& recipientShard) {
     using Doc = Document;
     using Arr = std::vector<Value>;
     using V = Value;
@@ -327,10 +299,6 @@ std::unique_ptr<Pipeline, PipelineDeleter> createOplogFetchingPipelineForReshard
     // verification.
     stages.emplace_back(DocumentSourceMatch::create(
         Doc{{"ts", Doc{{"$gte", startAfter.getTs()}}}}.toBson(), expCtx));
-
-    const Value captureCommandsOnCollectionClause = doesDonorOwnMinKeyChunk
-        ? V{Doc{{"op", "c"_sd}, {"ui", collUUID}}}
-        : V{Doc{{"op", "c"_sd}, {"ui", collUUID}, {"o.drop", EXISTS}}};
 
     stages.emplace_back(DocumentSourceMatch::create(
         Doc{{"$or",
@@ -346,7 +314,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> createOplogFetchingPipelineForReshard
                        {"o.prepare", DNE}}},
                  V{Doc{{"op", "c"_sd}, {"o.commitTransaction", EXISTS}}},
                  V{Doc{{"op", "c"_sd}, {"o.abortTransaction", EXISTS}}},
-                 captureCommandsOnCollectionClause}}}
+                 V{Doc{{"op", "c"_sd}, {"ui", collUUID}}}}}}
             .toBson(),
         expCtx));
 
@@ -490,40 +458,32 @@ std::unique_ptr<Pipeline, PipelineDeleter> createOplogFetchingPipelineForReshard
 
 boost::optional<ShardId> getDestinedRecipient(OperationContext* opCtx,
                                               const NamespaceString& sourceNss,
-                                              const BSONObj& fullDocument) {
+                                              const BSONObj& fullDocument,
+                                              CollectionShardingState* css,
+                                              const ScopedCollectionDescription& collDesc) {
     if (!ShardingState::get(opCtx)->enabled()) {
         // Don't bother looking up the sharding state for the collection if the server isn't even
         // running with sharding enabled. We know there couldn't possibly be any resharding fields.
         return boost::none;
     }
 
-    auto css = CollectionShardingState::get(opCtx, sourceNss);
-
-    auto reshardingKeyPattern =
-        css->getCollectionDescription(opCtx).getReshardingKeyIfShouldForwardOps();
+    auto reshardingKeyPattern = collDesc.getReshardingKeyIfShouldForwardOps();
     if (!reshardingKeyPattern)
         return boost::none;
 
-    if (!documentBelongsToMe(opCtx, css, fullDocument))
+    if (!documentBelongsToMe(opCtx, css, collDesc, fullDocument))
         return boost::none;
 
     bool allowLocks = true;
-    auto tempNssRoutingInfo = Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(
-        opCtx,
-        constructTemporaryReshardingNss(sourceNss.db(), getCollectionUuid(opCtx, sourceNss)),
-        allowLocks);
+    auto tempNssRoutingInfo =
+        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(
+            opCtx,
+            constructTemporaryReshardingNss(sourceNss.db(), getCollectionUuid(opCtx, sourceNss)),
+            allowLocks));
 
-    uassert(ShardInvalidatedForTargetingInfo(sourceNss),
-            "Routing information is not available for the temporary resharding collection.",
-            tempNssRoutingInfo.getStatus() != ErrorCodes::StaleShardVersion);
+    auto shardKey = reshardingKeyPattern->extractShardKeyFromDocThrows(fullDocument);
 
-    uassertStatusOK(tempNssRoutingInfo);
-
-    auto shardKey = reshardingKeyPattern->extractShardKeyFromDoc(fullDocument);
-
-    return tempNssRoutingInfo.getValue()
-        .findIntersectingChunkWithSimpleCollation(shardKey)
-        .getShardId();
+    return tempNssRoutingInfo.findIntersectingChunkWithSimpleCollation(shardKey).getShardId();
 }
 
 bool isFinalOplog(const repl::OplogEntry& oplog) {
@@ -549,9 +509,14 @@ bool isFinalOplog(const repl::OplogEntry& oplog, UUID reshardingUUID) {
 }
 
 
-NamespaceString getLocalOplogBufferNamespace(UUID reshardingUUID, ShardId donorShardId) {
+NamespaceString getLocalOplogBufferNamespace(UUID existingUUID, ShardId donorShardId) {
     return NamespaceString("config.localReshardingOplogBuffer.{}.{}"_format(
-        reshardingUUID.toString(), donorShardId.toString()));
+        existingUUID.toString(), donorShardId.toString()));
 }
 
+NamespaceString getLocalConflictStashNamespace(UUID existingUUID, ShardId donorShardId) {
+    return NamespaceString{NamespaceString::kConfigDb,
+                           "localReshardingConflictStash.{}.{}"_format(existingUUID.toString(),
+                                                                       donorShardId.toString())};
+}
 }  // namespace mongo

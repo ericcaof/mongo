@@ -71,26 +71,32 @@ public:
     ~RuntimeEnvironment();
 
     /**
-     * Registers and returns a SlotId for the given slot 'type'. The 'slotIdGenerartor' is used to
-     * generated a new SlotId for the given slot 'type', which is then registered with this
+     * Registers and returns a SlotId for the given slot 'name'. The 'slotIdGenerator' is used
+     * to generate a new SlotId for the given slot 'name', which is then registered with this
      * environment by creating a new SlotAccessor. The value 'val' is then stored within the
      * SlotAccessor and the newly generated SlotId is returned.
      *
      * Both owned and unowned values can be stored in the runtime environment.
      *
-     * A user exception is raised if this slot 'type' has been already registered.
+     * A user exception is raised if this slot 'name' has been already registered.
      */
-    value::SlotId registerSlot(StringData type,
+    value::SlotId registerSlot(StringData name,
                                value::TypeTags tag,
                                value::Value val,
                                bool owned,
                                value::SlotIdGenerator* slotIdGenerator);
 
     /**
-     * Returns a SlotId registered for the given slot 'type'. If the slot hasn't been registered
-     * yet, a user exception is raised..
+     * Returns a SlotId registered for the given slot 'name'. If the slot with the specified name
+     * hasn't been registered, a user exception is raised.
      */
-    value::SlotId getSlot(StringData type);
+    value::SlotId getSlot(StringData name);
+
+    /**
+     * Returns a SlotId registered for the given slot 'name'. If the slot with the specified name
+     * hasn't been registered, boost::none is returned.
+     */
+    boost::optional<value::SlotId> getSlotIfExists(StringData name);
 
     /**
      * Store the given value in the specified slot within this runtime environment instance.
@@ -311,7 +317,7 @@ auto makeSV(Args&&... args) {
 class EConstant final : public EExpression {
 public:
     EConstant(value::TypeTags tag, value::Value val) : _tag(tag), _val(val) {}
-    EConstant(std::string_view str) {
+    EConstant(StringData str) {
         // Views are non-owning so we have to make a copy.
         std::tie(_tag, _val) = value::makeNewString(str);
     }
@@ -358,32 +364,46 @@ private:
 class EPrimBinary final : public EExpression {
 public:
     enum Op {
+        // Logical operations. These operations are short-circuiting.
+        logicAnd,
+        logicOr,
+
+        // Math operations.
         add,
         sub,
-
         mul,
         div,
 
-        lessEq,
+        // Comparison operations. These operations support taking a third "collator" arg.
+        // If you add or remove comparison operations or change their order, make sure you
+        // update isComparisonOp() accordingly.
         less,
+        lessEq,
         greater,
         greaterEq,
-
         eq,
         neq,
-
         cmp3w,
-
-        // Logical operations are short - circuiting.
-        logicAnd,
-        logicOr,
     };
 
-    EPrimBinary(Op op, std::unique_ptr<EExpression> lhs, std::unique_ptr<EExpression> rhs)
+    EPrimBinary(Op op,
+                std::unique_ptr<EExpression> lhs,
+                std::unique_ptr<EExpression> rhs,
+                std::unique_ptr<EExpression> collator = nullptr)
         : _op(op) {
         _nodes.emplace_back(std::move(lhs));
         _nodes.emplace_back(std::move(rhs));
+
+        if (collator) {
+            invariant(isComparisonOp(_op));
+            _nodes.emplace_back(std::move(collator));
+        }
+
         validateNodes();
+    }
+
+    static bool isComparisonOp(Op op) {
+        return (op >= less && op <= cmp3w);
     }
 
     std::unique_ptr<EExpression> clone() const override;
@@ -428,7 +448,7 @@ private:
  */
 class EFunction final : public EExpression {
 public:
-    EFunction(std::string_view name, std::vector<std::unique_ptr<EExpression>> args) : _name(name) {
+    EFunction(StringData name, std::vector<std::unique_ptr<EExpression>> args) : _name(name) {
         _nodes = std::move(args);
         validateNodes();
     }
@@ -493,7 +513,7 @@ private:
  */
 class EFail final : public EExpression {
 public:
-    EFail(ErrorCodes::Error code, std::string_view message) : _code(code) {
+    EFail(ErrorCodes::Error code, StringData message) : _code(code) {
         std::tie(_messageTag, _messageVal) = value::makeNewString(message);
     }
 

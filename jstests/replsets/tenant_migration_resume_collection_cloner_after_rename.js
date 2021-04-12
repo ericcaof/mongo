@@ -1,7 +1,7 @@
 /**
  * Tests that in tenant migration, the recipient set can resume collection cloning from the last
  * document cloned after a failover even if the collection has been renamed on the donor.
- * @tags: [requires_majority_read_concern, requires_fcv_49]
+ * @tags: [requires_majority_read_concern, requires_fcv_49, incompatible_with_windows_tls]
  */
 
 (function() {
@@ -16,10 +16,15 @@ load("jstests/replsets/libs/tenant_migration_util.js");
 const recipientRst = new ReplSetTest({
     nodes: 2,
     name: jsTestName() + "_recipient",
-    // Use a batch size of 2 so that collection cloner requires more than a single batch to
-    // complete.
-    nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().recipient,
-                               {setParameter: {collectionClonerBatchSize: 2}})
+    nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().recipient, {
+        setParameter: {
+            // Use a batch size of 2 so that collection cloner requires more than a single batch to
+            // complete.
+            collectionClonerBatchSize: 2,
+            // Allow reads on recipient before migration completes for testing.
+            'failpoint.tenantMigrationRecipientNotRejectReads': tojson({mode: 'alwaysOn'}),
+        }
+    })
 });
 
 recipientRst.startSet();
@@ -44,8 +49,9 @@ const docs = [{_id: 0}, {_id: "string"}, {_id: UUID()}, {_id: new Date()}];
 tenantMigrationTest.insertDonorDB(dbName, collName, docs);
 
 const migrationId = UUID();
+const migrationIdString = extractUUIDFromObject(migrationId);
 const migrationOpts = {
-    migrationIdString: extractUUIDFromObject(migrationId),
+    migrationIdString: migrationIdString,
     recipientConnString: tenantMigrationTest.getRecipientConnString(),
     tenantId: tenantId,
 };
@@ -64,32 +70,31 @@ const migrationThread =
     new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
 migrationThread.start();
 hangDuringCollectionClone.wait();
-assert.eq(2, recipientColl.find().itcount());
+assert.soon(() => recipientColl.find().itcount() === 2);
+
+// Insert some documents that will be fetched by the recipient. This is to test that on failover,
+// the fetcher will resume fetching from where it left off. The system is expected to crash if
+// the recipient fetches a duplicate oplog entry upon resuming the migration.
+tenantMigrationTest.insertDonorDB(dbName, "aNewColl", [{_id: "docToBeFetched"}]);
+assert.soon(() => {
+    const configDb = recipientPrimary.getDB("config");
+    const oplogBuffer = configDb.getCollection("repl.migration.oplog_" + migrationIdString);
+    return oplogBuffer.find({"entry.o._id": "docToBeFetched"}).count() === 1;
+});
 
 // Step up a new node in the recipient set and trigger a failover. The new primary should resume
 // cloning starting from the third document.
 recipientRst.awaitLastOpCommitted();
 const newRecipientPrimary = recipientRst.getSecondaries()[0];
 const newRecipientDb = newRecipientPrimary.getDB(dbName);
-const hangAfterStartingOplogFetcher = configureFailPoint(
-    newRecipientDb, "fpAfterStartingOplogFetcherMigrationRecipientInstance", {action: "hang"});
 assert.commandWorked(newRecipientPrimary.adminCommand({replSetStepUp: 1}));
 hangDuringCollectionClone.off();
 recipientRst.getPrimary();
-
-// Wait until the new recipient primary starts the oplog fetcher. This failpoint is needed only
-// because tenant migration didn't fully support resuming after a failover (specifically, not
-// preserving the startApplyingDonorOpTime) when this test was written. Otherwise, we can simply
-// rename the collection on the donor before stepping up the new recipient primary.
-hangAfterStartingOplogFetcher.wait();
 
 // Rename the collection on the donor.
 const donorColl = donorPrimary.getDB(dbName).getCollection(collName);
 const collNameRenamed = collName + "_renamed";
 assert.commandWorked(donorColl.renameCollection(collNameRenamed));
-
-// Resume collection cloning on the new recipient primary.
-hangAfterStartingOplogFetcher.off();
 
 // The migration should go through after recipient failover.
 assert.commandWorked(migrationThread.returnData());
@@ -98,7 +103,8 @@ assert.commandWorked(migrationThread.returnData());
 recipientColl = newRecipientPrimary.getDB(dbName).getCollection(collNameRenamed);
 assert.eq(4, recipientColl.find().itcount());
 assert.eq(recipientColl.find().sort({_id: 1}).toArray(), docs);
-tenantMigrationTest.checkTenantDBHashes(tenantId);
+TenantMigrationUtil.checkTenantDBHashes(
+    tenantMigrationTest.getDonorRst(), tenantMigrationTest.getRecipientRst(), tenantId);
 
 tenantMigrationTest.stop();
 recipientRst.stopSet();

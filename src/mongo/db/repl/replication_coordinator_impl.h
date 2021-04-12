@@ -138,6 +138,9 @@ public:
     virtual ReplicationCoordinator::StatusAndDuration awaitReplication(
         OperationContext* opCtx, const OpTime& opTime, const WriteConcernOptions& writeConcern);
 
+    virtual SharedSemiFuture<void> awaitReplicationAsyncNoWTimeout(
+        const OpTime& opTime, const WriteConcernOptions& writeConcern);
+
     void stepDown(OperationContext* opCtx,
                   bool force,
                   const Milliseconds& waitTime,
@@ -255,6 +258,8 @@ public:
     virtual Status doReplSetReconfig(OperationContext* opCtx,
                                      GetNewConfigFn getNewConfig,
                                      bool force) override;
+
+    virtual Status doOptimizedReconfig(OperationContext* opCtx, GetNewConfigFn) override;
 
     virtual Status awaitConfigCommitment(OperationContext* opCtx,
                                          bool waitForOplogCommitment) override;
@@ -1475,6 +1480,15 @@ private:
      */
     const ReadPreference _getSyncSourceReadPreference(WithLock);
 
+    /*
+     * Performs the replica set reconfig procedure. Certain consensus safety checks are omitted when
+     * either 'force' or 'skipSafetyChecks' are true.
+     */
+    Status _doReplSetReconfig(OperationContext* opCtx,
+                              GetNewConfigFn getNewConfig,
+                              bool force,
+                              bool skipSafetyChecks);
+
     //
     // All member variables are labeled with one of the following codes indicating the
     // synchronization rules for accessing them.
@@ -1655,6 +1669,11 @@ private:
     boost::optional<long long> _pendingTermUpdateDuringStepDown;  // (M)
 
     AtomicWord<bool> _startedSteadyStateReplication{false};
+
+    // If we're waiting to get the RSTL at stepdown and therefore should claim we don't allow
+    // writes.  This is a counter rather than a flag because there are scenarios where multiple
+    // stepdowns are attempted at once.
+    short _waitingForRSTLAtStepDown = 0;
 
     // If we're in terminal shutdown.  If true, we'll refuse to vote in elections.
     bool _inTerminalShutdown = false;  // (M)

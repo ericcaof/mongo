@@ -4,7 +4,7 @@
  * connection string matches the donor's connection string or doesn't correspond to a replica set
  * with a least one host.
  *
- * @tags: [requires_fcv_47]
+ * @tags: [requires_fcv_47, incompatible_with_windows_tls]
  */
 
 (function() {
@@ -66,7 +66,9 @@ assert.commandFailedWithCode(donorPrimary.adminCommand({
     recipientConnectionString:
         tenantMigrationTest.getRecipientRst().getURL() + "," + donorPrimary.host,
     tenantId: tenantId,
-    readPreference: readPreference
+    readPreference: readPreference,
+    donorCertificateForRecipient: migrationCertificates.donorCertificateForRecipient,
+    recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
 }),
                              ErrorCodes.BadValue);
 
@@ -91,6 +93,7 @@ unsupportedtenantIds.forEach((invalidTenantId) => {
         migrationId: UUID(),
         donorConnectionString: tenantMigrationTest.getDonorRst().getURL(),
         tenantId: invalidTenantId,
+        startMigrationDonorTimestamp: Timestamp(1, 1),
         readPreference: readPreference,
         recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
     }),
@@ -103,7 +106,9 @@ assert.commandFailedWithCode(recipientPrimary.adminCommand({
     migrationId: UUID(),
     donorConnectionString: tenantMigrationTest.getRecipientRst().getURL(),
     tenantId: tenantId,
-    readPreference: readPreference
+    startMigrationDonorTimestamp: Timestamp(1, 1),
+    readPreference: readPreference,
+    recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
 }),
                              ErrorCodes.BadValue);
 
@@ -113,6 +118,7 @@ assert.commandFailedWithCode(recipientPrimary.adminCommand({
     migrationId: UUID(),
     donorConnectionString: tenantMigrationTest.getDonorRst().getURL() + "," + recipientPrimary.host,
     tenantId: tenantId,
+    startMigrationDonorTimestamp: Timestamp(1, 1),
     readPreference: readPreference,
     recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
 }),
@@ -124,11 +130,13 @@ assert.commandFailedWithCode(recipientPrimary.adminCommand({
     migrationId: UUID(),
     donorConnectionString: recipientPrimary.host,
     tenantId: tenantId,
-    readPreference: readPreference
+    startMigrationDonorTimestamp: Timestamp(1, 1),
+    readPreference: readPreference,
+    recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
 }),
                              ErrorCodes.BadValue);
 
-// Test 'returnAfterReachingDonorTimestamp' can' be null.
+// Test 'returnAfterReachingDonorTimestamp' can't be null.
 const nullTimestamps = [Timestamp(0, 0), Timestamp(0, 1)];
 nullTimestamps.forEach((nullTs) => {
     assert.commandFailedWithCode(donorPrimary.adminCommand({
@@ -136,8 +144,10 @@ nullTimestamps.forEach((nullTs) => {
         migrationId: UUID(),
         donorConnectionString: tenantMigrationTest.getDonorRst().getURL(),
         tenantId: tenantId,
+        startMigrationDonorTimestamp: Timestamp(1, 1),
         readPreference: readPreference,
-        returnAfterReachingDonorTimestamp: nullTs
+        returnAfterReachingDonorTimestamp: nullTs,
+        recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
     }),
                                  ErrorCodes.BadValue);
 });

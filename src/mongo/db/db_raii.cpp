@@ -38,6 +38,7 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/storage/snapshot_helper.h"
 #include "mongo/logv2/log.h"
 
@@ -59,9 +60,33 @@ bool supportsLockFreeRead(OperationContext* opCtx) {
     // Lock-free reads are not supported in multi-document transactions.
     // Lock-free reads are not supported under an exclusive lock (nested reads under exclusive lock
     // holding operations).
+    // Lock-free reads are not supported if a storage txn is already open w/o the lock-free reads
+    // operation flag set.
     return !storageGlobalParams.disableLockFreeReads && !opCtx->inMultiDocumentTransaction() &&
-        !opCtx->lockState()->isWriteLocked();
+        !opCtx->lockState()->isWriteLocked() &&
+        !(opCtx->recoveryUnit()->isActive() && !opCtx->isLockFreeReadsOp());
 }
+
+/**
+ * Type that pretends to be a Collection. It implements the minimal interface used by
+ * acquireCollectionAndConsistentSnapshot(). We are tricking acquireCollectionAndConsistentSnapshot
+ * to establish a consistent snapshot with just the catalog and not for a specific Collection.
+ */
+class FakeCollection {
+public:
+    // We just need to return something that would not considered to be the oplog. A default
+    // constructed NamespaceString is fine.
+    const NamespaceString& ns() const {
+        return _ns;
+    };
+    // We just need to return something that compares equal with itself here.
+    boost::optional<Timestamp> getMinimumVisibleSnapshot() const {
+        return boost::none;
+    }
+
+private:
+    NamespaceString _ns;
+};
 
 /**
  * Helper function to acquire a collection and consistent snapshot without holding the RSTL or
@@ -89,7 +114,9 @@ auto acquireCollectionAndConsistentSnapshot(
     // Figure out what type of Collection GetCollectionAndEstablishReadSourceFunc returns. It needs
     // to behave like a pointer.
     using CollectionPtrT = decltype(std::declval<GetCollectionAndEstablishReadSourceFunc>()(
-        std::declval<OperationContext*>(), std::declval<const CollectionCatalog&>()));
+        std::declval<OperationContext*>(),
+        std::declval<const CollectionCatalog&>(),
+        std::declval<bool>()));
 
     CollectionPtrT collection;
     catalogStasher.reset();
@@ -99,7 +126,8 @@ auto acquireCollectionAndConsistentSnapshot(
         long long replTerm = repl::ReplicationCoordinator::get(opCtx)->getTerm();
 
         auto catalog = CollectionCatalog::get(opCtx);
-        collection = getCollectionAndEstablishReadSource(opCtx, *catalog);
+        collection =
+            getCollectionAndEstablishReadSource(opCtx, *catalog, isLockFreeReadSubOperation);
 
         // A lock request does not always find a collection to lock.
         if (!collection)
@@ -108,6 +136,10 @@ auto acquireCollectionAndConsistentSnapshot(
         // If this is a nested lock acquisition, then we already have a consistent stashed catalog
         // and snapshot from which to read and we can skip the below logic.
         if (isLockFreeReadSubOperation) {
+            // A consistent in-memory and on-disk state is already set up by a higher level AutoGet*
+            // instance. Save the catalog on this instance, to retain it against out-of-order
+            // AutoGet* destruction, and return early.
+            catalogStasher.stash(catalog);
             return collection;
         }
 
@@ -145,8 +177,8 @@ auto acquireCollectionAndConsistentSnapshot(
 
         LOGV2_DEBUG(5067701,
                     3,
-                    "Retrying acquiring state for lock-free read because collection or replication "
-                    "state changed.");
+                    "Retrying acquiring state for lock-free read because collection, catalog or "
+                    "replication state changed.");
         reset();
         opCtx->recoveryUnit()->abandonSnapshot();
     }
@@ -190,7 +222,15 @@ AutoStatsTracker::~AutoStatsTracker() {
 template <typename AutoGetCollectionType, typename EmplaceAutoCollFunc>
 AutoGetCollectionForReadBase<AutoGetCollectionType, EmplaceAutoCollFunc>::
     AutoGetCollectionForReadBase(OperationContext* opCtx,
-                                 const EmplaceAutoCollFunc& emplaceAutoColl) {
+                                 const EmplaceAutoCollFunc& emplaceAutoColl,
+                                 bool isLockFreeReadSubOperation) {
+    // If this instance is nested and lock-free, then we do not want to adjust any setting, but we
+    // do need to set up the Collection reference.
+    if (isLockFreeReadSubOperation) {
+        emplaceAutoColl.emplace(_autoColl);
+        return;
+    }
+
     // The caller was expecting to conflict with batch application before entering this function.
     // i.e. the caller does not currently have a ShouldNotConflict... block in scope.
     bool callerWasConflicting = opCtx->lockState()->shouldConflictWithSecondaryBatchApplication();
@@ -401,7 +441,13 @@ void AutoGetCollectionForReadLockFree::EmplaceHelper::emplace(
                 /* CollectionCatalogStasher */
                 catalogStasher,
                 /* GetCollectionAndEstablishReadSourceFunc */
-                [uuid](OperationContext* opCtx, const CollectionCatalog& catalog) {
+                [uuid](OperationContext* opCtx,
+                       const CollectionCatalog& catalog,
+                       bool isLockFreeReadSubOperation) {
+                    // There should only ever be one helper recovering from a query yield, so it
+                    // should never be nested.
+                    invariant(!isLockFreeReadSubOperation);
+
                     auto coll = catalog.lookupCollectionByUUIDForRead(opCtx, uuid);
 
                     // After yielding and reacquiring locks, the preconditions that were used to
@@ -453,8 +499,9 @@ AutoGetCollectionForReadLockFree::AutoGetCollectionForReadLockFree(
         /* CollectionCatalogStasher */
         _catalogStash,
         /* GetCollectionAndEstablishReadSourceFunc */
-        [this, &emplaceFunc](OperationContext* opCtx, const CollectionCatalog&) {
-            _autoGetCollectionForReadBase.emplace(opCtx, emplaceFunc);
+        [this, &emplaceFunc](
+            OperationContext* opCtx, const CollectionCatalog&, bool isLockFreeReadSubOperation) {
+            _autoGetCollectionForReadBase.emplace(opCtx, emplaceFunc, isLockFreeReadSubOperation);
             return _autoGetCollectionForReadBase->getCollection().get();
         },
         /* GetCollectionAfterSnapshotFunc */
@@ -587,6 +634,69 @@ const NamespaceString& AutoGetCollectionForReadCommandMaybeLockFree::getNss() co
         return _autoGet->getNss();
     } else {
         return _autoGetLockFree->getNss();
+    }
+}
+
+AutoReadLockFree::AutoReadLockFree(OperationContext* opCtx, Date_t deadline)
+    : _catalogStash(opCtx),
+      _lockFreeReadsBlock(opCtx),
+      _globalLock(
+          opCtx, MODE_IS, deadline, Lock::InterruptBehavior::kThrow, true /* skipRSTLLock */) {
+    // The catalog will be stashed inside the CollectionCatalogStasher.
+    FakeCollection fakeColl;
+    acquireCollectionAndConsistentSnapshot(
+        opCtx,
+        /* isLockFreeReadSubOperation */
+        false,
+        /* CollectionCatalogStasher */
+        _catalogStash,
+        /* GetCollectionAndEstablishReadSourceFunc */
+        [&](OperationContext* opCtx, const CollectionCatalog&, bool) { return &fakeColl; },
+        /* GetCollectionAfterSnapshotFunc */
+        [&](OperationContext* opCtx, const CollectionCatalog& catalog) { return &fakeColl; },
+        /* ResetFunc */
+        []() {});
+}
+
+AutoGetDbForReadLockFree::AutoGetDbForReadLockFree(OperationContext* opCtx,
+                                                   StringData dbName,
+                                                   Date_t deadline)
+    : _catalogStash(opCtx),
+      _lockFreeReadsBlock(opCtx),
+      _globalLock(
+          opCtx, MODE_IS, deadline, Lock::InterruptBehavior::kThrow, true /* skipRSTLLock */) {
+    // The catalog will be stashed inside the CollectionCatalogStasher.
+    FakeCollection fakeColl;
+    acquireCollectionAndConsistentSnapshot(
+        opCtx,
+        /* isLockFreeReadSubOperation */
+        false,
+        /* CollectionCatalogStasher */
+        _catalogStash,
+        /* GetCollectionAndEstablishReadSourceFunc */
+        [&](OperationContext* opCtx, const CollectionCatalog&, bool) {
+            // Check that the sharding database version matches our read.
+            // Note: this must always be checked, regardless of whether the collection exists, so
+            // that the dbVersion of this node or the caller gets updated quickly in case either is
+            // stale.
+            auto dss = DatabaseShardingState::getSharedForLockFreeReads(opCtx, dbName);
+            auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss.get());
+            dss->checkDbVersion(opCtx, dssLock);
+            return &fakeColl;
+        },
+        /* GetCollectionAfterSnapshotFunc */
+        [&](OperationContext* opCtx, const CollectionCatalog& catalog) { return &fakeColl; },
+        /* ResetFunc */
+        []() {});
+}
+
+AutoGetDbForReadMaybeLockFree::AutoGetDbForReadMaybeLockFree(OperationContext* opCtx,
+                                                             StringData dbName,
+                                                             Date_t deadline) {
+    if (supportsLockFreeRead(opCtx)) {
+        _autoGetLockFree.emplace(opCtx, dbName, deadline);
+    } else {
+        _autoGet.emplace(opCtx, dbName, MODE_IS, deadline);
     }
 }
 

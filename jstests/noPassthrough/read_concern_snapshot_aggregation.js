@@ -1,7 +1,9 @@
 /**
  * Tests for the aggregate command's support for readConcern level "snapshot".
  *
- * @tags: [uses_transactions]
+ * @tags: [
+ *   uses_transactions,
+ * ]
  */
 (function() {
 "use strict";

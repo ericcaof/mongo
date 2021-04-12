@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2020 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -297,6 +297,56 @@ __wt_btree_config_encryptor(
 }
 
 /*
+ * __btree_config_tiered --
+ *     Return a bucket storage handle based on the configuration.
+ */
+static int
+__btree_config_tiered(WT_SESSION_IMPL *session, const char **cfg, WT_BUCKET_STORAGE **bstoragep)
+{
+    WT_BUCKET_STORAGE *bstorage;
+    WT_CONFIG_ITEM bucket, cval;
+    WT_DECL_RET;
+    bool local_free;
+
+    /*
+     * We do not use __wt_config_gets_none for name because "none" and the empty string have
+     * different meanings. The empty string means inherit the system tiered storage setting and
+     * "none" means this table is not using tiered storage.
+     */
+    *bstoragep = NULL;
+    local_free = false;
+    WT_RET(__wt_config_gets(session, cfg, "tiered_storage.name", &cval));
+    if (cval.len == 0)
+        *bstoragep = S2C(session)->bstorage;
+    else if (!WT_STRING_MATCH("none", cval.str, cval.len)) {
+        WT_RET(__wt_config_gets_none(session, cfg, "tiered_storage.bucket", &bucket));
+        WT_RET(__wt_tiered_bucket_config(session, &cval, &bucket, bstoragep));
+        local_free = true;
+        WT_ASSERT(session, *bstoragep != NULL);
+    }
+    bstorage = *bstoragep;
+    if (bstorage != NULL) {
+        /*
+         * If we get here then we have a valid bucket storage entry. Now see if the config overrides
+         * any of the other settings.
+         */
+        if (bstorage != S2C(session)->bstorage)
+            WT_ERR(__wt_tiered_common_config(session, cfg, bstorage));
+        WT_STAT_DATA_SET(session, tiered_object_size, bstorage->object_size);
+        WT_STAT_DATA_SET(session, tiered_retention, bstorage->retain_secs);
+    }
+    return (0);
+err:
+    /* If the bucket storage was set up with copies of the strings, free them here. */
+    if (bstorage != NULL && local_free && F_ISSET(bstorage, WT_BUCKET_FREE)) {
+        __wt_free(session, bstorage->auth_token);
+        __wt_free(session, bstorage->bucket);
+        __wt_free(session, bstorage);
+    }
+    return (ret);
+}
+
+/*
  * __btree_conf --
  *     Configure a WT_BTREE structure.
  */
@@ -481,8 +531,16 @@ __btree_conf(WT_SESSION_IMPL *session, WT_CKPT *ckpt)
         F_SET(btree, WT_BTREE_NO_LOGGING);
     }
 
+    /* Configure tiered storage. */
+    WT_RET(__btree_config_tiered(session, cfg, &btree->bstorage));
+
     /* Configure encryption. */
     WT_RET(__wt_btree_config_encryptor(session, cfg, &btree->kencryptor));
+
+    /* Configure read-only. */
+    WT_RET(__wt_config_gets(session, cfg, "readonly", &cval));
+    if (cval.val)
+        F_SET(btree, WT_BTREE_READONLY);
 
     /* Initialize locks. */
     WT_RET(__wt_rwlock_init(session, &btree->ovfl_lock));
@@ -519,9 +577,27 @@ __btree_conf(WT_SESSION_IMPL *session, WT_CKPT *ckpt)
 
     /* If this is the first time opening the tree this run. */
     if (F_ISSET(session, WT_SESSION_IMPORT) || ckpt->run_write_gen < conn->base_write_gen)
-        btree->base_write_gen = btree->run_write_gen = btree->write_gen;
+        btree->run_write_gen = btree->write_gen;
     else
-        btree->base_write_gen = btree->run_write_gen = ckpt->run_write_gen;
+        btree->run_write_gen = ckpt->run_write_gen;
+
+    /*
+     * In recovery use the last checkpointed run write generation number as base write generation
+     * number to reset the transaction ids of the pages that were modified before the restart. The
+     * transaction ids are retained only on the pages that are written after the restart.
+     *
+     * Rollback to stable does not operate on logged tables and metadata, so it is skipped.
+     *
+     * The only scenario where the checkpoint run write generation number is less than the
+     * connection last checkpoint base write generation number is when rollback to stable doesn't
+     * happen during the recovery due to the unavailability of history store file.
+     */
+    if (!F_ISSET(conn, WT_CONN_RECOVERING) || WT_IS_METADATA(btree->dhandle) ||
+      __wt_btree_immediately_durable(session) ||
+      ckpt->run_write_gen < conn->last_ckpt_base_write_gen)
+        btree->base_write_gen = btree->run_write_gen;
+    else
+        btree->base_write_gen = ckpt->run_write_gen;
 
     /*
      * We've just overwritten the runtime write generation based off the fact that know that we're

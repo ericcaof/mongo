@@ -1,7 +1,9 @@
 // Test that the read concern level 'snapshot' exhibits the correct yielding behavior. That is,
 // operations performed at read concern level snapshot check for interrupt but do not yield locks or
 // storage engine resources.
-// @tags: [uses_transactions]
+// @tags: [
+//   uses_transactions,
+// ]
 (function() {
 "use strict";
 
@@ -217,8 +219,8 @@ testCommand(function() {
     assert.eq(res.cursor.firstBatch.length, TestData.numDocs, tojson(res));
 }, {"command.pipeline": [{$match: {x: 1}}]});
 
-// Test getMore with an initial find batchSize of 0. Interrupt behavior of a getMore is not
-// expected to change with a change of batchSize in the originating command.
+// Test getMore with an initial find batchSize of 0. Interrupt behavior of a getMore is not expected
+// to change with a change of batchSize in the originating command.
 testCommand(function() {
     const session = db.getMongo().startSession({causalConsistency: false});
     const sessionDb = session.getDatabase("test");

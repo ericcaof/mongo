@@ -149,7 +149,7 @@ std::vector<std::string> getAddrsForHost(const std::string& iporhost,
         }
     }
 
-    if (shouldLog(logv2::LogSeverity::Debug(2))) {
+    if (shouldLog(MONGO_LOGV2_DEFAULT_COMPONENT, logv2::LogSeverity::Debug(2))) {
         LOGV2_DEBUG(21205,
                     2,
                     "getAddrsForHost()",
@@ -234,7 +234,7 @@ bool isSelf(const HostAndPort& hostAndPort, ServiceContext* const ctx) {
         // a replica set configuration document, but the 'isMaster' command requires a lock on the
         // replication coordinator to execute. As such we call we call 'connectSocketOnly', which
         // does not call 'isMaster'.
-        auto connectSocketResult = conn.connectSocketOnly(hostAndPort);
+        auto connectSocketResult = conn.connectSocketOnly(hostAndPort, boost::none);
         if (!connectSocketResult.isOK()) {
             LOGV2(4834700,
                   "isSelf could not connect via connectSocketOnly",
@@ -397,7 +397,7 @@ std::vector<std::string> getBoundAddrs(const bool ipv6enabled) {
 
 #endif  // defined(_WIN32)
 
-    if (shouldLog(logv2::LogSeverity::Debug(2))) {
+    if (shouldLog(MONGO_LOGV2_DEFAULT_COMPONENT, logv2::LogSeverity::Debug(2))) {
         LOGV2_DEBUG(21206, 2, "getBoundAddrs()", "result"_attr = out);
     }
     return out;

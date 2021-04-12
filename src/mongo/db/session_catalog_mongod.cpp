@@ -141,9 +141,9 @@ int removeSessionsTransactionRecords(OperationContext* opCtx,
         return 0;
 
     // Remove the session ids from the on-disk catalog
-    write_ops::Delete deleteOp(NamespaceString::kSessionTransactionsTableNamespace);
-    deleteOp.setWriteCommandBase([] {
-        write_ops::WriteCommandBase base;
+    write_ops::DeleteCommandRequest deleteOp(NamespaceString::kSessionTransactionsTableNamespace);
+    deleteOp.setWriteCommandRequestBase([] {
+        write_ops::WriteCommandRequestBase base;
         base.setOrdered(false);
         return base;
     }());
@@ -442,5 +442,17 @@ MongoDOperationContextSessionWithoutRefresh::~MongoDOperationContextSessionWitho
     // isn't prepared, aborted, or committed.
     invariant(!txnParticipant.transactionIsInProgress());
 }
+
+MongoDOperationContextSessionWithoutOplogRead::MongoDOperationContextSessionWithoutOplogRead(
+    OperationContext* opCtx)
+    : _operationContextSession(opCtx), _opCtx(opCtx) {
+    invariant(!opCtx->getClient()->isInDirectClient());
+
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    txnParticipant.refreshFromStorageIfNeededNoOplogEntryFetch(opCtx);
+}
+
+MongoDOperationContextSessionWithoutOplogRead::~MongoDOperationContextSessionWithoutOplogRead() =
+    default;
 
 }  // namespace mongo

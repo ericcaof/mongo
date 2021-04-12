@@ -33,6 +33,7 @@
 
 #include "mongo/base/data_cursor.h"
 #include "mongo/db/audit.h"
+#include "mongo/db/auth/authorization_checks.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/cursor_id.h"
 #include "mongo/db/cursor_manager.h"
@@ -68,16 +69,16 @@ bool killCursorIfAuthorized(OperationContext* opCtx, CursorId id) {
 
     AuthorizationSession* as = AuthorizationSession::get(opCtx->getClient());
     auto cursorOwner = pin.getValue().getCursor()->getAuthenticatedUsers();
-    auto authStatus = as->checkAuthForKillCursors(nss, cursorOwner);
+    auto authStatus = auth::checkAuthForKillCursors(as, nss, cursorOwner);
+    audit::logKillCursorsAuthzCheck(opCtx->getClient(), nss, id, authStatus.code());
     if (!authStatus.isOK()) {
-        audit::logKillCursorsAuthzCheck(opCtx->getClient(), nss, id, authStatus.code());
         return false;
     }
 
     // Release the pin so that the cursor can be killed.
     pin.getValue().release();
 
-    Status killStatus = cursorManager->killCursor(opCtx, id, true /* shouldAudit */);
+    Status killStatus = cursorManager->killCursor(opCtx, id);
     massert(28697,
             killStatus.reason(),
             killStatus.code() == ErrorCodes::OK || killStatus.code() == ErrorCodes::CursorNotFound);

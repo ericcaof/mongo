@@ -145,11 +145,23 @@ private:
  */
 void validateShardKeyIndexExistsOrCreateIfPossible(OperationContext* opCtx,
                                                    const NamespaceString& nss,
-                                                   const BSONObj& proposedKey,
                                                    const ShardKeyPattern& shardKeyPattern,
                                                    const boost::optional<BSONObj>& defaultCollation,
                                                    bool unique,
                                                    const ShardKeyValidationBehaviors& behaviors);
-
+/**
+ * Compares the proposed shard key with the collection's existing indexes to ensure they are a legal
+ * combination.
+ *
+ * Returns true if the shard key is valid and already exists. Steps 1, 2 and 3 of the previous
+ * function.
+ *
+ */
+bool validShardKeyIndexExists(OperationContext* opCtx,
+                              const NamespaceString& nss,
+                              const ShardKeyPattern& shardKeyPattern,
+                              const boost::optional<BSONObj>& defaultCollation,
+                              bool unique,
+                              const ShardKeyValidationBehaviors& behaviors);
 }  // namespace shardkeyutil
 }  // namespace mongo

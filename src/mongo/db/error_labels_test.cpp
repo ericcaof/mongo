@@ -69,6 +69,12 @@ TEST(IsTransientTransactionErrorTest, TenantMigrationAbortedIsTransient) {
                                             false /* isCommitOrAbort */));
 }
 
+TEST(IsTransientTransactionErrorTest, ShardCannotRefreshDueToLocksHeldIsTransient) {
+    ASSERT_TRUE(isTransientTransactionError(ErrorCodes::ShardCannotRefreshDueToLocksHeld,
+                                            false /* hasWriteConcernError */,
+                                            false /* isCommitOrAbort */));
+}
+
 TEST(IsTransientTransactionErrorTest, ShardInvalidatedForTargetingIsTransient) {
     ASSERT_TRUE(isTransientTransactionError(ErrorCodes::ShardInvalidatedForTargeting,
                                             false /* hasWriteConcernError */,
@@ -293,7 +299,8 @@ TEST_F(ErrorLabelBuilderTest, ResumableChangeStreamErrorAppliesToChangeStreamAgg
     auto cmdObj = BSON("aggregate" << nss().coll() << "pipeline"
                                    << BSON_ARRAY(BSON("$changeStream" << BSONObj())) << "cursor"
                                    << BSONObj() << "$db" << nss().db());
-    auto aggRequest = uassertStatusOK(aggregation_request_helper::parseFromBSON(nss(), cmdObj));
+    auto aggRequest =
+        uassertStatusOK(aggregation_request_helper::parseFromBSONForTests(nss(), cmdObj));
     ASSERT_TRUE(LiteParsedPipeline(aggRequest).hasChangeStream());
 
     // The label applies to a $changeStream "aggregate" command.
@@ -317,7 +324,8 @@ TEST_F(ErrorLabelBuilderTest, ResumableChangeStreamErrorDoesNotApplyToNonResumab
     auto cmdObj = BSON("aggregate" << nss().coll() << "pipeline"
                                    << BSON_ARRAY(BSON("$changeStream" << BSONObj())) << "cursor"
                                    << BSONObj() << "$db" << nss().db());
-    auto aggRequest = uassertStatusOK(aggregation_request_helper::parseFromBSON(nss(), cmdObj));
+    auto aggRequest =
+        uassertStatusOK(aggregation_request_helper::parseFromBSONForTests(nss(), cmdObj));
     ASSERT_TRUE(LiteParsedPipeline(aggRequest).hasChangeStream());
 
     // The label does not apply to a ChangeStreamFatalError error on a $changeStream aggregation.
@@ -341,7 +349,8 @@ TEST_F(ErrorLabelBuilderTest, ResumableChangeStreamErrorDoesNotApplyToNonChangeS
     auto cmdObj =
         BSON("aggregate" << nss().coll() << "pipeline" << BSON_ARRAY(BSON("$match" << BSONObj()))
                          << "cursor" << BSONObj() << "$db" << nss().db());
-    auto aggRequest = uassertStatusOK(aggregation_request_helper::parseFromBSON(nss(), cmdObj));
+    auto aggRequest =
+        uassertStatusOK(aggregation_request_helper::parseFromBSONForTests(nss(), cmdObj));
     ASSERT_FALSE(LiteParsedPipeline(aggRequest).hasChangeStream());
 
     // The label does not apply to a non-$changeStream "aggregate" command.

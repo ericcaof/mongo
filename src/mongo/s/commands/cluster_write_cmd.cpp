@@ -37,7 +37,7 @@
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/update_metrics.h"
-#include "mongo/db/commands/write_commands/write_commands_common.h"
+#include "mongo/db/commands/write_commands_common.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
@@ -46,10 +46,12 @@
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/chunk_manager_targeter.h"
 #include "mongo/s/client/num_hosts_targeted_metrics.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/cluster_last_error_info.h"
+#include "mongo/s/cluster_write.h"
 #include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/commands/document_shard_key_update_util.h"
 #include "mongo/s/grid.h"
@@ -59,8 +61,6 @@
 #include "mongo/s/would_change_owning_shard_exception.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/s/write_ops/chunk_manager_targeter.h"
-#include "mongo/s/write_ops/cluster_write.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -224,7 +224,7 @@ bool handleWouldChangeOwningShardError(OperationContext* opCtx,
             documentShardKeyUpdateUtil::startTransactionForShardKeyUpdate(opCtx);
             // Clear the error details from the response object before sending the write again
             response->unsetErrDetails();
-            ClusterWriter::write(opCtx, *request, &stats, response);
+            cluster::write(opCtx, *request, &stats, response);
             wouldChangeOwningShardErrorInfo =
                 getWouldChangeOwningShardErrorInfo(opCtx, *request, response, !isRetryableWrite);
             if (!wouldChangeOwningShardErrorInfo)
@@ -423,7 +423,6 @@ public:
                    BatchedCommandRequest batchedRequest,
                    UpdateMetrics* updateMetrics = nullptr)
         : CommandInvocation(command),
-          _bypass{shouldBypassDocumentValidationForCommand(request.body)},
           _request{&request},
           _batchedRequest{std::move(batchedRequest)},
           _updateMetrics{updateMetrics} {}
@@ -433,7 +432,7 @@ public:
     }
 
     bool getBypass() const {
-        return _bypass;
+        return _batchedRequest.getBypassDocumentValidation();
     }
 
 private:
@@ -469,7 +468,7 @@ private:
             batchedRequest.unsetWriteConcern();
         }
 
-        ClusterWriter::write(opCtx, batchedRequest, &stats, &response);
+        cluster::write(opCtx, batchedRequest, &stats, &response);
 
         bool updatedShardKey = false;
         if (_batchedRequest.getBatchType() == BatchedCommandRequest::BatchType_Update) {
@@ -484,7 +483,7 @@ private:
 
         if (!response.getOk()) {
             numAttempts = 0;
-        } else if (batchedRequest.getWriteCommandBase().getOrdered() &&
+        } else if (batchedRequest.getWriteCommandRequestBase().getOrdered() &&
                    response.isErrDetailsSet()) {
             // Add one failed attempt
             numAttempts = response.getErrDetailsAt(0)->getIndex() + 1;
@@ -674,6 +673,10 @@ private:
     LogicalOp getLogicalOp() const override {
         return LogicalOp::opInsert;
     }
+
+    const AuthorizationContract* getAuthorizationContract() const final {
+        return &::mongo::write_ops::InsertCommandRequest::kAuthorizationContract;
+    }
 } clusterInsertCmd;
 
 class ClusterUpdateCmd final : public ClusterWriteCmd {
@@ -715,6 +718,10 @@ private:
         return LogicalOp::opUpdate;
     }
 
+    const AuthorizationContract* getAuthorizationContract() const final {
+        return &::mongo::write_ops::UpdateCommandRequest::kAuthorizationContract;
+    }
+
     // Update related command execution metrics.
     UpdateMetrics _updateMetrics;
 } clusterUpdateCmd;
@@ -752,6 +759,11 @@ private:
     LogicalOp getLogicalOp() const override {
         return LogicalOp::opDelete;
     }
+
+    const AuthorizationContract* getAuthorizationContract() const final {
+        return &::mongo::write_ops::DeleteCommandRequest::kAuthorizationContract;
+    }
+
 } clusterDeleteCmd;
 
 }  // namespace

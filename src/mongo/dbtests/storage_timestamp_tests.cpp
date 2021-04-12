@@ -206,7 +206,7 @@ public:
         // Since the Client object persists across tests, even though the global
         // ReplicationCoordinator does not, we need to clear the last op associated with the client
         // to avoid the invariant in ReplClientInfo::setLastOp that the optime only goes forward.
-        repl::ReplClientInfo::forClient(_opCtx->getClient()).clearLastOp_forTest();
+        repl::ReplClientInfo::forClient(_opCtx->getClient()).clearLastOp();
 
         auto registry = std::make_unique<OpObserverRegistry>();
         registry->addObserver(std::make_unique<OpObserverImpl>());
@@ -738,7 +738,7 @@ public:
                                       << "ns"
                                       << "test.$cmd"
                                       << "wall" << Date_t() << "o"
-                                      << BSON("applyOps" << BSONArrayBuilder().obj())))),
+                                      << BSON("applyOps" << BSONArrayBuilder().arr())))),
                 repl::OplogApplication::Mode::kApplyOpsCmd,
                 &result));
         }
@@ -2750,12 +2750,7 @@ public:
         const LogicalTime beforeDropTs = currentTime.clusterTime();
 
         // Drop all of the indexes.
-        BSONObjBuilder result;
-        ASSERT_OK(dropIndexes(_opCtx,
-                              nss,
-                              BSON("index"
-                                   << "*"),
-                              &result));
+        dropIndexes(_opCtx, nss, "*");
 
         // Assert that each index is dropped individually and with its own timestamp. The order of
         // dropping and creating are not guaranteed to be the same, but assert all of the created
@@ -2830,13 +2825,7 @@ public:
         const LogicalTime beforeDropTs = currentTime.clusterTime();
 
         // Drop all of the indexes.
-        BSONObjBuilder result;
-        ASSERT_OK(dropIndexes(_opCtx,
-                              nss,
-                              BSON("index" << BSON_ARRAY("a_1"
-                                                         << "b_1"
-                                                         << "c_1")),
-                              &result));
+        dropIndexes(_opCtx, nss, std::vector<std::string>{"a_1", "b_1", "c_1"});
 
         // Assert that each index is dropped individually and with its own timestamp. The order of
         // dropping and creating are not guaranteed to be the same, but assert all of the created

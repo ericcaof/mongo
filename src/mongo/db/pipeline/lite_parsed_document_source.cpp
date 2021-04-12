@@ -42,12 +42,15 @@ namespace {
 // Empty vector used by LiteParsedDocumentSources which do not have a sub pipeline.
 inline static std::vector<LiteParsedPipeline> kNoSubPipeline = {};
 
-StringMap<Parser> parserMap;
+StringMap<LiteParsedDocumentSource::LiteParserInfo> parserMap;
 
 }  // namespace
 
-void LiteParsedDocumentSource::registerParser(const std::string& name, Parser parser) {
-    parserMap[name] = parser;
+void LiteParsedDocumentSource::registerParser(const std::string& name,
+                                              Parser parser,
+                                              AllowedWithApiStrict allowedWithApiStrict,
+                                              AllowedWithClientType allowedWithClientType) {
+    parserMap[name] = {parser, allowedWithApiStrict, allowedWithClientType};
     // Initialize a counter for this document source to track how many times it is used.
     aggStageCounters.stageCounterMap[name] = std::make_unique<AggStageCounters::StageCounter>(name);
 }
@@ -66,7 +69,17 @@ std::unique_ptr<LiteParsedDocumentSource> LiteParsedDocumentSource::parse(
             str::stream() << "Unrecognized pipeline stage name: '" << stageName << "'",
             it != parserMap.end());
 
-    return it->second(nss, specElem);
+    return it->second.parser(nss, specElem);
+}
+
+const LiteParsedDocumentSource::LiteParserInfo& LiteParsedDocumentSource::getInfo(
+    const std::string& stageName) {
+    auto it = parserMap.find(stageName);
+    uassert(5407200,
+            str::stream() << "Unrecognized pipeline stage name: '" << stageName << "'",
+            it != parserMap.end());
+
+    return it->second;
 }
 
 const std::vector<LiteParsedPipeline>& LiteParsedDocumentSource::getSubPipelines() const {

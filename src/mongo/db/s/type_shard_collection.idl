@@ -50,6 +50,8 @@
 #      "reshardingFields": {                                // optional
 #          "uuid" : UUID,
 #          "state" : CoordinatorState<kInitialized>,
+#          // Only populated if the coordinator has encountered an error.
+#          "abortReason": BSONObj   
 #          // Only populated if this collection is the original sharded collection.
 #          "donorFields" : {
 #              "reshardingKey" : {
@@ -153,6 +155,8 @@ structs:
                 description: "Whether this collection allows chunks to move. It is required by
                               almost all DDL operations in order to guarantee that the set of
                               shards, which comprise a collection will not change.
+
+                              If the flag is not present it defaults to true.
 
                               It must be optional and not present when running in FCV 4.4, because
                               binaries prior to 5.0 use strict parsing and will fail."

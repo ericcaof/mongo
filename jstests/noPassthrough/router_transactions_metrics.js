@@ -1,6 +1,9 @@
 // Tests multi-statement transactions metrics in the serverStatus output from mongos in various
 // basic cases.
-// @tags: [uses_transactions, uses_multi_shard_transaction]
+// @tags: [
+//   uses_multi_shard_transaction,
+//   uses_transactions,
+// ]
 (function() {
 "use strict";
 

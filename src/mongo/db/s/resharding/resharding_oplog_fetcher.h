@@ -32,6 +32,7 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/client/dbclient_base.h"
+#include "mongo/db/cancelable_operation_context.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/expression_context.h"
@@ -42,27 +43,44 @@
 #include "mongo/s/client/shard.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/util/background.h"
-#include "mongo/util/cancelation.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/future.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
+
+class ReshardingMetrics;
+
 class ReshardingOplogFetcher : public resharding::OnInsertAwaitable {
 public:
-    ReshardingOplogFetcher(UUID reshardingUUID,
+    class Env {
+    public:
+        Env(ServiceContext* service, ReshardingMetrics* metrics)
+            : _service(service), _metrics(metrics) {}
+        ServiceContext* service() const {
+            return _service;
+        }
+        ReshardingMetrics* metrics() const {
+            return _metrics;
+        }
+
+    private:
+        ServiceContext* _service;
+        ReshardingMetrics* _metrics;
+    };
+
+    ReshardingOplogFetcher(std::unique_ptr<Env> env,
+                           UUID reshardingUUID,
                            UUID collUUID,
                            ReshardingDonorOplogId startAt,
                            ShardId donorShard,
                            ShardId recipientShard,
-                           bool doesDonorOwnMinKeyChunk,
                            NamespaceString toWriteInto);
 
     ~ReshardingOplogFetcher();
 
     Future<void> awaitInsert(const ReshardingDonorOplogId& lastSeen) override;
-
-    void interrupt(Status status);
 
     /**
      * Schedules a task that will do the following:
@@ -79,7 +97,8 @@ public:
      * will be rescheduled in a way that resumes where it had left off from.
      */
     ExecutorFuture<void> schedule(std::shared_ptr<executor::TaskExecutor> executor,
-                                  const CancelationToken& cancelToken);
+                                  const CancellationToken& cancelToken,
+                                  CancelableOperationContextFactory factory);
 
     /**
      * Given a shard, fetches and copies oplog entries until
@@ -90,9 +109,9 @@ public:
      * Returns true if there are more oplog entries to be copied, and returns false if the sentinel
      * finish oplog entry has been copied.
      */
-    bool consume(Client* client, Shard* shard);
+    bool consume(Client* client, CancelableOperationContextFactory factory, Shard* shard);
 
-    bool iterate(Client* client);
+    bool iterate(Client* client, CancelableOperationContextFactory factory);
 
     int getNumOplogEntriesCopied() const {
         return _numOplogEntriesCopied;
@@ -118,17 +137,26 @@ private:
     /**
      * Returns true if there's more work to do and the task should be rescheduled.
      */
-    void _ensureCollection(Client* client, const NamespaceString nss);
-    AggregateCommand _makeAggregateCommand(Client* client);
+    void _ensureCollection(Client* client,
+                           CancelableOperationContextFactory factory,
+                           const NamespaceString nss);
+    AggregateCommandRequest _makeAggregateCommandRequest(Client* client,
+                                                         CancelableOperationContextFactory factory);
     ExecutorFuture<void> _reschedule(std::shared_ptr<executor::TaskExecutor> executor,
-                                     const CancelationToken& cancelToken);
+                                     const CancellationToken& cancelToken,
+                                     CancelableOperationContextFactory factory);
+
+    ServiceContext* _service() const {
+        return _env->service();
+    }
+
+    std::unique_ptr<Env> _env;
 
     const UUID _reshardingUUID;
     const UUID _collUUID;
     ReshardingDonorOplogId _startAt;
     const ShardId _donorShard;
     const ShardId _recipientShard;
-    const bool _doesDonorOwnMinKeyChunk;
     const NamespaceString _toWriteInto;
 
     int _numOplogEntriesCopied = 0;
@@ -136,7 +164,6 @@ private:
     Mutex _mutex = MONGO_MAKE_LATCH("ReshardingOplogFetcher::_mutex");
     Promise<void> _onInsertPromise;
     Future<void> _onInsertFuture;
-    boost::optional<Status> _interruptStatus;
 
     // For testing to control behavior.
 

@@ -78,9 +78,14 @@ public:
     boost::optional<ShardKeyPattern> getReshardingKeyIfShouldForwardOps() const;
 
     /**
+     * Throws an exception if resharding fields currently exist in the collection metadata.
+     */
+    void throwIfReshardingInProgress(NamespaceString const& nss) const;
+
+    /**
      * The caller should disallow writes when
      *      1. The coordinator is in the mirroring state, OR
-     *      2. The coordinator is in the committed or renaming state, but the UUID is still the
+     *      2. The coordinator is in the decision persisted state, but the UUID is still the
      *         original UUID.
      */
     bool disallowWritesForResharding(const UUID& currentCollectionUUID) const;
@@ -165,10 +170,16 @@ public:
      */
     void toBSONBasic(BSONObjBuilder& bb) const;
 
+    BSONObj toBSON() const;
+
     /**
      * String output of the collection and shard versions.
      */
     std::string toStringBasic() const;
+
+    std::string toString() const {
+        return toStringBasic();
+    }
 
     //
     // Methods used for orphan filtering and general introspection of the chunks owned by the shard
@@ -208,6 +219,11 @@ public:
         invariant(isSharded());
         return _cm->rangeOverlapsShard(range, _thisShardId);
     }
+
+    /**
+     * Returns true if this shard has any chunks for the collection.
+     */
+    bool currentShardHasAnyChunks() const;
 
     /**
      * Given a key in the shard key range, get the next range which overlaps or is greater than

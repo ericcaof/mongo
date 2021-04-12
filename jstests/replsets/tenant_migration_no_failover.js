@@ -1,7 +1,7 @@
 /**
  * Tests a full tenant migration, assuming no failover.
  *
- * @tags: [requires_fcv_47, requires_majority_read_concern]
+ * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_windows_tls]
  */
 
 (function() {
@@ -36,7 +36,7 @@ const migrationOpts = {
 };
 
 const stateRes = assert.commandWorked(tenantMigrationTest.runMigration(migrationOpts));
-assert.eq(stateRes.state, TenantMigrationTest.State.kCommitted);
+assert.eq(stateRes.state, TenantMigrationTest.DonorState.kCommitted);
 
 for (const db of [...tenantDBs, ...nonTenantDBs]) {
     for (const coll of collNames) {

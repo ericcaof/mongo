@@ -41,16 +41,73 @@
 #include "mongo/db/exec/sbe/stages/union.h"
 #include "mongo/db/exec/sbe/stages/unwind.h"
 #include "mongo/db/matcher/matcher_type_set.h"
+#include <iterator>
+#include <numeric>
 
 namespace mongo::stage_builder {
 
+std::unique_ptr<sbe::EExpression> makeUnaryOp(sbe::EPrimUnary::Op unaryOp,
+                                              std::unique_ptr<sbe::EExpression> operand) {
+    return sbe::makeE<sbe::EPrimUnary>(unaryOp, std::move(operand));
+}
+
+std::unique_ptr<sbe::EExpression> makeNot(std::unique_ptr<sbe::EExpression> e) {
+    return makeUnaryOp(sbe::EPrimUnary::logicNot, std::move(e));
+}
+
+std::unique_ptr<sbe::EExpression> makeBinaryOp(sbe::EPrimBinary::Op binaryOp,
+                                               std::unique_ptr<sbe::EExpression> lhs,
+                                               std::unique_ptr<sbe::EExpression> rhs,
+                                               std::unique_ptr<sbe::EExpression> collator) {
+    using namespace std::literals;
+
+    if (collator && sbe::EPrimBinary::isComparisonOp(binaryOp)) {
+        return sbe::makeE<sbe::EPrimBinary>(
+            binaryOp, std::move(lhs), std::move(rhs), std::move(collator));
+    } else {
+        return sbe::makeE<sbe::EPrimBinary>(binaryOp, std::move(lhs), std::move(rhs));
+    }
+}
+
+std::unique_ptr<sbe::EExpression> makeBinaryOp(sbe::EPrimBinary::Op binaryOp,
+                                               std::unique_ptr<sbe::EExpression> lhs,
+                                               std::unique_ptr<sbe::EExpression> rhs,
+                                               sbe::RuntimeEnvironment* env) {
+    invariant(env);
+
+    auto collatorSlot = env->getSlotIfExists("collator"_sd);
+    auto collatorVar = collatorSlot ? sbe::makeE<sbe::EVariable>(*collatorSlot) : nullptr;
+
+    return makeBinaryOp(binaryOp, std::move(lhs), std::move(rhs), std::move(collatorVar));
+}
+
+std::unique_ptr<sbe::EExpression> makeIsMember(std::unique_ptr<sbe::EExpression> input,
+                                               std::unique_ptr<sbe::EExpression> arr,
+                                               std::unique_ptr<sbe::EExpression> collator) {
+    if (collator) {
+        return makeFunction("collIsMember", std::move(collator), std::move(input), std::move(arr));
+    } else {
+        return makeFunction("isMember", std::move(input), std::move(arr));
+    }
+}
+
+std::unique_ptr<sbe::EExpression> makeIsMember(std::unique_ptr<sbe::EExpression> input,
+                                               std::unique_ptr<sbe::EExpression> arr,
+                                               sbe::RuntimeEnvironment* env) {
+    invariant(env);
+
+    auto collatorSlot = env->getSlotIfExists("collator"_sd);
+    auto collatorVar = collatorSlot ? sbe::makeE<sbe::EVariable>(*collatorSlot) : nullptr;
+
+    return makeIsMember(std::move(input), std::move(arr), std::move(collatorVar));
+}
+
 std::unique_ptr<sbe::EExpression> generateNullOrMissing(const sbe::EVariable& var) {
-    return sbe::makeE<sbe::EPrimBinary>(
-        sbe::EPrimBinary::logicOr,
-        makeNot(makeFunction("exists", var.clone())),
-        sbe::makeE<sbe::ETypeMatch>(var.clone(),
-                                    getBSONTypeMask(BSONType::jstNULL) |
-                                        getBSONTypeMask(BSONType::Undefined)));
+    return makeBinaryOp(sbe::EPrimBinary::logicOr,
+                        makeNot(makeFunction("exists", var.clone())),
+                        sbe::makeE<sbe::ETypeMatch>(var.clone(),
+                                                    getBSONTypeMask(BSONType::jstNULL) |
+                                                        getBSONTypeMask(BSONType::Undefined)));
 }
 
 std::unique_ptr<sbe::EExpression> generateNullOrMissing(const sbe::FrameId frameId,
@@ -60,72 +117,71 @@ std::unique_ptr<sbe::EExpression> generateNullOrMissing(const sbe::FrameId frame
 }
 
 std::unique_ptr<sbe::EExpression> generateNonNumericCheck(const sbe::EVariable& var) {
-    return sbe::makeE<sbe::EPrimUnary>(
-        sbe::EPrimUnary::logicNot,
-        sbe::makeE<sbe::EFunction>("isNumber", sbe::makeEs(var.clone())));
+    return makeNot(makeFunction("isNumber", var.clone()));
 }
 
 std::unique_ptr<sbe::EExpression> generateLongLongMinCheck(const sbe::EVariable& var) {
-    return sbe::makeE<sbe::EPrimBinary>(
+    return makeBinaryOp(
         sbe::EPrimBinary::logicAnd,
         sbe::makeE<sbe::ETypeMatch>(var.clone(),
                                     MatcherTypeSet{BSONType::NumberLong}.getBSONTypeMask()),
-        sbe::makeE<sbe::EPrimBinary>(
-            sbe::EPrimBinary::eq,
-            var.clone(),
-            sbe::makeE<sbe::EConstant>(
-                sbe::value::TypeTags::NumberInt64,
-                sbe::value::bitcastFrom<int64_t>(std::numeric_limits<int64_t>::min()))));
+        makeBinaryOp(sbe::EPrimBinary::eq,
+                     var.clone(),
+                     sbe::makeE<sbe::EConstant>(
+                         sbe::value::TypeTags::NumberInt64,
+                         sbe::value::bitcastFrom<int64_t>(std::numeric_limits<int64_t>::min()))));
 }
 
 std::unique_ptr<sbe::EExpression> generateNaNCheck(const sbe::EVariable& var) {
-    return sbe::makeE<sbe::EFunction>("isNaN", sbe::makeEs(var.clone()));
+    return makeFunction("isNaN", var.clone());
 }
 
 std::unique_ptr<sbe::EExpression> generateNonPositiveCheck(const sbe::EVariable& var) {
-    return sbe::makeE<sbe::EPrimBinary>(
-        sbe::EPrimBinary::EPrimBinary::lessEq,
-        var.clone(),
-        sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
-                                   sbe::value::bitcastFrom<int32_t>(0)));
+    return makeBinaryOp(sbe::EPrimBinary::EPrimBinary::lessEq,
+                        var.clone(),
+                        sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
+                                                   sbe::value::bitcastFrom<int32_t>(0)));
 }
 
 std::unique_ptr<sbe::EExpression> generateNegativeCheck(const sbe::EVariable& var) {
-    return sbe::makeE<sbe::EPrimBinary>(
-        sbe::EPrimBinary::EPrimBinary::less,
-        var.clone(),
-        sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
-                                   sbe::value::bitcastFrom<int32_t>(0)));
+    return makeBinaryOp(sbe::EPrimBinary::EPrimBinary::less,
+                        var.clone(),
+                        sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
+                                                   sbe::value::bitcastFrom<int32_t>(0)));
 }
 
 std::unique_ptr<sbe::EExpression> generateNonObjectCheck(const sbe::EVariable& var) {
-    return sbe::makeE<sbe::EPrimUnary>(
-        sbe::EPrimUnary::logicNot,
-        sbe::makeE<sbe::EFunction>("isObject", sbe::makeEs(var.clone())));
+    return makeNot(makeFunction("isObject", var.clone()));
 }
 
 std::unique_ptr<sbe::EExpression> generateNonStringCheck(const sbe::EVariable& var) {
-    return sbe::makeE<sbe::EPrimUnary>(
-        sbe::EPrimUnary::logicNot,
-        sbe::makeE<sbe::EFunction>("isString", sbe::makeEs(var.clone())));
+    return makeNot(makeFunction("isString", var.clone()));
 }
 
 std::unique_ptr<sbe::EExpression> generateNullishOrNotRepresentableInt32Check(
     const sbe::EVariable& var) {
     auto numericConvert32 =
         sbe::makeE<sbe::ENumericConvert>(var.clone(), sbe::value::TypeTags::NumberInt32);
-    return sbe::makeE<sbe::EPrimBinary>(
-        sbe::EPrimBinary::logicOr,
-        generateNullOrMissing(var),
-        sbe::makeE<sbe::EPrimUnary>(
-            sbe::EPrimUnary::logicNot,
-            sbe::makeE<sbe::EFunction>("exists", sbe::makeEs(std::move(numericConvert32)))));
+    return makeBinaryOp(sbe::EPrimBinary::logicOr,
+                        generateNullOrMissing(var),
+                        makeNot(makeFunction("exists", std::move(numericConvert32))));
 }
 
 template <>
 std::unique_ptr<sbe::EExpression> buildMultiBranchConditional(
     std::unique_ptr<sbe::EExpression> defaultCase) {
     return defaultCase;
+}
+
+std::unique_ptr<sbe::EExpression> buildMultiBranchConditionalFromCaseValuePairs(
+    std::vector<CaseValuePair> caseValuePairs, std::unique_ptr<sbe::EExpression> defaultValue) {
+    return std::accumulate(
+        std::make_reverse_iterator(std::make_move_iterator(caseValuePairs.end())),
+        std::make_reverse_iterator(std::make_move_iterator(caseValuePairs.begin())),
+        std::move(defaultValue),
+        [](auto&& expression, auto&& caseValuePair) {
+            return buildMultiBranchConditional(std::move(caseValuePair), std::move(expression));
+        });
 }
 
 std::unique_ptr<sbe::PlanStage> makeLimitTree(std::unique_ptr<sbe::PlanStage> inputStage,
@@ -139,33 +195,41 @@ std::unique_ptr<sbe::PlanStage> makeLimitCoScanTree(PlanNodeId planNodeId, long 
         sbe::makeS<sbe::CoScanStage>(planNodeId), limit, boost::none, planNodeId);
 }
 
-std::unique_ptr<sbe::EExpression> makeNot(std::unique_ptr<sbe::EExpression> e) {
-    return sbe::makeE<sbe::EPrimUnary>(sbe::EPrimUnary::logicNot, std::move(e));
-}
-
 std::unique_ptr<sbe::EExpression> makeFillEmptyFalse(std::unique_ptr<sbe::EExpression> e) {
     using namespace std::literals;
-    return sbe::makeE<sbe::EFunction>(
-        "fillEmpty"sv,
-        sbe::makeEs(std::move(e),
-                    sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Boolean,
-                                               sbe::value::bitcastFrom<bool>(false))));
+    return makeFunction("fillEmpty"_sd,
+                        std::move(e),
+                        sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Boolean,
+                                                   sbe::value::bitcastFrom<bool>(false)));
+}
+
+std::unique_ptr<sbe::EExpression> makeVariable(sbe::value::SlotId slotId) {
+    return sbe::makeE<sbe::EVariable>(slotId);
+}
+
+std::unique_ptr<sbe::EExpression> makeVariable(sbe::FrameId frameId, sbe::value::SlotId slotId) {
+    return sbe::makeE<sbe::EVariable>(frameId, slotId);
 }
 
 std::unique_ptr<sbe::EExpression> makeFillEmptyNull(std::unique_ptr<sbe::EExpression> e) {
     using namespace std::literals;
-    return sbe::makeE<sbe::EFunction>(
-        "fillEmpty"sv,
-        sbe::makeEs(std::move(e), sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0)));
+    return makeFunction(
+        "fillEmpty"_sd, std::move(e), sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0));
+}
+
+std::unique_ptr<sbe::EExpression> makeFillEmptyUndefined(std::unique_ptr<sbe::EExpression> e) {
+    using namespace std::literals;
+    return makeFunction("fillEmpty"_sd,
+                        std::move(e),
+                        sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::bsonUndefined, 0));
 }
 
 std::unique_ptr<sbe::EExpression> makeNothingArrayCheck(
     std::unique_ptr<sbe::EExpression> isArrayInput, std::unique_ptr<sbe::EExpression> otherwise) {
     using namespace std::literals;
-    return sbe::makeE<sbe::EIf>(
-        sbe::makeE<sbe::EFunction>("isArray"sv, sbe::makeEs(std::move(isArrayInput))),
-        sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Nothing, 0),
-        std::move(otherwise));
+    return sbe::makeE<sbe::EIf>(makeFunction("isArray"_sd, std::move(isArrayInput)),
+                                sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Nothing, 0),
+                                std::move(otherwise));
 }
 
 std::unique_ptr<sbe::EExpression> generateShardKeyBinding(
@@ -173,16 +237,11 @@ std::unique_ptr<sbe::EExpression> generateShardKeyBinding(
     sbe::value::FrameIdGenerator& frameIdGenerator,
     std::unique_ptr<sbe::EExpression> inputExpr,
     int level) {
-    using namespace std::literals;
     invariant(level >= 0);
 
     auto makeGetFieldKeyPattern = [&](std::unique_ptr<sbe::EExpression> slot) {
-        return makeFillEmptyNull(sbe::makeE<sbe::EFunction>(
-            "getField"sv,
-            sbe::makeEs(std::move(slot), sbe::makeE<sbe::EConstant>([&]() {
-                            const auto fieldName = keyPatternField[level];
-                            return std::string_view{fieldName.rawData(), fieldName.size()};
-                        }()))));
+        return makeFillEmptyNull(makeFunction(
+            "getField"_sd, std::move(slot), sbe::makeE<sbe::EConstant>(keyPatternField[level])));
     };
 
     if (level == keyPatternField.numParts() - 1) {
@@ -329,6 +388,29 @@ EvalStage makeTraverse(EvalStage outer,
             std::move(outSlots)};
 }
 
+EvalStage makeLimitSkip(EvalStage input,
+                        PlanNodeId planNodeId,
+                        boost::optional<long long> limit,
+                        boost::optional<long long> skip) {
+    return EvalStage{
+        sbe::makeS<sbe::LimitSkipStage>(std::move(input.stage), limit, skip, planNodeId),
+        std::move(input.outSlots)};
+}
+
+EvalStage makeUnion(std::vector<EvalStage> inputStages,
+                    std::vector<sbe::value::SlotVector> inputVals,
+                    sbe::value::SlotVector outputVals,
+                    PlanNodeId planNodeId) {
+    std::vector<std::unique_ptr<sbe::PlanStage>> branches;
+    branches.reserve(inputStages.size());
+    for (auto& inputStage : inputStages) {
+        branches.emplace_back(std::move(inputStage.stage));
+    }
+    return EvalStage{sbe::makeS<sbe::UnionStage>(
+                         std::move(branches), std::move(inputVals), outputVals, planNodeId),
+                     outputVals};
+}
+
 EvalExprStagePair generateUnion(std::vector<EvalExprStagePair> branches,
                                 BranchFn branchFn,
                                 PlanNodeId planNodeId,
@@ -376,8 +458,18 @@ EvalExprStagePair generateSingleResultUnion(std::vector<EvalExprStagePair> branc
 EvalExprStagePair generateShortCircuitingLogicalOp(sbe::EPrimBinary::Op logicOp,
                                                    std::vector<EvalExprStagePair> branches,
                                                    PlanNodeId planNodeId,
-                                                   sbe::value::SlotIdGenerator* slotIdGenerator) {
+                                                   sbe::value::SlotIdGenerator* slotIdGenerator,
+                                                   const FilterStateHelper& stateHelper) {
     invariant(logicOp == sbe::EPrimBinary::logicAnd || logicOp == sbe::EPrimBinary::logicOr);
+
+    if (!branches.empty() && logicOp == sbe::EPrimBinary::logicOr) {
+        // OR does not support index tracking, so we must ensure that state from the last branch
+        // holds only boolean value.
+        // NOTE: There is no technical reason for that. We could support index tracking for OR
+        // expression, but this would differ from the existing behaviour.
+        auto& [expr, _] = branches.back();
+        expr = stateHelper.makeState(stateHelper.getBool(expr.extractExpr()));
+    }
 
     // For AND and OR, if 'branches' only has one element, we can just return branches[0].
     if (branches.size() == 1) {
@@ -391,28 +483,28 @@ EvalExprStagePair generateShortCircuitingLogicalOp(sbe::EPrimBinary::Op logicOp,
     // be evaluated. In other words, the evaluation process will "short-circuit". If a branch's
     // filter condition is false, the branch will not produce a value and the evaluation process
     // will continue. The last branch doesn't have a FilterStage and will always produce a value.
-    auto branchFn = [logicOp](EvalExpr expr,
-                              EvalStage stage,
-                              PlanNodeId planNodeId,
-                              sbe::value::SlotIdGenerator* slotIdGenerator) {
+    auto branchFn = [logicOp, &stateHelper](EvalExpr expr,
+                                            EvalStage stage,
+                                            PlanNodeId planNodeId,
+                                            sbe::value::SlotIdGenerator* slotIdGenerator) {
         // Create a FilterStage for each branch (except the last one). If a branch's filter
         // condition is true, it will "short-circuit" the evaluation process. For AND, short-
         // circuiting should happen if an operand evalautes to false. For OR, short-circuiting
         // should happen if an operand evaluates to true.
-        auto filterExpr = (logicOp == sbe::EPrimBinary::logicAnd) ? makeNot(expr.extractExpr())
-                                                                  : expr.extractExpr();
-
-        stage = makeFilter<false>(std::move(stage), std::move(filterExpr), planNodeId);
-
         // Set up an output value to be returned if short-circuiting occurs. For AND, when
         // short-circuiting occurs, the output returned should be false. For OR, when short-
         // circuiting occurs, the output returned should be true.
-        auto shortCircuitVal = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Boolean,
-                                                          (logicOp == sbe::EPrimBinary::logicOr));
-        auto slot = slotIdGenerator->generate();
-        auto resultStage =
-            makeProject(std::move(stage), planNodeId, slot, std::move(shortCircuitVal));
-        return std::make_pair(slot, std::move(resultStage));
+        auto filterExpr = stateHelper.getBool(expr.extractExpr());
+        if (logicOp == sbe::EPrimBinary::logicAnd) {
+            filterExpr = makeNot(std::move(filterExpr));
+        }
+        stage = makeFilter<false>(std::move(stage), std::move(filterExpr), planNodeId);
+
+        auto resultSlot = slotIdGenerator->generate();
+        auto resultValue = stateHelper.makeState(logicOp == sbe::EPrimBinary::logicOr);
+        stage = makeProject(std::move(stage), planNodeId, resultSlot, std::move(resultValue));
+
+        return std::make_pair(resultSlot, std::move(stage));
     };
 
     return generateSingleResultUnion(std::move(branches), branchFn, planNodeId, slotIdGenerator);
@@ -467,11 +559,10 @@ std::pair<sbe::value::SlotVector, std::unique_ptr<sbe::PlanStage>> generateVirtu
         projectSlots.emplace_back(slotIdGenerator->generate());
         projections.emplace(
             projectSlots.back(),
-            sbe::makeE<sbe::EFunction>(
-                "getElement"sv,
-                sbe::makeEs(sbe::makeE<sbe::EVariable>(scanSlot),
-                            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
-                                                       sbe::value::bitcastFrom<int32_t>(i)))));
+            makeFunction("getElement"_sd,
+                         sbe::makeE<sbe::EVariable>(scanSlot),
+                         sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
+                                                    sbe::value::bitcastFrom<int32_t>(i))));
     }
 
     return {std::move(projectSlots),
@@ -480,10 +571,8 @@ std::pair<sbe::value::SlotVector, std::unique_ptr<sbe::PlanStage>> generateVirtu
 }
 
 std::pair<sbe::value::TypeTags, sbe::value::Value> makeValue(const BSONArray& ba) {
-    int numBytes = ba.objsize();
-    uint8_t* data = new uint8_t[numBytes];
-    memcpy(data, reinterpret_cast<const uint8_t*>(ba.objdata()), numBytes);
-    return {sbe::value::TypeTags::bsonArray, sbe::value::bitcastFrom<uint8_t*>(data)};
+    return sbe::value::copyValue(sbe::value::TypeTags::bsonArray,
+                                 sbe::value::bitcastFrom<const char*>(ba.objdata()));
 }
 
 uint32_t dateTypeMask() {
@@ -491,5 +580,91 @@ uint32_t dateTypeMask() {
             getBSONTypeMask(sbe::value::TypeTags::Timestamp) |
             getBSONTypeMask(sbe::value::TypeTags::ObjectId) |
             getBSONTypeMask(sbe::value::TypeTags::bsonObjectId));
+}
+
+EvalStage IndexStateHelper::makeTraverseCombinator(
+    EvalStage outer,
+    EvalStage inner,
+    sbe::value::SlotId inputSlot,
+    sbe::value::SlotId outputSlot,
+    sbe::value::SlotId innerOutputSlot,
+    PlanNodeId planNodeId,
+    sbe::value::FrameIdGenerator* frameIdGenerator) const {
+    // Fold expression is executed only when array has more then 1 element. It increments index
+    // value on each iteration. During this process index is paired with false value. Once the
+    // predicate evaluates to true, false value of index is changed to true. Final expression of
+    // traverse stage detects that now index is paired with true value and it means that we have
+    // found an index of array element where predicate evaluates to true.
+    //
+    // First step is to increment index. Fold expression is always executed when index stored in
+    // 'outputSlot' is encoded as a false value. This means that to increment index, we should
+    // subtract 1 from it.
+    auto frameId = frameIdGenerator->generate();
+    auto advancedIndex = sbe::makeE<sbe::EPrimBinary>(
+        sbe::EPrimBinary::sub, sbe::makeE<sbe::EVariable>(outputSlot), makeConstant(ValueType, 1));
+    auto binds = sbe::makeEs(std::move(advancedIndex));
+    sbe::EVariable advancedIndexVar{frameId, 0};
+
+    // In case the predicate in the inner branch of traverse returns true, we want pair
+    // incremented index with true value. This will tell final expression of traverse that we
+    // have found a matching element and iteration can be stopped.
+    // The expression below express the following function: f(x) = abs(x) - 1. This function
+    // converts false value to a true value because f(- index - 2) = index + 1 (take a look at
+    // the comment for the 'IndexStateHelper' class for encoding description).
+    auto indexWithTrueValue =
+        sbe::makeE<sbe::EPrimBinary>(sbe::EPrimBinary::sub,
+                                     makeFunction("abs", advancedIndexVar.clone()),
+                                     makeConstant(ValueType, 1));
+
+    // Finally, we check if the predicate in the inner branch returned true. If that's the case,
+    // we pair incremented index with true value. Otherwise, it stays paired with false value.
+    auto foldExpr = sbe::makeE<sbe::EIf>(FilterStateHelper::getBool(innerOutputSlot),
+                                         std::move(indexWithTrueValue),
+                                         advancedIndexVar.clone());
+
+    foldExpr = sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(foldExpr));
+
+    return makeTraverse(std::move(outer),
+                        std::move(inner),
+                        inputSlot,
+                        outputSlot,
+                        innerOutputSlot,
+                        std::move(foldExpr),
+                        FilterStateHelper::getBool(outputSlot),
+                        planNodeId,
+                        1);
+}
+
+std::unique_ptr<FilterStateHelper> makeFilterStateHelper(bool trackIndex) {
+    if (trackIndex) {
+        return std::make_unique<IndexStateHelper>();
+    }
+    return std::make_unique<BooleanStateHelper>();
+}
+
+sbe::value::SlotVector makeIndexKeyOutputSlotsMatchingParentReqs(
+    const BSONObj& indexKeyPattern,
+    sbe::IndexKeysInclusionSet parentIndexKeyReqs,
+    sbe::IndexKeysInclusionSet childIndexKeyReqs,
+    sbe::value::SlotVector childOutputSlots) {
+    tassert(5308000,
+            "'childIndexKeyReqs' had fewer bits set than 'parentIndexKeyReqs'",
+            parentIndexKeyReqs.count() <= childIndexKeyReqs.count());
+    sbe::value::SlotVector newIndexKeySlots;
+
+    size_t slotIdx = 0;
+    for (size_t indexFieldNumber = 0;
+         indexFieldNumber < static_cast<size_t>(indexKeyPattern.nFields());
+         ++indexFieldNumber) {
+        if (parentIndexKeyReqs.test(indexFieldNumber)) {
+            newIndexKeySlots.push_back(childOutputSlots[slotIdx]);
+        }
+
+        if (childIndexKeyReqs.test(indexFieldNumber)) {
+            ++slotIdx;
+        }
+    }
+
+    return newIndexKeySlots;
 }
 }  // namespace mongo::stage_builder

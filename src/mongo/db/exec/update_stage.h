@@ -114,6 +114,9 @@ protected:
 
     void _assertPathsNotArray(const mutablebson::Document& document, const FieldRefSet& paths);
 
+    void _checkRestrictionsOnUpdatingShardKeyAreNotViolated(
+        const ScopedCollectionDescription& collDesc, const FieldRefSet& shardKeyPaths);
+
     UpdateStageParams _params;
 
     // Not owned by us.
@@ -171,7 +174,8 @@ private:
                                     const BSONObj& newObj,
                                     const Snapshotted<BSONObj>& oldObj);
 
-    bool wasReshardingKeyUpdated(const ScopedCollectionDescription& collDesc,
+    bool wasReshardingKeyUpdated(CollectionShardingState* css,
+                                 const ScopedCollectionDescription& collDesc,
                                  const BSONObj& newObj,
                                  const Snapshotted<BSONObj>& oldObj);
 

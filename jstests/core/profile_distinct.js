@@ -1,7 +1,6 @@
 // @tags: [
 //   does_not_support_stepdowns,
-//   requires_profiling,
-//   sbe_incompatible,
+//   requires_profiling
 // ]
 
 // Confirms that profiled distinct execution contains all expected metrics with proper values.

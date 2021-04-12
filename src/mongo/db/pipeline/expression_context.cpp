@@ -31,6 +31,7 @@
 
 #include <utility>
 
+#include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/process_interface/stub_mongo_process_interface.h"
 #include "mongo/db/query/collation/collation_spec.h"
@@ -46,7 +47,7 @@ ExpressionContext::ResolvedNamespace::ResolvedNamespace(NamespaceString ns,
     : ns(std::move(ns)), pipeline(std::move(pipeline)) {}
 
 ExpressionContext::ExpressionContext(OperationContext* opCtx,
-                                     const AggregateCommand& request,
+                                     const AggregateCommandRequest& request,
                                      std::unique_ptr<CollatorInterface> collator,
                                      std::shared_ptr<MongoProcessInterface> processInterface,
                                      StringMap<ResolvedNamespace> resolvedNamespaces,
@@ -125,8 +126,6 @@ ExpressionContext::ExpressionContext(
     }
     if (letParameters)
         variables.seedVariablesWithLetParameters(this, *letParameters);
-    if (opCtx)
-        apiParameters = APIParameters::get(opCtx);
 }
 
 ExpressionContext::ExpressionContext(
@@ -214,6 +213,8 @@ intrusive_ptr<ExpressionContext> ExpressionContext::copyWith(
 
     expCtx->variables = variables;
     expCtx->variablesParseState = variablesParseState.copyWith(expCtx->variables.useIdGenerator());
+    expCtx->exprUnstableForApiV1 = exprUnstableForApiV1;
+    expCtx->exprDeprectedForApiV1 = exprDeprectedForApiV1;
 
     // Note that we intentionally skip copying the value of '_interruptCounter' because 'expCtx' is
     // intended to be used for executing a separate aggregation pipeline.

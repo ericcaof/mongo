@@ -31,9 +31,12 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/find_and_modify_common.h"
 #include "mongo/db/commands/update_metrics.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
@@ -43,6 +46,7 @@
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/s/cluster_ddl.h"
 #include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/commands/document_shard_key_update_util.h"
 #include "mongo/s/commands/strategy.h"
@@ -52,7 +56,6 @@
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/s/would_change_owning_shard_exception.h"
-#include "mongo/s/write_ops/cluster_write.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -171,7 +174,7 @@ public:
     FindAndModifyCmd()
         : BasicCommand("findAndModify", "findandmodify"), _updateMetrics{"findAndModify"} {}
 
-    const std::set<std::string>& apiVersions() const {
+    const std::set<std::string>& apiVersions() const override {
         return kApiVersions1;
     }
 
@@ -188,7 +191,7 @@ public:
     }
 
     ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
-                                                 repl::ReadConcernLevel level) const final {
+                                                 repl::ReadConcernLevel level) const override {
         return {{level != repl::ReadConcernLevel::kLocalReadConcern &&
                      level != repl::ReadConcernLevel::kSnapshotReadConcern,
                  {ErrorCodes::InvalidOptions, "read concern not supported"}},
@@ -198,7 +201,31 @@ public:
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
                                std::vector<Privilege>* out) const override {
-        find_and_modify::addPrivilegesRequiredForFindAndModify(this, dbname, cmdObj, out);
+        bool update = cmdObj["update"].trueValue();
+        bool upsert = cmdObj["upsert"].trueValue();
+        bool remove = cmdObj["remove"].trueValue();
+
+        ActionSet actions;
+        actions.addAction(ActionType::find);
+        if (update) {
+            actions.addAction(ActionType::update);
+        }
+        if (upsert) {
+            actions.addAction(ActionType::insert);
+        }
+        if (remove) {
+            actions.addAction(ActionType::remove);
+        }
+        if (shouldBypassDocumentValidationForCommand(cmdObj)) {
+            actions.addAction(ActionType::bypassDocumentValidation);
+        }
+
+        std::string ns = CommandHelpers::parseNsFromCommand(dbname, cmdObj);
+        ResourcePattern resource(CommandHelpers::resourcePatternForNamespace(ns));
+        uassert(17137,
+                "Invalid target namespace " + resource.toString(),
+                resource.isExactNamespacePattern());
+        out->push_back(Privilege(resource, actions));
     }
 
     Status explain(OperationContext* opCtx,
@@ -213,7 +240,6 @@ public:
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
 
         std::shared_ptr<Shard> shard;
-
         if (cm.isSharded()) {
             const BSONObj query = cmdObj.getObjectField("query");
             const BSONObj collation = getCollation(cmdObj);
@@ -248,7 +274,7 @@ public:
         } else {
             _runCommand(opCtx,
                         shard->getId(),
-                        ChunkVersion::UNSHARDED(),
+                        boost::make_optional(!cm.dbVersion().isFixed(), ChunkVersion::UNSHARDED()),
                         cm.dbVersion(),
                         nss,
                         applyReadWriteConcern(opCtx, false, false, explainCmd),
@@ -282,41 +308,40 @@ public:
         // Collect metrics.
         _updateMetrics.collectMetrics(cmdObj);
 
-        // findAndModify should only be creating database if upsert is true, but this would require
-        // that the parsing be pulled into this function.
-        createShardDatabase(opCtx, nss.db());
+        // Technically, findAndModify should only be creating database if upsert is true, but this
+        // would require that the parsing be pulled into this function.
+        cluster::createDatabase(opCtx, nss.db());
 
         // Append mongoS' runtime constants to the command object before forwarding it to the shard.
         auto cmdObjForShard = appendLegacyRuntimeConstantsToCommandObject(opCtx, cmdObj);
 
         const auto cm = uassertStatusOK(getCollectionRoutingInfoForTxnCmd(opCtx, nss));
-        if (!cm.isSharded()) {
+        if (cm.isSharded()) {
+            const BSONObj query = cmdObjForShard.getObjectField("query");
+            const BSONObj collation = getCollation(cmdObjForShard);
+            const auto let = getLet(cmdObjForShard);
+            const auto rc = getLegacyRuntimeConstants(cmdObjForShard);
+            const BSONObj shardKey =
+                getShardKey(opCtx, cm, nss, query, collation, boost::none, let, rc);
+
+            auto chunk = cm.findIntersectingChunk(shardKey, collation);
+
+            _runCommand(opCtx,
+                        chunk.getShardId(),
+                        cm.getVersion(chunk.getShardId()),
+                        boost::none,
+                        nss,
+                        applyReadWriteConcern(opCtx, this, cmdObjForShard),
+                        &result);
+        } else {
             _runCommand(opCtx,
                         cm.dbPrimary(),
-                        ChunkVersion::UNSHARDED(),
+                        boost::make_optional(!cm.dbVersion().isFixed(), ChunkVersion::UNSHARDED()),
                         cm.dbVersion(),
                         nss,
                         applyReadWriteConcern(opCtx, this, cmdObjForShard),
                         &result);
-            return true;
         }
-
-        const BSONObj query = cmdObjForShard.getObjectField("query");
-        const BSONObj collation = getCollation(cmdObjForShard);
-        const auto let = getLet(cmdObjForShard);
-        const auto rc = getLegacyRuntimeConstants(cmdObjForShard);
-        const BSONObj shardKey =
-            getShardKey(opCtx, cm, nss, query, collation, boost::none, let, rc);
-
-        auto chunk = cm.findIntersectingChunk(shardKey, collation);
-
-        _runCommand(opCtx,
-                    chunk.getShardId(),
-                    cm.getVersion(chunk.getShardId()),
-                    boost::none,
-                    nss,
-                    applyReadWriteConcern(opCtx, this, cmdObjForShard),
-                    &result);
 
         return true;
     }
@@ -324,8 +349,8 @@ public:
 private:
     static void _runCommand(OperationContext* opCtx,
                             const ShardId& shardId,
-                            const ChunkVersion& shardVersion,
-                            boost::optional<DatabaseVersion> dbVersion,
+                            const boost::optional<ChunkVersion>& shardVersion,
+                            const boost::optional<DatabaseVersion>& dbVersion,
                             const NamespaceString& nss,
                             const BSONObj& cmdObj,
                             BSONObjBuilder* result) {
@@ -337,7 +362,10 @@ private:
             if (dbVersion) {
                 cmdObjWithVersions = appendDbVersionIfPresent(cmdObjWithVersions, *dbVersion);
             }
-            requests.emplace_back(shardId, appendShardVersion(cmdObjWithVersions, shardVersion));
+            if (shardVersion) {
+                cmdObjWithVersions = appendShardVersion(cmdObjWithVersions, *shardVersion);
+            }
+            requests.emplace_back(shardId, cmdObjWithVersions);
 
             MultiStatementTransactionRequestsSender ars(
                 opCtx,

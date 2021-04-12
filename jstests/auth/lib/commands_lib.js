@@ -195,6 +195,35 @@ var authCommandsLib = {
     /************* TEST CASES ****************/
 
     tests: [
+      {
+        testname: "abortReshardCollection",
+        command: {abortReshardCollection: "test.x"},
+        skipUnlessSharded: true,
+        testcases: [
+            {
+              runOnDb: adminDbName,
+              roles: Object.extend({enableSharding: 1}, roles_clusterManager),
+              privileges:
+              [{resource: {db: "test", collection: "x"}, actions: ["reshardCollection"]}],
+                expectFail: true
+            },
+        ]
+      },
+      {
+        testname: "_configsvrAbortReshardCollection",
+        command: {_configsvrAbortReshardCollection: "test.x"},
+        skipSharded: true,
+        testcases: [
+            {
+              runOnDb: adminDbName,
+              roles: {__system: 1},
+              privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+              expectFail: true
+            },
+            {runOnDb: firstDbName, roles: {}},
+            {runOnDb: secondDbName, roles: {}}
+        ]
+      },
         {
           testname: "abortTxn",
           command: {abortTransaction: 1},
@@ -213,7 +242,7 @@ var authCommandsLib = {
           command: {
               _addShard: 1,
               shardIdentity: {
-                  shardName: "shard0000",
+                  shardName: shard0name,
                   clusterId: ObjectId('5b2031806195dffd744258ee'),
                   configsvrConnectionString: "foobarbaz/host:20022,host:20023,host:20024"
               }
@@ -301,6 +330,7 @@ var authCommandsLib = {
                       actions: ["appendOplogNote"],
                       removeWhenTestingAuthzFailure: false
                     },
+                    {resource: {cluster: true}, actions: ["applyOps"]},
                 ],
               },
           ]
@@ -324,17 +354,13 @@ var authCommandsLib = {
               {
                 runOnDb: adminDbName,
                 roles: {
-                    readWrite: 1,
-                    dbAdmin: 1,
-                    dbOwner: 1,
-                    readWriteAnyDatabase: 1,
                     dbAdminAnyDatabase: 1,
                     root: 1,
-                    restore: 1,
                     __system: 1
                 },
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["createCollection"]},
+                    {resource: {cluster: true}, actions: ["applyOps"]},
                 ]
               },
           ]
@@ -359,10 +385,10 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: {root: 1, restore: 1, __system: 1},
+                roles: {__system: 1, root: 1},
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["createCollection"]},
-                    {resource: {cluster: true}, actions: ["useUUID", "forceUUID"]}
+                    {resource: {cluster: true}, actions: ["useUUID", "forceUUID", "applyOps"]},
                 ]
               },
           ]
@@ -389,7 +415,7 @@ var authCommandsLib = {
               privileges: [
                   {resource: {db: firstDbName, collection: "x"}, actions: ["createCollection"]},
                   // Do not have forceUUID.
-                  {resource: {cluster: true}, actions: ["useUUID"]}
+                  {resource: {cluster: true}, actions: ["useUUID", "applyOps"]},
               ]
           }]
         },
@@ -415,17 +441,13 @@ var authCommandsLib = {
               {
                 runOnDb: adminDbName,
                 roles: {
-                    readWrite: 1,
-                    dbAdmin: 1,
-                    dbOwner: 1,
-                    readWriteAnyDatabase: 1,
                     dbAdminAnyDatabase: 1,
                     root: 1,
-                    restore: 1,
                     __system: 1
                 },
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["dropCollection"]},
+                    {resource: {cluster: true}, actions: ["applyOps"]},
                 ]
               },
           ]
@@ -460,10 +482,10 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: {root: 1, restore: 1, __system: 1},
+                roles: {__system: 1, root: 1},
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["dropCollection"]},
-                    {resource: {cluster: true}, actions: ["useUUID"]}
+                    {resource: {cluster: true}, actions: ["useUUID", "applyOps"]},
                 ]
               },
           ]
@@ -500,7 +522,8 @@ var authCommandsLib = {
                 expectAuthzFailure: true,
                 runOnDb: adminDbName,
                 privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["dropCollection"]}
+                    {resource: {db: firstDbName, collection: "x"}, actions: ["dropCollection"]},
+                    {resource: {cluster: true}, actions: ["applyOps"]},
                     // don't have useUUID privilege.
                 ]
               },
@@ -514,13 +537,13 @@ var authCommandsLib = {
               {
                 runOnDb: adminDbName,
                 privileges: [
-                    {resource: {cluster: true}, actions: ["appendOplogNote"]},
+                    {resource: {cluster: true}, actions: ["appendOplogNote", "applyOps"]},
                 ],
               },
               {
                 runOnDb: firstDbName,
                 privileges: [
-                    {resource: {cluster: true}, actions: ["appendOplogNote"]},
+                    {resource: {cluster: true}, actions: ["appendOplogNote", "applyOps"]},
                 ],
                 expectFailure: true
               }
@@ -551,7 +574,7 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: {readWriteAnyDatabase: 1, root: 1, __system: 1},
+                roles: {__system: 1, root: 1},
                 privileges: [
                     {
                       resource: {db: firstDbName, collection: "x"},
@@ -560,7 +583,8 @@ var authCommandsLib = {
                     {
                       resource: {db: secondDbName, collection: "y"},
                       actions: ["insert", "createIndex"]
-                    }
+                    },
+                    {resource: {cluster: true}, actions: ["applyOps"]},
                 ]
               },
           ]
@@ -584,9 +608,10 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: roles_write,
+                roles: {__system: 1, root: 1},
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["insert"]},
+                    {resource: {cluster: true}, actions: ["applyOps"]},
                 ],
               },
           ]
@@ -619,10 +644,10 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: {root: 1, restore: 1, __system: 1},
+                roles: {__system: 1, root: 1},
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["insert"]},
-                    {resource: {cluster: true}, actions: ["useUUID"]}
+                    {resource: {cluster: true}, actions: ["useUUID", "applyOps"]},
                 ],
               },
           ]
@@ -659,10 +684,10 @@ var authCommandsLib = {
                 // failure.
                 expectFail: true,
                 runOnDb: adminDbName,
-                roles: {root: 1, restore: 1, __system: 1},
+                roles: {__system: 1, root: 1},
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["insert"]},
-                    {resource: {cluster: true}, actions: ["useUUID"]}
+                    {resource: {cluster: true}, actions: ["useUUID", "applyOps"]},
                 ],
               },
           ]
@@ -698,6 +723,7 @@ var authCommandsLib = {
                 runOnDb: adminDbName,
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["insert"]},
+                    {resource: {cluster: true}, actions: ["applyOps"]},
                     // Don't have useUUID privilege.
                 ],
               },
@@ -739,7 +765,7 @@ var authCommandsLib = {
                 runOnDb: adminDbName,
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["insert"]},
-                    {resource: {cluster: true}, actions: ["useUUID", "forceUUID"]}
+                    {resource: {cluster: true}, actions: ["useUUID", "forceUUID", "applyOps"]},
                     // Require universal privilege set.
                 ],
               },
@@ -779,7 +805,7 @@ var authCommandsLib = {
                       actions: ["createCollection", "insert"]
                     },
                     {resource: {db: firstDbName, collection: "y"}, actions: ["createCollection"]},
-                    {resource: {cluster: true}, actions: ["useUUID", "forceUUID"]}
+                    {resource: {cluster: true}, actions: ["useUUID", "forceUUID", "applyOps"]},
                 ],
               },
           ]
@@ -819,7 +845,7 @@ var authCommandsLib = {
                       resource: {db: firstDbName, collection: "y"},
                       actions: ["createCollection", "insert"]
                     },
-                    {resource: {cluster: true}, actions: ["useUUID", "forceUUID"]}
+                    {resource: {cluster: true}, actions: ["useUUID", "forceUUID", "applyOps"]},
                 ],
               },
           ]
@@ -844,9 +870,10 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: Object.merge(roles_write, {restore: 0}, true),
+                roles: {__system: 1, root: 1},
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["update", "insert"]},
+                    {resource: {cluster: true}, actions: ["applyOps"]},
                 ],
               },
           ]
@@ -872,9 +899,10 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: Object.merge(roles_write, {restore: 0}, true),
+                roles: {__system: 1, root: 1},
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["update"]},
+                    {resource: {cluster: true}, actions: ["applyOps"]},
                 ],
               },
           ]
@@ -909,10 +937,10 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: {root: 1, __system: 1},
+                roles: {__system: 1, root: 1},
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["update"]},
-                    {resource: {cluster: true}, actions: ["useUUID"]}
+                    {resource: {cluster: true}, actions: ["useUUID", "applyOps"]},
                 ],
               },
           ]
@@ -950,6 +978,7 @@ var authCommandsLib = {
                 runOnDb: adminDbName,
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["update"]},
+                    {resource: {cluster: true}, actions: ["applyOps"]},
                 ],
               },
           ]
@@ -967,9 +996,10 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: Object.merge(roles_write, {restore: 0}, true),
+                roles: {__system: 1, root: 1},
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["remove"]},
+                    {resource: {cluster: true}, actions: ["applyOps"]},
                 ],
               },
           ]
@@ -2178,6 +2208,50 @@ var authCommandsLib = {
           ]
         },
         {
+          testname: "cleanupReshardCollection",
+          command: {cleanupReshardCollection: "test.x"},
+          skipUnlessSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: Object.extend({enableSharding: 1}, roles_clusterManager),
+                privileges:
+                [{resource: {db: "test", collection: "x"}, actions: ["reshardCollection"]}],
+                  expectFail: true
+              },
+          ]
+        },
+        {
+          testname: "_configsvrCleanupReshardCollection",
+          command: {_configsvrCleanupReshardCollection: "test.x"},
+          skipSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {__system: 1},
+                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
+          testname: "_shardsvrCleanupReshardCollection",
+          command: {_shardsvrCleanupReshardCollection: "test.x", reshardingUUID: UUID()},
+          skipSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {__system: 1},
+                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
           testname: "cloneCollectionAsCapped",
           command: {cloneCollectionAsCapped: "x", toCollection: "y", size: 1000},
           skipSharded: true,
@@ -3357,6 +3431,25 @@ var authCommandsLib = {
           ]
         },
         {
+          testname: "donorAbortMigration",
+          command: {
+              donorAbortMigration: 1,
+              migrationId: UUID(),
+          },
+          skipSharded: true,
+          testcases: [
+              {
+                  runOnDb: adminDbName,
+                  roles: roles_clusterManager,
+                  privileges: [{resource: {cluster: true}, actions: ["runTenantMigration"]}],
+                  // This is expected to throw NoSuchTenantMigration.
+                  expectFail: true,
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
           testname: "donorForgetMigration",
           command: {
               donorForgetMigration: 1,
@@ -3394,6 +3487,52 @@ var authCommandsLib = {
                   privileges: [{resource: {cluster: true}, actions: ["runTenantMigration"]}],
                   // Cannot start tenant migration on a standalone mongod.
                   expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
+          testname: "recipientSyncData",
+          command: {
+              recipientSyncData: 1,
+              migrationId: UUID(),
+              donorConnectionString: "donor-rs/localhost:1234",
+              tenantId: "testTenantId",
+              readPreference: {mode: "primary"},
+              startMigrationDonorTimestamp: Timestamp(1, 1),
+              recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
+          },
+          skipSharded: true,
+          testcases: [
+              {
+                  runOnDb: adminDbName,
+                  roles: roles_clusterManager,
+                  privileges: [{resource: {cluster: true}, actions: ["runTenantMigration"]}],
+                  // Cannot start tenant migration on a standalone mongod.
+                  expectFail: true,
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
+          testname: "recipientForgetMigration",
+          command: {
+              recipientForgetMigration: 1,
+              migrationId: UUID(),
+              donorConnectionString: "donor-rs/localhost:1234",
+              tenantId: "testTenantId",
+              readPreference: {mode: "primary"},
+          },
+          skipSharded: true,
+          testcases: [
+              {
+                  runOnDb: adminDbName,
+                  roles: roles_clusterManager,
+                  privileges: [{resource: {cluster: true}, actions: ["runTenantMigration"]}],
+                  // This is expected to fail with InvalidOptions without cluster certificate.
+                  expectFail: true,
               },
               {runOnDb: firstDbName, roles: {}},
               {runOnDb: secondDbName, roles: {}}
@@ -4987,16 +5126,19 @@ var authCommandsLib = {
         {
           testname: "renameCollection_twoDbs",
           command: {renameCollection: firstDbName + ".x", to: secondDbName + ".y"},
+          skipSharded: true,
           setup: function(db) {
-              assert.writeOK(db.getSiblingDB(firstDbName).x.save({}));
-
-              // Running movePrimary is necessary on mongos, but doesn't exist on non-sharded
-              // systems.
-              if (db.getMongo().isMongos()) {
-                assert.commandWorked(
-                  db.getSiblingDB(adminDbName).runCommand({movePrimary: firstDbName, to: shard0name}));
-                assert.commandWorked(
-                  db.getSiblingDB(adminDbName).runCommand({movePrimary: secondDbName, to: shard0name}));
+            assert.writeOK(db.getSiblingDB(firstDbName).x.save({}));
+            assert.writeOK(db.getSiblingDB(secondDbName).y.save({}));
+            db.getSiblingDB(secondDbName).y.drop();
+            // Running movePrimary is necessary on mongos, but doesn't exist on non-sharded
+            // systems.
+            if (db.getMongo().isMongos()) {
+              const shardId = assert.commandWorked(db.getSiblingDB(adminDbName).runCommand({listShards: 1})).shards[0]['_id'];
+              assert.commandWorked(
+                db.getSiblingDB(adminDbName).runCommand({movePrimary: firstDbName, to: shardId}));
+              assert.commandWorked(
+                db.getSiblingDB(adminDbName).runCommand({movePrimary: secondDbName, to: shardId}));
               }
           },
           teardown: function(db) {
@@ -5226,15 +5368,6 @@ var authCommandsLib = {
               },
               {runOnDb: firstDbName, roles: {}},
               {runOnDb: secondDbName, roles: {}}
-          ]
-        },
-        {
-          testname: "resetError",
-          command: {resetError: 1},
-          testcases: [
-              {runOnDb: adminDbName, roles: roles_all, privileges: []},
-              {runOnDb: firstDbName, roles: roles_all, privileges: []},
-              {runOnDb: secondDbName, roles: roles_all, privileges: []}
           ]
         },
         {
@@ -5625,14 +5758,17 @@ var authCommandsLib = {
               {
                 runOnDb: adminDbName,
                 privileges: [{resource: {db: 'config', collection: 'shards'}, actions: ['update']}],
+                expectFail: true, // shard0name doesn't exist
               },
               {
                 runOnDb: adminDbName,
                 roles: roles_clusterManager,
+                expectFail: true, // shard0name doesn't exist
               },
               {
                 runOnDb: adminDbName,
                 privileges: [{resource: {cluster: true}, actions: ["enableSharding"]}],
+                expectFail: true, // shard0name doesn't exist
               },
           ]
         },
@@ -5655,14 +5791,17 @@ var authCommandsLib = {
                     {resource: {db: 'config', collection: 'shards'}, actions: ['update']},
                     {resource: {db: 'config', collection: 'tags'}, actions: ['find']}
                 ],
+                expectFail: true, // shard0name doesn't exist
               },
               {
                 runOnDb: adminDbName,
                 roles: roles_clusterManager,
+                expectFail: true, // shard0name doesn't exist
               },
               {
                 runOnDb: adminDbName,
                 privileges: [{resource: {cluster: true}, actions: ["enableSharding"]}],
+                expectFail: true, // shard0name doesn't exist
               },
           ]
         },
@@ -5774,10 +5913,11 @@ var authCommandsLib = {
               }]
           },
           skipSharded: false,
+          skipTest: (conn) => true, // TODO SERVER-54877 re-enable this test case
           // Only enterprise knows of this aggregation stage.
-          skipTest:
-              (conn) =>
-                  !conn.getDB("admin").runCommand({buildInfo: 1}).modules.includes("enterprise"),
+          //skipTest:
+          //    (conn) =>
+          //        !conn.getDB("admin").runCommand({buildInfo: 1}).modules.includes("enterprise"),
           testcases: [
               {
                 runOnDb: firstDbName,
@@ -5993,6 +6133,77 @@ var authCommandsLib = {
               },
             ]
         },
+        {
+          testname: "validate_db_metadata_command_specific_db",
+          command: {
+              validateDBMetadata: 1,
+              db: secondDbName,
+              collection: "test",
+              apiParameters: {version: "1", strict: true}
+          },
+          setup: function(db) {
+              assert.commandWorked(db.getSiblingDB(firstDbName).createCollection("test"));
+              assert.commandWorked(db.getSiblingDB(secondDbName).createCollection("test"));
+              assert.commandWorked(db.getSiblingDB("ThirdDB").createCollection("test"));
+          },
+          teardown: function(db) {
+              assert.commandWorked(db.getSiblingDB(firstDbName).dropDatabase());
+              assert.commandWorked(db.getSiblingDB(secondDbName).dropDatabase());
+              assert.commandWorked(db.getSiblingDB("ThirdDB").dropDatabase());
+          },
+          testcases: [
+              {
+                  runOnDb: secondDbName,
+                  privileges: [{resource: {db: secondDbName, collection: ""}, actions: ["validate"]}]
+              },
+              {
+                  // Need to only have permission on secondDbName to be able to the command against
+                  // the db.
+                  runOnDb: firstDbName,
+                  privileges: [{resource: {db: secondDbName, collection: ""}, actions: ["validate"]}],
+              },
+              {
+                  runOnDb: firstDbName,
+                  privileges: [
+                      {resource: {db: firstDbName, collection: ""}, actions: ["validate"]}
+                  ],
+                  expectAuthzFailure: true
+              },
+          ]
+      },
+      {
+          testname: "validate_db_metadata_command_all_dbs",
+          command: {validateDBMetadata: 1, apiParameters: {version: "1", strict: true}},
+          setup: function(db) {
+              assert.commandWorked(db.getSiblingDB(firstDbName).createCollection("test"));
+              assert.commandWorked(db.getSiblingDB(secondDbName).createCollection("test"));
+          },
+          teardown: function(db) {
+              assert.commandWorked(db.getSiblingDB(firstDbName).dropDatabase());
+              assert.commandWorked(db.getSiblingDB(secondDbName).dropDatabase());
+          },
+          testcases: [
+              {
+                  // Since the command didn't specify a 'db', it validates all dbs and hence require
+                  // permission to run on all dbs.
+                  runOnDb: secondDbName,
+                  privileges: [{resource: {db: "", collection: ""}, actions: ["validate"]}],
+              },
+              {
+                  // An exhaustive list on all databases is still not good enough for running to
+                  // command on all dbs.
+                  runOnDb: secondDbName,
+                  privileges: [
+                      {resource: {db: "admin", collection: ""}, actions: ["validate"]},
+                      {resource: {db: "config", collection: ""}, actions: ["validate"]},
+                      {resource: {db: "local", collection: ""}, actions: ["validate"]},
+                      {resource: {db: firstDbName, collection: ""}, actions: ["validate"]},
+                      {resource: {db: secondDbName, collection: ""}, actions: ["validate"]}
+                  ],
+                  expectAuthzFailure: true
+              },
+          ]
+      },
     ],
 
     /************* SHARED TEST LOGIC ****************/

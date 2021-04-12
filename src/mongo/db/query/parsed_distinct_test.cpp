@@ -60,10 +60,12 @@ TEST(ParsedDistinctTest, ConvertToAggregationNoQuery) {
     ASSERT_OK(agg);
 
     auto cmdObj = OpMsgRequest::fromDBAndBody(testns.db(), agg.getValue()).body;
-    auto ar = aggregation_request_helper::parseFromBSON(testns, cmdObj);
+    auto ar = aggregation_request_helper::parseFromBSONForTests(testns, cmdObj);
     ASSERT_OK(ar.getStatus());
     ASSERT(!ar.getValue().getExplain());
-    ASSERT_EQ(ar.getValue().getBatchSize(), aggregation_request_helper::kDefaultBatchSize);
+    ASSERT_EQ(ar.getValue().getCursor().getBatchSize().value_or(
+                  aggregation_request_helper::kDefaultBatchSize),
+              aggregation_request_helper::kDefaultBatchSize);
     ASSERT_EQ(ar.getValue().getNamespace(), testns);
     ASSERT_BSONOBJ_EQ(ar.getValue().getCollation().value_or(BSONObj()), BSONObj());
     ASSERT(ar.getValue().getReadConcern().value_or(BSONObj()).isEmpty());
@@ -100,10 +102,12 @@ TEST(ParsedDistinctTest, ConvertToAggregationDottedPathNoQuery) {
     ASSERT_OK(agg);
 
     auto cmdObj = OpMsgRequest::fromDBAndBody(testns.db(), agg.getValue()).body;
-    auto ar = aggregation_request_helper::parseFromBSON(testns, cmdObj);
+    auto ar = aggregation_request_helper::parseFromBSONForTests(testns, cmdObj);
     ASSERT_OK(ar.getStatus());
     ASSERT(!ar.getValue().getExplain());
-    ASSERT_EQ(ar.getValue().getBatchSize(), aggregation_request_helper::kDefaultBatchSize);
+    ASSERT_EQ(ar.getValue().getCursor().getBatchSize().value_or(
+                  aggregation_request_helper::kDefaultBatchSize),
+              aggregation_request_helper::kDefaultBatchSize);
     ASSERT_EQ(ar.getValue().getNamespace(), testns);
     ASSERT_BSONOBJ_EQ(ar.getValue().getCollation().value_or(BSONObj()), BSONObj());
     ASSERT(ar.getValue().getReadConcern().value_or(BSONObj()).isEmpty());
@@ -165,10 +169,12 @@ TEST(ParsedDistinctTest, ConvertToAggregationWithAllOptions) {
     ASSERT_OK(agg);
 
     auto cmdObj = OpMsgRequest::fromDBAndBody(testns.db(), agg.getValue()).body;
-    auto ar = aggregation_request_helper::parseFromBSON(testns, cmdObj);
+    auto ar = aggregation_request_helper::parseFromBSONForTests(testns, cmdObj);
     ASSERT_OK(ar.getStatus());
     ASSERT(!ar.getValue().getExplain());
-    ASSERT_EQ(ar.getValue().getBatchSize(), aggregation_request_helper::kDefaultBatchSize);
+    ASSERT_EQ(ar.getValue().getCursor().getBatchSize().value_or(
+                  aggregation_request_helper::kDefaultBatchSize),
+              aggregation_request_helper::kDefaultBatchSize);
     ASSERT_EQ(ar.getValue().getNamespace(), testns);
     ASSERT_BSONOBJ_EQ(ar.getValue().getCollation().value_or(BSONObj()),
                       BSON("locale"
@@ -212,10 +218,12 @@ TEST(ParsedDistinctTest, ConvertToAggregationWithQuery) {
     ASSERT_OK(agg);
 
     auto cmdObj = OpMsgRequest::fromDBAndBody(testns.db(), agg.getValue()).body;
-    auto ar = aggregation_request_helper::parseFromBSON(testns, cmdObj);
+    auto ar = aggregation_request_helper::parseFromBSONForTests(testns, cmdObj);
     ASSERT_OK(ar.getStatus());
     ASSERT(!ar.getValue().getExplain());
-    ASSERT_EQ(ar.getValue().getBatchSize(), aggregation_request_helper::kDefaultBatchSize);
+    ASSERT_EQ(ar.getValue().getCursor().getBatchSize().value_or(
+                  aggregation_request_helper::kDefaultBatchSize),
+              aggregation_request_helper::kDefaultBatchSize);
     ASSERT_EQ(ar.getValue().getNamespace(), testns);
     ASSERT_BSONOBJ_EQ(ar.getValue().getCollation().value_or(BSONObj()), BSONObj());
     ASSERT(ar.getValue().getReadConcern().value_or(BSONObj()).isEmpty());
@@ -255,7 +263,7 @@ TEST(ParsedDistinctTest, ExplainNotIncludedWhenConvertingToAggregationCommand) {
     ASSERT_FALSE(agg.getValue().hasField("explain"));
 
     auto cmdObj = OpMsgRequest::fromDBAndBody(testns.db(), agg.getValue()).body;
-    auto ar = aggregation_request_helper::parseFromBSON(testns, cmdObj);
+    auto ar = aggregation_request_helper::parseFromBSONForTests(testns, cmdObj);
     ASSERT_OK(ar.getStatus());
     ASSERT(!ar.getValue().getExplain());
     ASSERT_EQ(ar.getValue().getNamespace(), testns);

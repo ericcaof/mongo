@@ -33,6 +33,7 @@
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/update/document_diff_serialization.h"
 #include "mongo/stdx/variant.h"
 #include "mongo/util/visit_helper.h"
@@ -50,13 +51,31 @@ constexpr int kRetryableAndTxnBatchWriteBSONSizeOverhead =
 /**
  * Parses the 'limit' property of a delete entry, which has inverted meaning from the 'multi'
  * property of an update.
+ *
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
  */
 bool readMultiDeleteProperty(const BSONElement& limitElement);
 
 /**
  * Writes the 'isMulti' value as a limit property.
+ *
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
  */
 void writeMultiDeleteProperty(bool isMulti, StringData fieldName, BSONObjBuilder* builder);
+
+/**
+ * Serializes the opTime fields to specified BSON builder. A 'term' field will be included only
+ * when it is intialized.
+ */
+void opTimeSerializerWithTermCheck(repl::OpTime opTime, StringData fieldName, BSONObjBuilder* bob);
+
+/**
+ * Method to deserialize the specified BSON element to opTime. This method is used by the IDL
+ * parser to generate the deserializer code.
+ */
+repl::OpTime opTimeParser(BSONElement elem);
 
 class UpdateModification {
 public:
@@ -87,8 +106,16 @@ public:
 
     /**
      * These methods support IDL parsing of the "u" field from the update command and OP_UPDATE.
+     *
+     * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+     * break because of it.
      */
     static UpdateModification parseFromBSON(BSONElement elem);
+
+    /**
+     * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+     * break because of it.
+     */
     void serializeToBSON(StringData fieldName, BSONObjBuilder* bob) const;
 
     // When parsing from legacy OP_UPDATE messages, we receive the "u" field as an object. When an

@@ -69,7 +69,9 @@ public:
 
     static const char kSessionMigrateOplogTag[];
 
-    SessionCatalogMigrationDestination(ShardId fromShard, MigrationSessionId migrationSessionId);
+    SessionCatalogMigrationDestination(NamespaceString nss,
+                                       ShardId fromShard,
+                                       MigrationSessionId migrationSessionId);
     ~SessionCatalogMigrationDestination();
 
     /**
@@ -110,6 +112,7 @@ private:
 
     void _errorOccurred(StringData errMsg);
 
+    const NamespaceString _nss;
     const ShardId _fromShard;
     const MigrationSessionId _migrationSessionId;
 
@@ -117,7 +120,6 @@ private:
 
     // Protects _state and _errMsg.
     Mutex _mutex = MONGO_MAKE_LATCH("SessionCatalogMigrationDestination::_mutex");
-    stdx::condition_variable _isStateChanged;
     State _state = State::NotStarted;
     std::string _errMsg;  // valid only if _state == ErrorOccurred.
 };

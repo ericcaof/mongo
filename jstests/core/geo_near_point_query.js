@@ -2,7 +2,7 @@
  * Verifies that $geoNear correctly matches the point given to the 'near' parameter when the
  * 'maxDistance' parameter is set to 0.
  *
- * @tags: [sbe_incompatible, backport_required_multiversion]
+ * @tags: [backport_required_multiversion]
  */
 (function() {
 "use strict";
@@ -22,8 +22,7 @@ const docs = [
     {"location": {"type": "Point", "coordinates": [90, 45.01]}},
 
 ];
-coll.insert(docs);
-
+assert.commandWorked(coll.insert(docs));
 assert.commandWorked(coll.createIndex({location: "2dsphere"}));
 
 for (const doc of docs) {
@@ -44,7 +43,7 @@ for (const doc of docs) {
             {$project: {_id: 0, location: 1}}
         ];
         const result = coll.aggregate(pipeline).toArray();
-        assert.eq(1, result.length, tojson(result));
+        assert.eq(1, result.length, tojson(doc));
         const item = result[0];
         assert.eq(doc, item);
     }

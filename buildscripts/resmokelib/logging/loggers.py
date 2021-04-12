@@ -1,6 +1,7 @@
 """Module to hold the logger instances themselves."""
 
 import logging
+import re
 import shutil
 import subprocess
 import sys
@@ -10,6 +11,7 @@ from buildscripts.resmokelib import errors
 from buildscripts.resmokelib.core import redirect as redirect_lib
 from buildscripts.resmokelib.logging import buildlogger
 from buildscripts.resmokelib.logging import formatters
+from buildscripts.resmokelib.logging import jasper_logger
 
 _DEFAULT_FORMAT = "[%(name)s] %(message)s"
 
@@ -154,12 +156,24 @@ def new_job_logger(test_kind, job_num):
 # Fixture loggers
 
 
+class FixtureLogger(logging.Logger):
+    """Custom fixture logger."""
+
+    def __init__(self, name, full_name):
+        """Initialize fixture logger."""
+        self.full_name = full_name
+        super().__init__(name)
+
+
 def new_fixture_logger(fixture_class, job_num):
     """Create a logger for a particular fixture class."""
-    name = "%s:job%d" % (fixture_class, job_num)
-    logger = logging.Logger(name)
+    full_name = "%s:job%d" % (fixture_class, job_num)
+    logger = FixtureLogger(_shorten(full_name), full_name)
     logger.parent = ROOT_FIXTURE_LOGGER
-    _add_build_logger_handler(logger, job_num)
+    if config.SPAWN_USING == "jasper":
+        _add_jasper_logger_handler(logger, job_num)
+    else:
+        _add_build_logger_handler(logger, job_num)
 
     _FIXTURE_LOGGER_REGISTRY[job_num] = logger
     return logger
@@ -167,8 +181,8 @@ def new_fixture_logger(fixture_class, job_num):
 
 def new_fixture_node_logger(fixture_class, job_num, node_name):
     """Create a logger for a particular element in a multi-process fixture."""
-    name = "%s:job%d:%s" % (fixture_class, job_num, node_name)
-    logger = logging.Logger(name)
+    full_name = "%s:job%d:%s" % (fixture_class, job_num, node_name)
+    logger = FixtureLogger(_shorten(full_name), full_name)
     logger.parent = _FIXTURE_LOGGER_REGISTRY[job_num]
     return logger
 
@@ -184,7 +198,7 @@ def new_testqueue_logger(test_kind):
 
 
 #pylint: disable=too-many-arguments
-def new_test_logger(test_shortname, test_basename, command, parent, job_num, job_logger):
+def new_test_logger(test_shortname, test_basename, command, parent, job_num, test_id, job_logger):
     """Create a new test logger that will be a child of the given parent."""
     name = "%s:%s" % (parent.name, test_shortname)
     logger = logging.Logger(name)
@@ -210,6 +224,10 @@ def new_test_logger(test_shortname, test_basename, command, parent, job_num, job
 
         return (test_id, url)
 
+    if config.SPAWN_USING == "jasper":
+        _add_jasper_logger_handler(logger, job_num, test_id=test_id)
+        return (logger, None)
+
     (test_id, url) = _get_test_endpoint(job_num, test_basename, command, job_logger)
     _add_build_logger_handler(logger, job_num, test_id)
     return (logger, url)
@@ -217,7 +235,8 @@ def new_test_logger(test_shortname, test_basename, command, parent, job_num, job
 
 def new_test_thread_logger(parent, test_kind, thread_id):
     """Create a new test thread logger that will be the child of the given parent."""
-    logger = logging.Logger("%s:%s" % (test_kind, thread_id))
+    name = "%s:%s" % (test_kind, thread_id)
+    logger = logging.Logger(name)
     logger.parent = parent
     return logger
 
@@ -274,13 +293,19 @@ def _get_buildlogger_handler_info(logger_info):
     return None
 
 
+def _add_jasper_logger_handler(logger, job_num, test_id=None):
+    handler = jasper_logger.JasperHandler(logger.name, job_num, test_id)
+    handler.setFormatter(formatters.TimestampFormatter(_DEFAULT_FORMAT))
+    logger.addHandler(handler)
+
+
 def _fallback_buildlogger_handler(include_logger_name=True):
     """Return a handler that writes to stderr."""
     if include_logger_name:
         log_format = "[fallback] [%(name)s] %(message)s"
     else:
         log_format = "[fallback] %(message)s"
-    formatter = formatters.ISO8601Formatter(fmt=log_format)
+    formatter = formatters.TimestampFormatter(fmt=log_format)
 
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(formatter)
@@ -290,5 +315,27 @@ def _fallback_buildlogger_handler(include_logger_name=True):
 
 def _get_formatter(logger_info):
     """Return formatter."""
-    log_format = logger_info.get("format", _DEFAULT_FORMAT)
-    return formatters.ISO8601Formatter(fmt=log_format)
+    if "format" in logger_info:
+        log_format = logger_info["format"]
+    else:
+        log_format = _DEFAULT_FORMAT
+    return formatters.TimestampFormatter(fmt=log_format)
+
+
+def _shorten(logger_name):
+    """Modify logger name."""
+    # TODO: this function is only called for the fixture and fixture node loggers.
+    #  If additional abbreviation is desired, we will need to call _shorten() in the appropriate places.
+
+    removes = config.SHORTEN_LOGGER_NAME_CONFIG.get("remove", [])
+    for remove in removes:
+        logger_name = logger_name.replace(remove, "")
+
+    replaces = config.SHORTEN_LOGGER_NAME_CONFIG.get("replace", {})
+    for key, value in replaces.items():
+        logger_name = logger_name.replace(key, value)
+
+    # remove leading and trailing colons and underscores
+    logger_name = re.sub(r"(^[:_]+|[:_]+$)", "", logger_name)
+
+    return logger_name

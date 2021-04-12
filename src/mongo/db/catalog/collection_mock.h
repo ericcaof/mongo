@@ -224,7 +224,19 @@ public:
         std::abort();
     }
 
+    Status checkValidatorAPIVersionCompatability(OperationContext* opCtx) const final {
+        std::abort();
+    }
+
     bool isTemporary(OperationContext* opCtx) const {
+        std::abort();
+    }
+
+    bool isClustered() const {
+        std::abort();
+    }
+
+    Status updateCappedSize(OperationContext* opCtx, long long newCappedSize) {
         std::abort();
     }
 
@@ -240,6 +252,14 @@ public:
         std::abort();
     }
 
+    long long getCappedMaxDocs() const {
+        std::abort();
+    }
+
+    long long getCappedMaxSize() const {
+        std::abort();
+    }
+
     CappedCallback* getCappedCallback() {
         std::abort();
     }
@@ -251,11 +271,11 @@ public:
         std::abort();
     }
 
-    uint64_t numRecords(OperationContext* opCtx) const {
+    long long numRecords(OperationContext* opCtx) const {
         std::abort();
     }
 
-    uint64_t dataSize(OperationContext* opCtx) const {
+    long long dataSize(OperationContext* opCtx) const {
         std::abort();
     }
 
@@ -283,6 +303,10 @@ public:
         std::abort();
     }
 
+    boost::optional<TimeseriesOptions> getTimeseriesOptions() const {
+        std::abort();
+    }
+
     const CollatorInterface* getDefaultCollator() const {
         std::abort();
     }
@@ -305,7 +329,7 @@ public:
         std::abort();
     }
 
-    void onDeregisterFromCatalog() {}
+    void onDeregisterFromCatalog(OperationContext* opCtx) {}
 
     UUID uuid() const {
         return _uuid;

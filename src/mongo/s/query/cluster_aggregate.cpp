@@ -102,7 +102,7 @@ auto resolveInvolvedNamespaces(stdx::unordered_set<NamespaceString> involvedName
 // collection UUID if provided.
 boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
     OperationContext* opCtx,
-    const AggregateCommand& request,
+    const AggregateCommandRequest& request,
     BSONObj collationObj,
     boost::optional<UUID> uuid,
     StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces) {
@@ -188,11 +188,25 @@ void updateHostsTargetedMetrics(OperationContext* opCtx,
     }
 }
 
+/**
+ * Performs validations related to API versioning and time-series stages.
+ * Throws UserAssertion if any of the validations fails
+ *     - validation of API versioning on each stage on the pipeline
+ *     - validation of API versioning on 'AggregateCommandRequest' request
+ *     - validation of time-series related stages
+ */
+void performValidationChecks(const OperationContext* opCtx,
+                             const AggregateCommandRequest& request,
+                             const LiteParsedPipeline& liteParsedPipeline) {
+    liteParsedPipeline.validate(opCtx);
+    aggregation_request_helper::validateRequestForAPIVersion(opCtx, request);
+}
+
 }  // namespace
 
 Status ClusterAggregate::runAggregate(OperationContext* opCtx,
                                       const Namespaces& namespaces,
-                                      const AggregateCommand& request,
+                                      const AggregateCommandRequest& request,
                                       const PrivilegeVector& privileges,
                                       BSONObjBuilder* result) {
     return runAggregate(opCtx, namespaces, request, {request}, privileges, result);
@@ -200,30 +214,26 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
 
 Status ClusterAggregate::runAggregate(OperationContext* opCtx,
                                       const Namespaces& namespaces,
-                                      const AggregateCommand& request,
+                                      const AggregateCommandRequest& request,
                                       const LiteParsedPipeline& liteParsedPipeline,
                                       const PrivilegeVector& privileges,
                                       BSONObjBuilder* result) {
-    // If 'apiStrict: true', validates that the pipeline does not contain stages which are not in
-    // this API version.
-    auto apiParameters = APIParameters::get(opCtx);
-    if (apiParameters.getAPIStrict().value_or(false)) {
-        auto apiVersion = apiParameters.getAPIVersion().value_or("");
-        if (!apiVersion.empty())
-            liteParsedPipeline.validatePipelineStagesIfAPIStrict(apiVersion);
-    }
+    // Perform some validations on the LiteParsedPipeline and request before continuing with the
+    // aggregation command.
+    performValidationChecks(opCtx, request, liteParsedPipeline);
 
     uassert(51028, "Cannot specify exchange option to a mongos", !request.getExchange());
     uassert(51143,
             "Cannot specify runtime constants option to a mongos",
             !request.getLegacyRuntimeConstants());
     uassert(51089,
-            str::stream() << "Internal parameter(s) [" << AggregateCommand::kNeedsMergeFieldName
-                          << ", " << AggregateCommand::kFromMongosFieldName
+            str::stream() << "Internal parameter(s) ["
+                          << AggregateCommandRequest::kNeedsMergeFieldName << ", "
+                          << AggregateCommandRequest::kFromMongosFieldName
                           << "] cannot be set to 'true' when sent to mongos",
             !request.getNeedsMerge() && !request.getFromMongos());
     uassert(4928902,
-            str::stream() << AggregateCommand::kCollectionUUIDFieldName
+            str::stream() << AggregateCommandRequest::kCollectionUUIDFieldName
                           << " is not supported on a mongos",
             !request.getCollectionUUID());
 
@@ -247,11 +257,11 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
     auto executionNsRoutingInfoStatus =
         sharded_agg_helpers::getExecutionNsRoutingInfo(opCtx, namespaces.executionNss);
 
-    // For consistency, we assert that when running a pipeline with collStats as the source and a
-    // count parameter that the collection exists.
-    if (liteParsedPipeline.startsWithCollStatsWithCount()) {
-        uassertStatusOKWithContext(executionNsRoutingInfoStatus,
-                                   "Unable to retrieve queryExecStats in $collStats stage");
+    if (!executionNsRoutingInfoStatus.isOK()) {
+        if (liteParsedPipeline.startsWithCollStats()) {
+            uassertStatusOKWithContext(executionNsRoutingInfoStatus,
+                                       "Unable to retrieve information for $collStats stage");
+        }
     }
 
     if (executionNsRoutingInfoStatus.isOK()) {
@@ -313,6 +323,7 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
 
     if (request.getExplain()) {
         explain_common::generateServerInfo(result);
+        explain_common::generateServerParameters(result);
     }
 
     auto status = [&]() {
@@ -344,7 +355,8 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
 
                 return cluster_aggregation_planner::runPipelineOnMongoS(
                     namespaces,
-                    request.getBatchSize(),
+                    request.getCursor().getBatchSize().value_or(
+                        aggregation_request_helper::kDefaultBatchSize),
                     std::move(targeter.pipeline),
                     result,
                     privileges);
@@ -355,7 +367,8 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
                     opCtx,
                     std::move(targeter),
                     aggregation_request_helper::serializeToCommandDoc(request),
-                    request.getBatchSize(),
+                    request.getCursor().getBatchSize().value_or(
+                        aggregation_request_helper::kDefaultBatchSize),
                     namespaces,
                     privileges,
                     result,
@@ -382,7 +395,7 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
 }
 
 Status ClusterAggregate::retryOnViewError(OperationContext* opCtx,
-                                          const AggregateCommand& request,
+                                          const AggregateCommandRequest& request,
                                           const ResolvedView& resolvedView,
                                           const NamespaceString& requestedNss,
                                           const PrivilegeVector& privileges,

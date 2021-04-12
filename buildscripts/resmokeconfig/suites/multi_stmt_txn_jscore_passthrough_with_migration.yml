@@ -19,7 +19,6 @@ selector:
   - jstests/core/collmod_without_uuid.js # applyOps, SERVER-1439
   - jstests/core/compact_keeps_indexes.js  # compact.
   - jstests/core/currentop.js  # uses fsync.
-  - jstests/core/dbadmin.js  # "local" database.
   - jstests/core/dbhash.js  # dbhash.
   - jstests/core/dbhash2.js  # dbhash.
   - jstests/core/diagdata.js # Command not supported in mongos
@@ -44,8 +43,6 @@ selector:
   - jstests/core/geo_s2explain.js  # inputStage in different spot in explain().
   - jstests/core/geo_s2sparse.js  # keysPerIndex in different spot in validate().
   - jstests/core/operation_latency_histogram.js  # Stats are counted differently on mongos, SERVER-24880.
-  # Test expects to run against a standalone, but shards in this passthrough are repl sets.
-  - jstests/core/read_after_optime.js
   # The following tests fail because they count indexes. These counts do not take into account the
   # additional hashed shard key indexes that are automatically added by this passthrough.
   - jstests/core/apitest_dbcollection.js
@@ -73,6 +70,7 @@ selector:
   # TODO: Remove after fixing SERVER-32563. The implementation of explain for the count command is
   # incorrect on sharded collections.
   - jstests/core/explain_count.js
+  - jstests/core/explain_server_params.js
   # TODO SERVER-32311: These tests use plan stage helpers which can't handle sharded explain output.
   - jstests/core/expr_index_use.js
   - jstests/core/index_multikey.js
@@ -120,6 +118,7 @@ selector:
   - jstests/core/or1.js
   - jstests/core/or2.js
   - jstests/core/or3.js
+  - jstests/core/ord.js
   - jstests/core/orj.js
   - jstests/core/ref.js
   - jstests/core/ref4.js
@@ -142,9 +141,6 @@ selector:
   - jstests/core/update_modifier_pop.js
   - jstests/core/updateh.js
   - jstests/core/updatej.js
-
-  # SERVER-38096 Mongos opCounter doesn't increase when last op causes the transaction to implicitly abort
-  - jstests/core/opcounters_write_cmd.js
 
   # TODO: SERVER-38207 Cannot insert document with MaxKey shard key.
   - jstests/core/type8.js
@@ -169,6 +165,7 @@ selector:
   - jstests/core/sort_array.js
   - jstests/core/views/views_collation.js
   - jstests/core/wildcard_index_count.js
+  - jstests/core/explain_server_params.js
 
   # $listSessions
   - jstests/core/list_all_local_sessions.js
@@ -201,6 +198,7 @@ selector:
   - jstests/core/update_dbref.js
   - jstests/core/updatel.js
   - jstests/core/write_result.js
+  - jstests/core/positional_projection.js
 
   # Trick for bypassing mongo shell validation in the test doesn't work because txn_override
   # retry logic will hit the shell validation.
@@ -255,9 +253,6 @@ selector:
   # using a single txnNumber.
   - jstests/core/json_schema/misc_validation.js
   - jstests/core/views/views_all_commands.js
-
-  # Fails with implicit sessions because it will use multiple sessions on the same Mongo connection.
-  - jstests/core/dropdb.js
 
   # Committing a transaction when the server is fsync locked fails.
   - jstests/core/fsync.js
@@ -319,6 +314,7 @@ selector:
   # "writeConcern is not allowed within a multi-statement transaction"
   - assumes_write_concern_unchanged
   - assumes_against_mongod_not_mongos
+  - assumes_standalone_mongod
   # Tests tagged with the following will fail because they assume collections are not sharded.
   - assumes_no_implicit_collection_creation_after_drop
   - assumes_no_implicit_index_creation
@@ -332,8 +328,7 @@ selector:
   - requires_capped
   # Retrying a query can change whether a plan cache entry is active.
   - inspects_whether_plan_cache_entry_is_active
-  # $out is not supported in transactions
-  - uses_$out
+  - does_not_support_transactions
   # Cannot retry a getMore command if a transient transaction or network error occurs during
   # it, since we won't know whether the cursor was advanced or not.
   - requires_getmore

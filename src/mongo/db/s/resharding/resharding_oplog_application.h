@@ -39,7 +39,6 @@
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/repl/oplog_entry.h"
-#include "mongo/db/repl/oplog_entry_or_grouped_inserts.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/s/chunk_manager.h"
@@ -65,8 +64,7 @@ public:
      * Wraps the op application in a writeConflictRetry loop and is responsible for creating and
      * committing the WUOW.
      */
-    Status applyOperation(OperationContext* opCtx,
-                          const repl::OplogEntryOrGroupedInserts& opOrGroupedInserts);
+    Status applyOperation(OperationContext* opCtx, const repl::OplogEntry& op) const;
 
 private:
     // Applies an insert operation
@@ -74,27 +72,27 @@ private:
                              Database* db,
                              const CollectionPtr& outputColl,
                              const CollectionPtr& stashColl,
-                             const repl::OplogEntryOrGroupedInserts& opOrGroupedInserts);
+                             const repl::OplogEntry& op) const;
 
     // Applies an update operation
     void _applyUpdate_inlock(OperationContext* opCtx,
                              Database* db,
                              const CollectionPtr& outputColl,
                              const CollectionPtr& stashColl,
-                             const repl::OplogEntryOrGroupedInserts& opOrGroupedInserts);
+                             const repl::OplogEntry& op) const;
 
     // Applies a delete operation
     void _applyDelete_inlock(OperationContext* opCtx,
                              Database* db,
                              const CollectionPtr& outputColl,
                              const CollectionPtr& stashColl,
-                             const repl::OplogEntryOrGroupedInserts& opOrGroupedInserts);
+                             const repl::OplogEntry& op) const;
 
     // Queries '_stashNss' using 'idQuery'.
     BSONObj _queryStashCollById(OperationContext* opCtx,
                                 Database* db,
                                 const CollectionPtr& coll,
-                                const BSONObj& idQuery);
+                                const BSONObj& idQuery) const;
 
     // Namespace where operations should be applied, unless there is an _id conflict.
     const NamespaceString _outputNss;

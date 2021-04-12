@@ -238,6 +238,11 @@ public:
     void optimizePipeline();
 
     /**
+     * Modifies the container, optimizing it by combining and swapping stages.
+     */
+    static void optimizeContainer(SourceContainer* container);
+
+    /**
      * Returns any other collections involved in the pipeline in addition to the collection the
      * aggregation is run on. All namespaces returned are the names of collections, after views have
      * been resolved.
@@ -268,9 +273,22 @@ public:
 
     /**
      * Returns the dependencies needed by this pipeline. 'unavailableMetadata' should reflect what
-     * metadata is not present on documents that are input to the front of the pipeline.
+     * metadata is not present on documents that are input to the front of the pipeline. If
+     * 'unavailableMetadata' is specified, this method will throw if any of the dependencies
+     * reference unavailable metadata.
      */
-    DepsTracker getDependencies(QueryMetadataBitSet unavailableMetadata) const;
+    DepsTracker getDependencies(boost::optional<QueryMetadataBitSet> unavailableMetadata) const;
+
+    /**
+     * Returns the dependencies needed by the SourceContainer. 'unavailableMetadata' should reflect
+     * what metadata is not present on documents that are input to the front of the pipeline. If
+     * 'unavailableMetadata' is specified, this method will throw if any of the dependencies
+     * reference unavailable metadata.
+     */
+    static DepsTracker getDependenciesForContainer(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const SourceContainer& container,
+        boost::optional<QueryMetadataBitSet> unavailableMetadata);
 
     const SourceContainer& getSources() const {
         return _sources;
@@ -340,10 +358,11 @@ private:
     void stitch();
 
     /**
-     * Reset all stages' child pointers to nullptr. Used to prevent dangling pointers during the
-     * optimization process, where we might swap or destroy stages.
+     * Stitch together the source pointers by calling setSource() for each source in 'container'.
+     * This function must be called any time the order of stages within the container changes, e.g.
+     * in optimizeContainer().
      */
-    void unstitch();
+    static void stitch(SourceContainer* container);
 
     /**
      * Performs common validation for top-level or facet pipelines. Throws if the pipeline is

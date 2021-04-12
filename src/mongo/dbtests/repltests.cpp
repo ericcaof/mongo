@@ -78,7 +78,7 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                                 {},                         // sessionInfo
                                 boost::none,                // upsert
                                 Date_t(),                   // wall clock time
-                                boost::none,                // statement id
+                                {},                         // statement ids
                                 boost::none,    // optime of previous write within same transaction
                                 boost::none,    // pre-image optime
                                 boost::none,    // post-image optime
@@ -120,7 +120,7 @@ public:
         // Since the Client object persists across tests, even though the global
         // ReplicationCoordinator does not, we need to clear the last op associated with the client
         // to avoid the invariant in ReplClientInfo::setLastOp that the optime only goes forward.
-        repl::ReplClientInfo::forClient(_opCtx.getClient()).clearLastOp_forTest();
+        repl::ReplClientInfo::forClient(_opCtx.getClient()).clearLastOp();
 
         sc->setOpObserver(std::make_unique<OpObserverImpl>());
 

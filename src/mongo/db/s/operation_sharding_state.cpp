@@ -31,8 +31,6 @@
 
 #include "mongo/db/s/operation_sharding_state.h"
 
-#include "mongo/db/operation_context.h"
-
 namespace mongo {
 namespace {
 
@@ -60,20 +58,8 @@ OperationShardingState& OperationShardingState::get(OperationContext* opCtx) {
 }
 
 bool OperationShardingState::isOperationVersioned(OperationContext* opCtx) {
-    return !(get(opCtx)._shardVersions.empty());
-}
-
-void OperationShardingState::setAllowImplicitCollectionCreation(
-    const BSONElement& allowImplicitCollectionCreationElem) {
-    if (!allowImplicitCollectionCreationElem.eoo()) {
-        _allowImplicitCollectionCreation = allowImplicitCollectionCreationElem.Bool();
-    } else {
-        _allowImplicitCollectionCreation = true;
-    }
-}
-
-bool OperationShardingState::allowImplicitCollectionCreation() const {
-    return _allowImplicitCollectionCreation;
+    const auto& oss = get(opCtx);
+    return !oss._shardVersions.empty();
 }
 
 void OperationShardingState::initializeClientRoutingVersionsFromCommand(NamespaceString nss,
@@ -103,8 +89,17 @@ void OperationShardingState::initializeClientRoutingVersions(
     const boost::optional<ChunkVersion>& shardVersion,
     const boost::optional<DatabaseVersion>& dbVersion) {
     if (shardVersion) {
-        invariant(_shardVersionsChecked.find(nss.ns()) == _shardVersionsChecked.end(), nss.ns());
-        _shardVersions[nss.ns()] = *shardVersion;
+        // Changing the shardVersion expected for a namespace is not safe to happen in the
+        // middle of execution, but for the cases where operation is retried on the same
+        // OperationContext it can be set twice to the same value.
+        if (_shardVersionsChecked.contains(nss.ns())) {
+            invariant(_shardVersions[nss.ns()] == *shardVersion,
+                      str::stream()
+                          << "Trying to set " << shardVersion->toString() << " for " << nss.ns()
+                          << " but it already has " << _shardVersions[nss.ns()].toString());
+        } else {
+            _shardVersions.emplace(nss.ns(), *shardVersion);
+        }
     }
     if (dbVersion) {
         invariant(_databaseVersions.find(nss.db()) == _databaseVersions.end());
@@ -201,6 +196,23 @@ boost::optional<Status> OperationShardingState::resetShardingOperationFailedStat
     Status failedStatus = Status(*_shardingOperationFailedStatus);
     _shardingOperationFailedStatus = boost::none;
     return failedStatus;
+}
+
+using ScopedAllowImplicitCollectionCreate_UNSAFE =
+    OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE;
+
+ScopedAllowImplicitCollectionCreate_UNSAFE::ScopedAllowImplicitCollectionCreate_UNSAFE(
+    OperationContext* opCtx)
+    : _opCtx(opCtx) {
+    auto& oss = get(_opCtx);
+    invariant(!oss._allowCollectionCreation);
+    oss._allowCollectionCreation = true;
+}
+
+ScopedAllowImplicitCollectionCreate_UNSAFE::~ScopedAllowImplicitCollectionCreate_UNSAFE() {
+    auto& oss = get(_opCtx);
+    invariant(oss._allowCollectionCreation);
+    oss._allowCollectionCreation = false;
 }
 
 }  // namespace mongo

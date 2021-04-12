@@ -97,8 +97,8 @@ TEST(ShardCollectionType, ReshardingFieldsIncluded) {
     ShardCollectionType shardCollType(kNss, OID::gen(), UUID::gen(), kKeyPattern, true);
 
     TypeCollectionReshardingFields reshardingFields;
-    const auto reshardingUuid = UUID::gen();
-    reshardingFields.setUuid(reshardingUuid);
+    const auto reshardingUUID = UUID::gen();
+    reshardingFields.setReshardingUUID(reshardingUUID);
     shardCollType.setReshardingFields(std::move(reshardingFields));
 
     BSONObj obj = shardCollType.toBSON();
@@ -106,20 +106,16 @@ TEST(ShardCollectionType, ReshardingFieldsIncluded) {
 
     ShardCollectionType shardCollTypeFromBSON(obj);
     ASSERT(shardCollType.getReshardingFields());
-    ASSERT_EQ(reshardingUuid, shardCollType.getReshardingFields()->getUuid());
+    ASSERT_EQ(reshardingUUID, shardCollType.getReshardingFields()->getReshardingUUID());
 }
 
 TEST(ShardCollectionType, AllowMigrationsFieldBackwardsCompatibility) {
     ShardCollectionType shardCollType(kNss, OID::gen(), UUID::gen(), kKeyPattern, true);
     shardCollType.setAllowMigrations(false);
-    ASSERT_EQ(
-        false,
-        shardCollType.toBSON()[ShardCollectionTypeBase::kPre50CompatibleAllowMigrationsFieldName]
-            .Bool());
+    ASSERT_EQ(false, shardCollType.toBSON()[ShardCollectionType::kAllowMigrationsFieldName].Bool());
 
     shardCollType.setAllowMigrations(true);
-    ASSERT(shardCollType.toBSON()[ShardCollectionTypeBase::kPre50CompatibleAllowMigrationsFieldName]
-               .eoo());
+    ASSERT(shardCollType.toBSON()[ShardCollectionType::kAllowMigrationsFieldName].eoo());
 }
 
 }  // namespace

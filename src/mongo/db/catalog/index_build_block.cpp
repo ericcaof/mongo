@@ -35,6 +35,7 @@
 
 #include <vector>
 
+#include "mongo/db/audit.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/uncommitted_collections.h"
 #include "mongo/db/catalog_raii.h"
@@ -97,11 +98,7 @@ Status IndexBuildBlock::initForResume(OperationContext* opCtx,
         // A bulk cursor can only be opened on a fresh table, so we drop the table that was created
         // before shutdown and recreate it.
         auto status = DurableCatalog::get(opCtx)->dropAndRecreateIndexIdentForResume(
-            opCtx,
-            collection->getCatalogId(),
-            descriptor,
-            indexCatalogEntry->getIdent(),
-            indexCatalogEntry->getPrefix());
+            opCtx, collection->getCatalogId(), descriptor, indexCatalogEntry->getIdent());
         if (!status.isOK())
             return status;
     }
@@ -129,6 +126,15 @@ Status IndexBuildBlock::init(OperationContext* opCtx, Collection* collection) {
         std::make_unique<IndexDescriptor>(IndexNames::findPluginName(keyPattern), _spec);
 
     _indexName = descriptor->indexName();
+
+    // Since the index build block is being initialized, the index build for _indexName is
+    // beginning. Accordingly, emit an audit event indicating this.
+    audit::logCreateIndex(opCtx->getClient(),
+                          &_spec,
+                          _indexName,
+                          collection->ns(),
+                          "IndexBuildStarted",
+                          ErrorCodes::OK);
 
     bool isBackgroundIndex = _method == IndexBuildMethod::kHybrid;
     bool isBackgroundSecondaryBuild = false;
@@ -180,6 +186,14 @@ void IndexBuildBlock::fail(OperationContext* opCtx, Collection* collection) {
 
     invariant(opCtx->lockState()->isCollectionLockedForMode(_nss, MODE_X));
 
+    // Audit that the index build is being aborted.
+    audit::logCreateIndex(opCtx->getClient(),
+                          &_spec,
+                          _indexName,
+                          collection->ns(),
+                          "IndexBuildAborted",
+                          ErrorCodes::IndexBuildAborted);
+
     auto indexCatalogEntry = getEntry(opCtx, collection);
     if (indexCatalogEntry) {
         invariant(collection->getIndexCatalog()->dropIndexEntry(opCtx, indexCatalogEntry).isOK());
@@ -214,6 +228,14 @@ void IndexBuildBlock::success(OperationContext* opCtx, Collection* collection) {
     collection->indexBuildSuccess(opCtx, indexCatalogEntry);
     auto svcCtx = opCtx->getClient()->getServiceContext();
 
+    // Before committing the index build, optimistically audit that the index build has succeeded.
+    audit::logCreateIndex(opCtx->getClient(),
+                          &_spec,
+                          _indexName,
+                          collection->ns(),
+                          "IndexBuildSucceeded",
+                          ErrorCodes::OK);
+
     opCtx->recoveryUnit()->onCommit(
         [svcCtx,
          indexName = _indexName,
@@ -238,8 +260,7 @@ void IndexBuildBlock::success(OperationContext* opCtx, Collection* collection) {
 
             // Add the index to the TTLCollectionCache upon successfully committing the index build.
             if (spec.hasField(IndexDescriptor::kExpireAfterSecondsFieldName)) {
-                TTLCollectionCache::get(svcCtx).registerTTLInfo(
-                    std::make_pair(coll->uuid(), indexName));
+                TTLCollectionCache::get(svcCtx).registerTTLInfo(coll->uuid(), indexName);
             }
         });
 }

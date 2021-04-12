@@ -104,6 +104,12 @@ struct SortOptions {
     // maxMemoryUsageBytes, we will uassert.
     bool extSortAllowed;
 
+    // In case the sorter spills encrypted data to disk that must be readable even after process
+    // restarts, it must encrypt with a persistent key. This key is accessed using the database
+    // name that the sorted collection lives in. If encryption is enabled and dbName is boost::none,
+    // a temporary key is used.
+    boost::optional<std::string> dbName;
+
     // Directory into which we place a file when spilling to disk. Must be explicitly set if
     // extSortAllowed is true.
     std::string tempDir;
@@ -129,6 +135,11 @@ struct SortOptions {
 
     SortOptions& TempDir(const std::string& newTempDir) {
         tempDir = newTempDir;
+        return *this;
+    }
+
+    SortOptions& DBName(std::string newDbName) {
+        dbName = std::move(newDbName);
         return *this;
     }
 };
@@ -266,6 +277,10 @@ public:
         return _numSorted;
     }
 
+    uint64_t totalDataSizeSorted() const {
+        return _totalDataSizeSorted;
+    }
+
     PersistedState persistDataForShutdown();
 
 protected:
@@ -275,6 +290,7 @@ protected:
 
     size_t _numSpills = 0;  // Keeps track of the number of times data was spilled to disk.
     size_t _numSorted = 0;  // Keeps track of the number of keys sorted.
+    uint64_t _totalDataSizeSorted = 0;  // Keeps track of the total size of data sorted.
 
     // Whether the files written by this Sorter should be kept on destruction.
     bool _shouldKeepFilesOnDestruction = false;
@@ -345,6 +361,8 @@ private:
     // for the next SortedFileWriter instance using the same file.
     std::streampos _fileStartOffset;
     std::streampos _fileEndOffset;
+
+    boost::optional<std::string> _dbName;
 };
 }  // namespace mongo
 

@@ -45,9 +45,7 @@ void TenantMigrationAccessBlockerRegistry::add(StringData tenantId,
 
     if (it != _tenantMigrationAccessBlockers.end()) {
         uasserted(ErrorCodes::ConflictingOperationInProgress,
-                  str::stream() << "Found active migration for tenantId \"" << it->first
-                                << "\" which conflicts with the specified tenantId \"" << tenantId
-                                << "\"");
+                  str::stream() << "Found active migration for tenantId \"" << tenantId << "\"");
     }
 
     _tenantMigrationAccessBlockers.emplace(tenantId, mtab);
@@ -100,7 +98,8 @@ void TenantMigrationAccessBlockerRegistry::shutDown() {
     _tenantMigrationAccessBlockers.clear();
 }
 
-void TenantMigrationAccessBlockerRegistry::appendInfoForServerStatus(BSONObjBuilder* builder) {
+void TenantMigrationAccessBlockerRegistry::appendInfoForServerStatus(
+    BSONObjBuilder* builder) const {
     stdx::lock_guard<Latch> lg(_mutex);
 
     std::for_each(

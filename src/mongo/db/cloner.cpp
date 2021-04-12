@@ -32,7 +32,6 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/cloner.h"
-#include "mongo/db/cloner_gen.h"
 
 #include <algorithm>
 
@@ -46,6 +45,7 @@
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/cloner_gen.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/list_collections_filter.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -59,6 +59,7 @@
 #include "mongo/db/repl/isself.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/logv2/log.h"
@@ -329,9 +330,8 @@ StatusWith<std::vector<BSONObj>> Cloner::_filterCollectionsForClone(
         }
 
         const NamespaceString ns(fromDBName, collectionName.c_str());
-
         if (ns.isSystem()) {
-            if (!ns.isLegalClientSystemNS()) {
+            if (!ns.isLegalClientSystemNS(serverGlobalParams.featureCompatibility)) {
                 LOGV2_DEBUG(20419, 2, "\t\t not cloning because system collection");
                 continue;
             }
@@ -363,7 +363,7 @@ Status Cloner::_createCollectionsForDb(
 
         const NamespaceString nss(dbName, params.collectionName);
 
-        uassertStatusOK(userAllowedCreateNS(nss));
+        uassertStatusOK(userAllowedCreateNS(opCtx, nss));
         Status status = writeConflictRetry(opCtx, "createCollection", nss.ns(), [&] {
             opCtx->checkForInterrupt();
             WriteUnitOfWork wunit(opCtx);
@@ -412,10 +412,15 @@ Status Cloner::_createCollectionsForDb(
 
             CollectionOptions collectionOptions = uassertStatusOK(
                 CollectionOptions::parse(options, CollectionOptions::ParseKind::parseForStorage));
-            Status createStatus = db->userCreateNS(
-                opCtx, nss, collectionOptions, createDefaultIndexes, params.idIndexSpec);
-            if (!createStatus.isOK()) {
-                return createStatus;
+
+            {
+                OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE
+                    unsafeCreateCollection(opCtx);
+                Status createStatus = db->userCreateNS(
+                    opCtx, nss, collectionOptions, createDefaultIndexes, params.idIndexSpec);
+                if (!createStatus.isOK()) {
+                    return createStatus;
+                }
             }
 
             wunit.commit();

@@ -150,7 +150,7 @@ protected:
     }
 
     void _recordDurable(const OpTimeAndWallTime& newOpTimeAndWallTime) {
-        // We have to use setMyLastDurableOpTimeAndWallTimeFoward since this thread races with
+        // We have to use setMyLastDurableOpTimeAndWallTimeForward since this thread races with
         // ReplicationExternalStateImpl::onTransitionToPrimary.
         _replCoord->setMyLastDurableOpTimeAndWallTimeForward(newOpTimeAndWallTime);
     }
@@ -522,6 +522,7 @@ StatusWith<OpTime> OplogApplierImpl::_applyOplogBatch(OperationContext* opCtx,
                         // This code path is only executed on secondaries and initial syncing nodes,
                         // so it is safe to exclude any writes from Flow Control.
                         opCtx->setShouldParticipateInFlowControl(false);
+                        opCtx->setEnforceConstraints(false);
 
                         status = opCtx->runWithoutInterruptionExceptAtGlobalShutdown([&] {
                             return applyOplogBatchPerWorker(opCtx.get(), &writer, &multikeyVector);
@@ -553,13 +554,6 @@ StatusWith<OpTime> OplogApplierImpl::_applyOplogBatch(OperationContext* opCtx,
             }
         }
     }
-
-    // Tell the storage engine to flush the journal now that a replication batch has completed. This
-    // means that all the writes associated with the oplog entries in the batch are finished and no
-    // new writes with timestamps associated with those oplog entries will show up in the future. We
-    // want to flush the journal as soon as possible in order to free ops waiting with 'j' write
-    // concern.
-    JournalFlusher::get(opCtx)->triggerJournalFlush();
 
     // Use this fail point to hold the PBWM lock and prevent the batch from completing.
     if (MONGO_unlikely(pauseBatchApplicationBeforeCompletion.shouldFail())) {

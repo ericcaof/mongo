@@ -43,7 +43,6 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/query/cursor_response.h"
-#include "mongo/db/query/query_request.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/read_concern_args.h"
@@ -220,28 +219,24 @@ std::unique_ptr<ShardRegistry> ShardingMongodTestFixture::makeShardRegistry(
 std::unique_ptr<DistLockManager> ShardingMongodTestFixture::makeDistLockManager() {
     class DistLockManagerNoop : public DistLockManager {
     public:
+        DistLockManagerNoop() : DistLockManager(OID::gen()) {}
         void startUp() override {}
         void shutDown(OperationContext* opCtx) {}
         std::string getProcessID() override {
             return "DistLockManagerNoop";
         }
-        StatusWith<DistLockHandle> lockWithSessionID(OperationContext* opCtx,
-                                                     StringData name,
-                                                     StringData whyMessage,
-                                                     const OID& lockSessionID,
-                                                     Milliseconds waitFor) override {
-            return DistLockHandle::gen();
+        Status lockDirect(OperationContext* opCtx,
+                          StringData name,
+                          StringData whyMessage,
+                          Milliseconds waitFor) override {
+            return Status::OK();
         }
-        StatusWith<DistLockHandle> tryLockWithLocalWriteConcern(OperationContext* opCtx,
-                                                                StringData name,
-                                                                StringData whyMessage,
-                                                                const OID& lockSessionID) override {
-            return DistLockHandle::gen();
+        Status tryLockDirectWithLocalWriteConcern(OperationContext* opCtx,
+                                                  StringData name,
+                                                  StringData whyMessage) override {
+            return Status::OK();
         }
-        void unlock(Interruptible* intr, const DistLockHandle& lockHandle) override {}
-        void unlock(Interruptible* intr,
-                    const DistLockHandle& lockHandle,
-                    StringData name) override {}
+        void unlock(Interruptible* intr, StringData name) override {}
         void unlockAll(OperationContext* opCtx) override {}
     };
     return std::make_unique<DistLockManagerNoop>();

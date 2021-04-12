@@ -219,7 +219,7 @@ StatusWith<std::string> WiredTigerUtil::getMetadataCreate(OperationContext* opCt
     WT_CURSOR* cursor = nullptr;
     try {
         const std::string metadataURI = "metadata:create";
-        cursor = session->getCachedCursor(metadataURI, WiredTigerSession::kMetadataCreateTableId);
+        cursor = session->getCachedCursor(WiredTigerSession::kMetadataCreateTableId, "");
         if (!cursor) {
             cursor = session->getNewCursor(metadataURI);
         }
@@ -228,7 +228,7 @@ StatusWith<std::string> WiredTigerUtil::getMetadataCreate(OperationContext* opCt
     }
     invariant(cursor);
     auto releaser = makeGuard(
-        [&] { session->releaseCursor(WiredTigerSession::kMetadataCreateTableId, cursor); });
+        [&] { session->releaseCursor(WiredTigerSession::kMetadataCreateTableId, cursor, ""); });
 
     return _getMetadata(cursor, uri);
 }
@@ -249,7 +249,7 @@ StatusWith<std::string> WiredTigerUtil::getMetadata(OperationContext* opCtx, Str
     WT_CURSOR* cursor = nullptr;
     try {
         const std::string metadataURI = "metadata:";
-        cursor = session->getCachedCursor(metadataURI, WiredTigerSession::kMetadataTableId);
+        cursor = session->getCachedCursor(WiredTigerSession::kMetadataTableId, "");
         if (!cursor) {
             cursor = session->getNewCursor(metadataURI);
         }
@@ -258,7 +258,7 @@ StatusWith<std::string> WiredTigerUtil::getMetadata(OperationContext* opCtx, Str
     }
     invariant(cursor);
     auto releaser =
-        makeGuard([&] { session->releaseCursor(WiredTigerSession::kMetadataTableId, cursor); });
+        makeGuard([&] { session->releaseCursor(WiredTigerSession::kMetadataTableId, cursor, ""); });
 
     return _getMetadata(cursor, uri);
 }
@@ -303,7 +303,7 @@ Status WiredTigerUtil::getApplicationMetadata(OperationContext* opCtx,
                 bob->appendBool(key, valueItem.val);
                 break;
             case WT_CONFIG_ITEM::WT_CONFIG_ITEM_NUM:
-                bob->appendIntOrLL(key, valueItem.val);
+                bob->appendNumber(key, static_cast<long long>(valueItem.val));
                 break;
             default:
                 bob->append(key, StringData(valueItem.str, valueItem.len));
@@ -756,6 +756,10 @@ Status WiredTigerUtil::setTableLogging(WT_SESSION* session, const std::string& u
 
     invariant(_tableLoggingInfo.isFirstTable);
     invariant(!_tableLoggingInfo.hasPreviouslyIncompleteTableChecks);
+
+    // When repair or a forced modification to the table logging settings isn't running, check that
+    // the first table is the catalog.
+    invariant(uri == "table:_mdb_catalog", str::stream() << "First table checked was: " << uri);
     _tableLoggingInfo.isFirstTable = false;
 
     // Check if the first tables logging settings need to be modified.

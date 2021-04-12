@@ -91,9 +91,13 @@ ValidateState::ValidateState(OperationContext* opCtx,
 
     // RepairMode is incompatible with the ValidateModes kBackground and
     // kForegroundFullEnforceFastCount.
-    if (shouldRunRepair()) {
+    if (fixErrors()) {
         invariant(!isBackground());
         invariant(!shouldEnforceFastCount());
+    }
+
+    if (adjustMultikey()) {
+        invariant(!isBackground());
     }
 
     _uuid = _collection->uuid();
@@ -305,5 +309,4 @@ void ValidateState::_relockDatabaseAndCollection(OperationContext* opCtx) {
 }
 
 }  // namespace CollectionValidation
-
 }  // namespace mongo

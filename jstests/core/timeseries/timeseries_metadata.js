@@ -2,13 +2,11 @@
  * Tests that only measurements with a binary identical meta field are included in the same bucket
  * in a time-series collection.
  * @tags: [
- *     assumes_unsharded_collection,         # TODO(SERVER-53816): remove
- *     does_not_support_causal_consistency,  # TODO(SERVER-53819): remove
+ *     assumes_no_implicit_collection_creation_after_drop,
  *     does_not_support_stepdowns,
  *     requires_fcv_49,
  *     requires_find_command,
  *     requires_getmore,
- *     sbe_incompatible,
  * ]
  */
 (function() {
@@ -21,8 +19,7 @@ if (!TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo())) {
     return;
 }
 
-const testDB = db.getSiblingDB(jsTestName());
-assert.commandWorked(testDB.dropDatabase());
+const collNamePrefix = 'timeseries_metadata_';
 
 const timeFieldName = 'time';
 const metaFieldName = 'meta';
@@ -35,20 +32,21 @@ let collCount = 0;
  * time-series collection.
  */
 const runTest = function(docsBucketA, docsBucketB) {
-    const coll = testDB.getCollection('t_' + collCount++);
-    const bucketsColl = testDB.getCollection('system.buckets.' + coll.getName());
+    const coll = db.getCollection(collNamePrefix + collCount++);
+    const bucketsColl = db.getCollection('system.buckets.' + coll.getName());
     coll.drop();
 
     jsTestLog('Running test: collection: ' + coll.getFullName() +
               '; bucket collection: ' + bucketsColl.getFullName() +
               '; bucketA: ' + tojson(docsBucketA) + '; bucketB: ' + tojson(docsBucketB));
 
-    assert.commandWorked(testDB.createCollection(
+    assert.commandWorked(db.createCollection(
         coll.getName(), {timeseries: {timeField: timeFieldName, metaField: metaFieldName}}));
-    assert.contains(bucketsColl.getName(), testDB.getCollectionNames());
+    assert.contains(bucketsColl.getName(), db.getCollectionNames());
 
     let docs = docsBucketA.concat(docsBucketB);
-    assert.commandWorked(coll.insert(docs), 'failed to insert docs: ' + tojson(docs));
+    assert.commandWorked(coll.insert(docs, {ordered: false}),
+                         'failed to insert docs: ' + tojson(docs));
 
     // Check view.
     const viewDocs = coll.find({}).sort({_id: 1}).toArray();
@@ -118,10 +116,13 @@ runTest(
     ]);
 
 runTest(
-    // No metadata field in first bucket.
+    // Null metadata field in first bucket. Temporarily use null meta instead of missing meta
+    // to accomodate the new $_internalUnpackBucket behavior which is null meta in a bucket
+    // is materialized as "null" meta.
+    // TODO SERVER-55213: Need to test both missing meta case and null meta case.
     [
-        {_id: 0, time: t[0], x: 0},
-        {_id: 1, time: t[1], x: 10},
+        {_id: 0, time: t[0], meta: null, x: 0},
+        {_id: 1, time: t[1], meta: null, x: 10},
     ],
     [
         {_id: 2, time: t[2], meta: 123, x: 20},
@@ -134,10 +135,13 @@ runTest(
         {_id: 0, time: t[0], meta: [1, 2, 3], x: 0},
         {_id: 1, time: t[1], meta: [1, 2, 3], x: 10},
     ],
-    // No metadata field in second bucket.
+    // Null metadata field in second bucket. Temporarily use null meta instead of missing meta
+    // to accomodate the new $_internalUnpackBucket behavior which is null meta in a bucket
+    // is materialized as "null" meta.
+    // TODO SERVER-55213: Need to test both missing meta case and null meta case.
     [
-        {_id: 2, time: t[2], x: 20},
-        {_id: 3, time: t[3], x: 30},
+        {_id: 2, time: t[2], meta: null, x: 20},
+        {_id: 3, time: t[3], meta: null, x: 30},
     ]);
 
 runTest(

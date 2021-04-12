@@ -110,10 +110,28 @@ all:
     test_file: jstests/replsets/not_primary_errors_returned_during_rollback_if_helloOk.js
   - ticket: SERVER-50769
     test_file: jstests/sharding/change_stream_empty_apply_ops.js
-  - ticket: SERVER-52953
-    test_file: jstests/core/geo_near_point_query.js
   - ticket: SERVER-52547
     test_file: jstests/core/txns/errors_on_committed_transaction.js
+  - ticket: SERVER-53612
+    test_file: jstests/replsets/election_handoff_not_immediately_electable.js
+  - ticket: SERVER-50486
+    test_file: jstests/replsets/dont_refresh_session_prepare_secondary.js
+  - ticket: SERVER-53932
+    test_file: jstests/replsets/rollback_reconstructs_transactions_prepared_before_stable.js
+  - ticket: SERVER-53431
+    test_file: jstests/replsets/stepdown_kill_other_ops.js
+  - ticket: SERVER-53394
+    test_file: jstests/sharding/sharding_task_executor_pool_matching_policy.js
+  - ticket: SERVER-53849
+    test_file: jstests/core/txns/timestamped_reads_wait_for_prepare_oplog_visibility.js
+  - ticket: SERVER-53985
+    test_file: jstests/replsets/unconditional_step_down.js
+  - ticket: SERVER-54366
+    test_file: jstests/replsets/force_shutdown_primary.js
+  - ticket: SERVER-52953
+    test_file: jstests/core/geo_near_point_query.js
+  - ticket: SERVER-48179
+    test_file: jstests/replsets/reconfig_removes_node_in_rollback.js
 
 # Tests that should only be excluded from particular suites should be listed under that suite.
 suites:

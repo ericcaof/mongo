@@ -86,7 +86,7 @@ public:
                                  const BSONObj& cmdObj) final;
 
     Status runAggregation(OperationContext* opCtx,
-                          const AggregateCommand& aggRequest,
+                          const AggregateCommandRequest& aggRequest,
                           std::function<bool(const std::vector<BSONObj>& batch)> callback);
 
 private:
@@ -122,7 +122,8 @@ private:
         const NamespaceString& nss,
         const BSONObj& query,
         const BSONObj& sort,
-        boost::optional<long long> limit) final;
+        boost::optional<long long> limit,
+        const boost::optional<BSONObj>& hint = boost::none) final;
 
     StatusWith<AsyncCmdHandle> _scheduleCommand(
         OperationContext* opCtx,

@@ -168,6 +168,24 @@ BSONObj CommandHelpers::runCommandDirectly(OperationContext* opCtx, const OpMsgR
     return replyBuilder.releaseBody();
 }
 
+Future<void> CommandHelpers::runCommandInvocation(
+    std::shared_ptr<RequestExecutionContext> rec,
+    std::shared_ptr<CommandInvocation> invocation,
+    transport::ServiceExecutor::ThreadingModel threadingModel) {
+    switch (threadingModel) {
+        case transport::ServiceExecutor::ThreadingModel::kBorrowed:
+            return runCommandInvocationAsync(std::move(rec), std::move(invocation));
+        case transport::ServiceExecutor::ThreadingModel::kDedicated:
+            return makeReadyFutureWith([opCtx = rec->getOpCtx(),
+                                        request = rec->getRequest(),
+                                        invocation = invocation.get(),
+                                        replyBuilder = rec->getReplyBuilder()] {
+                runCommandInvocation(opCtx, request, invocation, replyBuilder);
+            });
+    }
+    MONGO_UNREACHABLE;
+}
+
 void CommandHelpers::runCommandInvocation(OperationContext* opCtx,
                                           const OpMsgRequest& request,
                                           CommandInvocation* invocation,
@@ -339,7 +357,9 @@ bool CommandHelpers::appendCommandStatusNoThrow(BSONObjBuilder& result, const St
     }
     // If the command has errored, assert that it satisfies the IDL-defined requirements on a
     // command error reply.
-    if (!status.isOK()) {
+    // Only validate error reply in test mode so that we don't expose users to errors if we
+    // construct an invalid error reply.
+    if (!status.isOK() && getTestCommandsEnabled()) {
         try {
             ErrorReply::parse(IDLParserErrorContext("appendCommandStatusNoThrow"),
                               result.asTempObj());
@@ -670,15 +690,6 @@ void CommandHelpers::evaluateFailCommandFailPoint(OperationContext* opCtx,
                     data.getObjectField(kErrorLabelsFieldName).getOwned());
             }
 
-            if (closeConnection) {
-                opCtx->getClient()->session()->end();
-                LOGV2(20431,
-                      "Failing {command} via 'failCommand' failpoint: closing connection",
-                      "Failing command via 'failCommand' failpoint: closing connection",
-                      "command"_attr = cmd->getName());
-                uasserted(50985, "Failing command due to 'failCommand' failpoint");
-            }
-
             if (blockConnection) {
                 long long blockTimeMS = 0;
                 uassert(ErrorCodes::InvalidOptions,
@@ -699,6 +710,15 @@ void CommandHelpers::evaluateFailCommandFailPoint(OperationContext* opCtx,
                       "Unblocking {command} via 'failCommand' failpoint",
                       "Unblocking command via 'failCommand' failpoint",
                       "command"_attr = cmd->getName());
+            }
+
+            if (closeConnection) {
+                opCtx->getClient()->session()->end();
+                LOGV2(20431,
+                      "Failing {command} via 'failCommand' failpoint: closing connection",
+                      "Failing command via 'failCommand' failpoint: closing connection",
+                      "command"_attr = cmd->getName());
+                uasserted(50985, "Failing command due to 'failCommand' failpoint");
             }
 
             if (hasExtraInfo) {

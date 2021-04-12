@@ -160,7 +160,7 @@ TEST_F(ReplicaSetMonitorFixture, StreamableRSMWireVersion) {
     // Schedule isMaster requests and wait for the responses.
     auto primaryFuture =
         rsm->getHostOrRefresh(ReadPreferenceSetting(mongo::ReadPreference::PrimaryOnly),
-                              CancelationToken::uncancelable());
+                              CancellationToken::uncancelable());
     primaryFuture.get();
 
     ASSERT_EQ(rsm->getMinWireVersion(), WireVersion::LATEST_WIRE_VERSION);
@@ -173,9 +173,15 @@ TEST_F(ReplicaSetMonitorFixture, ReplicaSetMonitorCleanup) {
     auto sets = ReplicaSetMonitorManager::get()->getAllSetNames();
     ASSERT_TRUE(std::find(sets.begin(), sets.end(), setName) == sets.end());
 
+    auto mutex = MONGO_MAKE_LATCH("ReplicaSetMonitorCleanup");
+    stdx::condition_variable cv;
     bool cleanupInvoked = false;
-    auto rsm = ReplicaSetMonitorManager::get()->getOrCreateMonitor(
-        replSetUri, [&cleanupInvoked] { cleanupInvoked = true; });
+    auto rsm = ReplicaSetMonitorManager::get()->getOrCreateMonitor(replSetUri,
+                                                                   [&cleanupInvoked, &mutex, &cv] {
+                                                                       stdx::unique_lock lk(mutex);
+                                                                       cleanupInvoked = true;
+                                                                       cv.notify_one();
+                                                                   });
 
     sets = ReplicaSetMonitorManager::get()->getAllSetNames();
     ASSERT_TRUE(std::find(sets.begin(), sets.end(), setName) != sets.end());
@@ -183,6 +189,8 @@ TEST_F(ReplicaSetMonitorFixture, ReplicaSetMonitorCleanup) {
     shutdownExecutor();
     rsm.reset();
 
+    stdx::unique_lock lk(mutex);
+    cv.wait(lk, [&cleanupInvoked] { return cleanupInvoked; });
     ASSERT_TRUE(cleanupInvoked);
 }
 

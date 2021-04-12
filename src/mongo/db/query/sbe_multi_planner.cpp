@@ -56,16 +56,35 @@ CandidatePlans MultiPlanner::finalizeExecutionPlans(
     std::vector<plan_ranker::CandidatePlan> candidates) const {
     invariant(decision);
 
+    // Make sure we have at least one plan which hasn't failed.
+    uassert(4822873,
+            "all candidate plans failed during multi planning",
+            std::count_if(candidates.begin(), candidates.end(), [](auto&& candidate) {
+                return candidate.status.isOK();
+            }) > 0);
+
     auto&& stats = decision->getStats<sbe::PlanStageStats>();
+
     const auto winnerIdx = decision->candidateOrder[0];
-    invariant(winnerIdx < candidates.size());
-    invariant(winnerIdx < stats.candidatePlanStats.size());
+    tassert(5323801,
+            str::stream() << "winner index is out of candidate plans bounds: " << winnerIdx << ", "
+                          << candidates.size(),
+            winnerIdx < candidates.size());
+    tassert(5323802,
+            str::stream() << "winner index is out of candidate plan stats bounds: " << winnerIdx
+                          << ", " << stats.candidatePlanStats.size(),
+            winnerIdx < stats.candidatePlanStats.size());
+
     auto& winner = candidates[winnerIdx];
+    tassert(5323803,
+            str::stream() << "winning candidate retruned an error: " << winner.status,
+            winner.status.isOK());
 
     LOGV2_DEBUG(
         4822875, 5, "Winning solution", "bestSolution"_attr = redact(winner.solution->toString()));
 
-    auto explainer = plan_explainer_factory::make(winner.root.get(), winner.solution.get());
+    auto explainer =
+        plan_explainer_factory::make(winner.root.get(), &winner.data, winner.solution.get());
     LOGV2_DEBUG(4822876, 2, "Winning plan", "planSummary"_attr = explainer->getPlanSummary());
 
     // Close all candidate plans but the winner.
@@ -81,7 +100,7 @@ CandidatePlans MultiPlanner::finalizeExecutionPlans(
     // in the plan executor.
     if (!stats.candidatePlanStats[winnerIdx]->common.isEOF && winner.exitedEarly) {
         winner.root->close();
-        winner.root->open(true);
+        winner.root->open(false);
         // Clear the results queue.
         winner.results = decltype(winner.results){};
     }

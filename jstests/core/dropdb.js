@@ -1,34 +1,41 @@
-// Test that a db does not exist after it is dropped.
-// Disabled in the small oplog suite because the secondary may create a primary db
-// with the same name as the dropped db when requesting a clone.
-// @tags: [requires_fcv_49]
+/**
+ * Test that a db does not exist after it is dropped.
+ *
+ * @tags: [
+ *   # listDatabases with explicit filter on db names doesn't work on tenant migrations suites
+ *   tenant_migration_incompatible,
+ *   ]
+ */
 
-m = db.getMongo();
-baseName = "jstests_dropdb";
-ddb = db.getSiblingDB(baseName);
+(function() {
+"use strict";
 
-print("initial dbs: " + tojson(m.getDBNames()));
-
-function check(shouldExist) {
-    var dbs = m.getDBNames();
-    assert.eq(Array.contains(dbs, baseName),
-              shouldExist,
-              "DB " + baseName + " should " + (shouldExist ? "" : "not ") + "exist." +
-                  " dbs: " + tojson(dbs) + "\n" + tojson(m.getDBs()));
+function listDatabases(options) {
+    return assert
+        .commandWorked(db.adminCommand(Object.assign({listDatabases: 1, nameOnly: true}, options)))
+        .databases;
 }
 
+function assertDatabaseDoesNotExist(dbName) {
+    assert.eq(0, listDatabases({filter: {name: dbName}}).length);
+}
+
+function assertDatabaseExists(dbName) {
+    assert.eq(1,
+              listDatabases({filter: {name: dbName}}).length,
+              "database " + dbName + " not found in " + tojson(listDatabases()));
+}
+
+let ddb = db.getSiblingDB("jstests_dropdb");
+
+jsTest.log("Initial DBs: " + tojson(listDatabases()));
+
 ddb.c.save({});
-check(true);
+assertDatabaseExists(ddb.getName());
 
-var res = ddb.dropDatabase();
-assert.commandWorked(res);
-assert.eq(res.dropped, baseName, "dropped field did not contain correct database name");
-check(false);
+assert.commandWorked(ddb.dropDatabase());
+assertDatabaseDoesNotExist(ddb.getName());
 
-var res = ddb.dropDatabase();
-assert.commandWorked(res);
-assert.eq(res.dropped,
-          undefined,
-          "dropped field was populated even though nothing should have been dropped");
-assert.eq('database does not exist', res.info);
-check(false);
+assert.commandWorked(ddb.dropDatabase());
+assertDatabaseDoesNotExist(ddb.getName());
+})();

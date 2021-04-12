@@ -1,4 +1,4 @@
-"""Utility functions to create MongoDB processes.
+"""Utility functions for creating MongoDB processes.
 
 Handles all the nitty-gritty parameter conversion.
 """
@@ -12,45 +12,10 @@ from buildscripts.resmokelib import config
 from buildscripts.resmokelib import utils
 from buildscripts.resmokelib.core import jasper_process
 from buildscripts.resmokelib.core import process
-from buildscripts.resmokelib.multiversionconstants import LAST_LTS_MONGOD_BINARY
-from buildscripts.resmokelib.multiversionconstants import LAST_LTS_MONGOS_BINARY
-
-# The below parameters define the default 'logComponentVerbosity' object passed to mongod processes
-# started either directly via resmoke or those that will get started by the mongo shell. We allow
-# this default to be different for tests run locally and tests run in Evergreen. This allows us, for
-# example, to keep log verbosity high in Evergreen test runs without polluting the logs for
-# developers running local tests.
-
-# The default verbosity setting for any tests that are not started with an Evergreen task id. This
-# will apply to any tests run locally.
-DEFAULT_MONGOD_LOG_COMPONENT_VERBOSITY = {
-    "replication": {"rollback": 2}, "sharding": {"migration": 2}, "transaction": 4,
-    "tenantMigration": 4
-}
-
-DEFAULT_LAST_LTS_MONGOD_LOG_COMPONENT_VERBOSITY = {"replication": {"rollback": 2}, "transaction": 4}
-
-# The default verbosity setting for any mongod processes running in Evergreen i.e. started with an
-# Evergreen task id.
-DEFAULT_EVERGREEN_MONGOD_LOG_COMPONENT_VERBOSITY = {
-    "replication": {"election": 4, "heartbeats": 2, "initialSync": 2, "rollback": 2},
-    "sharding": {"migration": 2}, "storage": {"recovery": 2}, "transaction": 4, "tenantMigration": 4
-}
-
-# The default verbosity setting for any last-lts mongod processes running in Evergreen i.e. started
-# with an Evergreen task id.
-DEFAULT_EVERGREEN_LAST_LTS_MONGOD_LOG_COMPONENT_VERBOSITY = {
-    "replication": {"election": 4, "heartbeats": 2, "initialSync": 2, "rollback": 2},
-    "storage": {"recovery": 2}, "transaction": 4
-}
-
-# The default verbosity setting for any tests that are not started with an Evergreen task id. This
-# will apply to any tests run locally.
-DEFAULT_MONGOS_LOG_COMPONENT_VERBOSITY = {"transaction": 3}
-
-# The default verbosity setting for any tests running in Evergreen i.e. started with an Evergreen
-# task id.
-DEFAULT_EVERGREEN_MONGOS_LOG_COMPONENT_VERBOSITY = {"transaction": 3}
+from buildscripts.resmokelib.core import network
+from buildscripts.resmokelib.testing.fixtures import standalone, shardedcluster
+from buildscripts.resmokelib.testing.fixtures.fixturelib import FixtureLib
+from buildscripts.resmokelib.utils.history import make_historic, HistoryDict
 
 
 def make_process(*args, **kwargs):
@@ -82,230 +47,65 @@ def make_process(*args, **kwargs):
     return process_cls(*args, **kwargs)
 
 
-def default_mongod_log_component_verbosity():
-    """Return the default 'logComponentVerbosity' value to use for mongod processes."""
-    if config.EVERGREEN_TASK_ID:
-        return DEFAULT_EVERGREEN_MONGOD_LOG_COMPONENT_VERBOSITY
-    return DEFAULT_MONGOD_LOG_COMPONENT_VERBOSITY
+def mongod_program(logger, job_num, executable, process_kwargs, mongod_options):
+    """
+    Return a Process instance that starts mongod arguments constructed from 'mongod_options'.
 
+    @param logger - The logger to pass into the process.
+    @param executable - The mongod executable to run.
+    @param process_kwargs - A dict of key-value pairs to pass to the process.
+    @param mongod_options - A HistoryDict describing the various options to pass to the mongod.
+    """
 
-def default_last_lts_mongod_log_component_verbosity():
-    """Return the default 'logComponentVerbosity' value to use for last-lts mongod processes."""
-    if config.EVERGREEN_TASK_ID:
-        return DEFAULT_EVERGREEN_LAST_LTS_MONGOD_LOG_COMPONENT_VERBOSITY
-    return DEFAULT_LAST_LTS_MONGOD_LOG_COMPONENT_VERBOSITY
-
-
-def default_mongos_log_component_verbosity():
-    """Return the default 'logComponentVerbosity' value to use for mongos processes."""
-    if config.EVERGREEN_TASK_ID:
-        return DEFAULT_EVERGREEN_MONGOS_LOG_COMPONENT_VERBOSITY
-    return DEFAULT_MONGOS_LOG_COMPONENT_VERBOSITY
-
-
-def get_default_log_component_verbosity_for_mongod(executable):
-    """Return the correct default 'logComponentVerbosity' value for the executable version."""
-    if executable == LAST_LTS_MONGOD_BINARY:
-        return default_last_lts_mongod_log_component_verbosity()
-    return default_mongod_log_component_verbosity()
-
-
-def _add_testing_set_parameters(suite_set_parameters):
-    # Certain behaviors should only be enabled for resmoke usage. These are traditionally new
-    # commands, insecure access, and increased diagnostics.
-    suite_set_parameters.setdefault("testingDiagnosticsEnabled", True)
-    suite_set_parameters.setdefault("enableTestCommands", True)
-
-
-def mongod_program(  # pylint: disable=too-many-branches,too-many-statements
-        logger, executable=None, process_kwargs=None, **kwargs):
-    """Return a Process instance that starts mongod arguments constructed from 'kwargs'."""
-
-    executable = utils.default_if_none(executable, config.DEFAULT_MONGOD_EXECUTABLE)
     args = [executable]
+    mongod_options = mongod_options.copy()
 
-    # Apply the --setParameter command line argument. Command line options to resmoke.py override
-    # the YAML configuration.
-    suite_set_parameters = kwargs.pop("set_parameters", {})
-
-    if config.MONGOD_SET_PARAMETERS is not None:
-        suite_set_parameters.update(utils.load_yaml(config.MONGOD_SET_PARAMETERS))
-
-    # Set default log verbosity levels if none were specified.
-    if "logComponentVerbosity" not in suite_set_parameters:
-        suite_set_parameters[
-            "logComponentVerbosity"] = get_default_log_component_verbosity_for_mongod(executable)
-
-    # minNumChunksForSessionsCollection controls the minimum number of chunks the balancer will
-    # enforce for the sessions collection. If the actual number of chunks is less, the balancer will
-    # issue split commands to create more chunks. As a result, the balancer will also end up moving
-    # chunks for the sessions collection to balance the chunks across shards. Unless the suite is
-    # explicitly prepared to handle these background migrations, set the parameter to 1.
-    if "configsvr" in kwargs and "minNumChunksForSessionsCollection" not in suite_set_parameters:
-        suite_set_parameters["minNumChunksForSessionsCollection"] = 1
-
-    # orphanCleanupDelaySecs controls an artificial delay before cleaning up an orphaned chunk
-    # that has migrated off of a shard, meant to allow most dependent queries on secondaries to
-    # complete first. It defaults to 900, or 15 minutes, which is prohibitively long for tests.
-    # Setting it in the .yml file overrides this.
-    if "shardsvr" in kwargs and "orphanCleanupDelaySecs" not in suite_set_parameters:
-        suite_set_parameters["orphanCleanupDelaySecs"] = 1
-
-    # The LogicalSessionCache does automatic background refreshes in the server. This is
-    # race-y for tests, since tests trigger their own immediate refreshes instead. Turn off
-    # background refreshing for tests. Set in the .yml file to override this.
-    if "disableLogicalSessionCacheRefresh" not in suite_set_parameters:
-        suite_set_parameters["disableLogicalSessionCacheRefresh"] = True
-
-    # Set coordinateCommitReturnImmediatelyAfterPersistingDecision to false so that tests do
-    # not need to rely on causal consistency or explicitly wait for the transaction to finish
-    # committing. If we are running LAST_LTS mongoD and the test suite has explicitly set the
-    # coordinateCommitReturnImmediatelyAfterPersistingDecision parameter, we remove it from
-    # the setParameter list, since coordinateCommitReturnImmediatelyAfterPersistingDecision
-    # does not exist prior to 4.7.
-    # TODO(SERVER-51682): remove the 'elif' clause on master when 5.0 becomes LAST_LTS.
-    if executable != LAST_LTS_MONGOD_BINARY and \
-        "coordinateCommitReturnImmediatelyAfterPersistingDecision" not in suite_set_parameters:
-        suite_set_parameters["coordinateCommitReturnImmediatelyAfterPersistingDecision"] = False
-    elif executable == LAST_LTS_MONGOD_BINARY and \
-        "coordinateCommitReturnImmediatelyAfterPersistingDecision" in suite_set_parameters:
-        del suite_set_parameters["coordinateCommitReturnImmediatelyAfterPersistingDecision"]
-
-    # There's a periodic background thread that checks for and aborts expired transactions.
-    # "transactionLifetimeLimitSeconds" specifies for how long a transaction can run before expiring
-    # and being aborted by the background thread. It defaults to 60 seconds, which is too short to
-    # be reliable for our tests. Setting it to 24 hours, so that it is longer than the Evergreen
-    # execution timeout.
-    if "transactionLifetimeLimitSeconds" not in suite_set_parameters:
-        suite_set_parameters["transactionLifetimeLimitSeconds"] = 24 * 60 * 60
-
-    # Hybrid index builds drain writes received during the build process in batches of 1000 writes
-    # by default. Not all tests perform enough writes to exercise the code path where multiple
-    # batches are applied, which means certain bugs are harder to encounter. Set this level lower
-    # so there are more opportunities to drain writes in multiple batches.
-    if "maxIndexBuildDrainBatchSize" not in suite_set_parameters:
-        suite_set_parameters["maxIndexBuildDrainBatchSize"] = 10
-
-    # The periodic no-op writer writes an oplog entry of type='n' once every 10 seconds. This has
-    # the potential to mask issues such as SERVER-31609 because it allows the operationTime of
-    # cluster to advance even if the client is blocked for other reasons. We should disable the
-    # periodic no-op writer. Set in the .yml file to override this.
-    if "replSet" in kwargs and "writePeriodicNoops" not in suite_set_parameters:
-        suite_set_parameters["writePeriodicNoops"] = False
-
-    # The default time for stepdown and quiesce mode in response to SIGTERM is 15 seconds. Reduce
-    # this to 100ms for faster shutdown. On branches 4.4 and earlier, there is no quiesce mode, but
-    # the default time for stepdown is 10 seconds.
-    # TODO(SERVER-47797): Remove reference to waitForStepDownOnNonCommandShutdown.
-    if ("replSet" in kwargs and "waitForStepDownOnNonCommandShutdown" not in suite_set_parameters
-            and "shutdownTimeoutMillisForSignaledShutdown" not in suite_set_parameters):
-        if executable == LAST_LTS_MONGOD_BINARY:
-            suite_set_parameters["waitForStepDownOnNonCommandShutdown"] = False
-        else:
-            suite_set_parameters["shutdownTimeoutMillisForSignaledShutdown"] = 100
-
-    if "enableFlowControl" not in suite_set_parameters and config.FLOW_CONTROL is not None:
-        suite_set_parameters["enableFlowControl"] = (config.FLOW_CONTROL == "on")
-
-    if ("failpoint.flowControlTicketOverride" not in suite_set_parameters
-            and config.FLOW_CONTROL_TICKETS is not None):
-        suite_set_parameters["failpoint.flowControlTicketOverride"] = {
-            "mode": "alwaysOn", "data": {"numTickets": config.FLOW_CONTROL_TICKETS}
-        }
-
-    _add_testing_set_parameters(suite_set_parameters)
-
+    if "port" not in mongod_options:
+        mongod_options["port"] = network.PortAllocator.next_fixture_port(job_num)
+    suite_set_parameters = mongod_options.get("set_parameters", make_historic({}))
     _apply_set_parameters(args, suite_set_parameters)
-
-    shortcut_opts = {
-        "enableMajorityReadConcern": config.MAJORITY_READ_CONCERN,
-        "nojournal": config.NO_JOURNAL,
-        "storageEngine": config.STORAGE_ENGINE,
-        "transportLayer": config.TRANSPORT_LAYER,
-        "wiredTigerCollectionConfigString": config.WT_COLL_CONFIG,
-        "wiredTigerEngineConfigString": config.WT_ENGINE_CONFIG,
-        "wiredTigerIndexConfigString": config.WT_INDEX_CONFIG,
-    }
-
-    if config.STORAGE_ENGINE == "inMemory":
-        shortcut_opts["inMemorySizeGB"] = config.STORAGE_ENGINE_CACHE_SIZE
-    elif config.STORAGE_ENGINE == "rocksdb":
-        shortcut_opts["rocksdbCacheSizeGB"] = config.STORAGE_ENGINE_CACHE_SIZE
-    elif config.STORAGE_ENGINE == "wiredTiger" or config.STORAGE_ENGINE is None:
-        shortcut_opts["wiredTigerCacheSizeGB"] = config.STORAGE_ENGINE_CACHE_SIZE
-
-    # These options are just flags, so they should not take a value.
-    opts_without_vals = ("nojournal", "logappend")
-
-    # Have the --nojournal command line argument to resmoke.py unset the journal option.
-    if shortcut_opts["nojournal"] and "journal" in kwargs:
-        del kwargs["journal"]
-
-    # Ensure that config servers run with journaling enabled.
-    if "configsvr" in kwargs:
-        shortcut_opts["nojournal"] = False
-        kwargs["journal"] = ""
-
-    # Command line options override the YAML configuration.
-    for opt_name in shortcut_opts:
-        opt_value = shortcut_opts[opt_name]
-        if opt_name in opts_without_vals:
-            # Options that are specified as --flag on the command line are represented by a boolean
-            # value where True indicates that the flag should be included in 'kwargs'.
-            if opt_value:
-                kwargs[opt_name] = ""
-        else:
-            # Options that are specified as --key=value on the command line are represented by a
-            # value where None indicates that the key-value pair shouldn't be included in 'kwargs'.
-            if opt_value is not None:
-                kwargs[opt_name] = opt_value
-
-    # Override the storage engine specified on the command line with "wiredTiger" if running a
-    # config server replica set.
-    if "replSet" in kwargs and "configsvr" in kwargs:
-        kwargs["storageEngine"] = "wiredTiger"
+    mongod_options.pop("set_parameters")
 
     # Apply the rest of the command line arguments.
-    _apply_kwargs(args, kwargs)
+    _apply_kwargs(args, mongod_options)
 
-    _set_keyfile_permissions(kwargs)
+    _set_keyfile_permissions(mongod_options)
 
-    process_kwargs = utils.default_if_none(process_kwargs, {})
-    return make_process(logger, args, **process_kwargs)
+    process_kwargs = make_historic(utils.default_if_none(process_kwargs, {}))
+    process_kwargs["job_num"] = job_num
+    if config.EXPORT_MONGOD_CONFIG == "regular":
+        mongod_options.dump_history(f"{logger.name}_config.yml")
+    elif config.EXPORT_MONGOD_CONFIG == "detailed":
+        mongod_options.dump_history(f"{logger.name}_config.yml", include_location=True)
+    return make_process(logger, args, **process_kwargs), mongod_options["port"]
 
 
-def mongos_program(logger, executable=None, process_kwargs=None, **kwargs):
+def mongos_program(  # pylint: disable=too-many-arguments
+        logger, job_num, test_id=None, executable=None, process_kwargs=None, mongos_options=None):
     """Return a Process instance that starts a mongos with arguments constructed from 'kwargs'."""
-
-    executable = utils.default_if_none(executable, config.DEFAULT_MONGOS_EXECUTABLE)
     args = [executable]
 
-    # Apply the --setParameter command line argument. Command line options to resmoke.py override
-    # the YAML configuration.
-    suite_set_parameters = kwargs.pop("set_parameters", {})
+    mongos_options = mongos_options.copy()
 
-    if config.MONGOS_SET_PARAMETERS is not None:
-        suite_set_parameters.update(utils.load_yaml(config.MONGOS_SET_PARAMETERS))
-
-    # Set default log verbosity levels if none were specified.
-    if "logComponentVerbosity" not in suite_set_parameters:
-        suite_set_parameters["logComponentVerbosity"] = default_mongos_log_component_verbosity()
-
-    _add_testing_set_parameters(suite_set_parameters)
-
+    if "port" not in mongos_options:
+        mongos_options["port"] = network.PortAllocator.next_fixture_port(job_num)
+    suite_set_parameters = mongos_options.get("set_parameters", {})
     _apply_set_parameters(args, suite_set_parameters)
+    mongos_options.pop("set_parameters")
 
     # Apply the rest of the command line arguments.
-    _apply_kwargs(args, kwargs)
+    _apply_kwargs(args, mongos_options)
 
-    _set_keyfile_permissions(kwargs)
+    _set_keyfile_permissions(mongos_options)
 
-    process_kwargs = utils.default_if_none(process_kwargs, {})
-    return make_process(logger, args, **process_kwargs)
+    process_kwargs = make_historic(utils.default_if_none(process_kwargs, {}))
+    process_kwargs["job_num"] = job_num
+    process_kwargs["test_id"] = test_id
+    return make_process(logger, args, **process_kwargs), mongos_options["port"]
 
 
 def mongo_shell_program(  # pylint: disable=too-many-arguments,too-many-branches,too-many-locals,too-many-statements
-        logger, job_num=None, test_id=None, executable=None, connection_string=None, filename=None,
+        logger, job_num, test_id=None, executable=None, connection_string=None, filename=None,
         process_kwargs=None, **kwargs):
     """Return a Process instance that starts a mongo shell.
 
@@ -373,20 +173,27 @@ def mongo_shell_program(  # pylint: disable=too-many-arguments,too-many-branches
     if config.MONGOCRYPTD_SET_PARAMETERS is not None:
         mongocryptd_set_parameters.update(utils.load_yaml(config.MONGOCRYPTD_SET_PARAMETERS))
 
+    fixturelib = FixtureLib()
+    mongod_launcher = standalone.MongodLauncher(fixturelib)
+
     # If the 'logComponentVerbosity' setParameter for mongod was not already specified, we set its
     # value to a default.
     mongod_set_parameters.setdefault("logComponentVerbosity",
-                                     default_mongod_log_component_verbosity())
+                                     mongod_launcher.default_mongod_log_component_verbosity())
 
     # If the 'enableFlowControl' setParameter for mongod was not already specified, we set its value
     # to a default.
     if config.FLOW_CONTROL is not None:
         mongod_set_parameters.setdefault("enableFlowControl", config.FLOW_CONTROL == "on")
 
+    # Set the default value for minimum resharding operation duration to 5 seconds.
+    mongod_set_parameters.setdefault("reshardingMinimumOperationDurationMillis", 5000)
+
+    mongos_launcher = shardedcluster.MongosLauncher(fixturelib)
     # If the 'logComponentVerbosity' setParameter for mongos was not already specified, we set its
     # value to a default.
     mongos_set_parameters.setdefault("logComponentVerbosity",
-                                     default_mongos_log_component_verbosity())
+                                     mongos_launcher.default_mongos_log_component_verbosity())
 
     test_data["setParameters"] = mongod_set_parameters
     test_data["setParametersMongos"] = mongos_set_parameters
@@ -492,7 +299,7 @@ def _format_shell_vars(sb, paths, value):
         return lst[0] + ''.join(f'["{i}"]' for i in lst[1:])
 
     # Only need to do special handling for JSON objects.
-    if not isinstance(value, dict):
+    if not isinstance(value, (dict, HistoryDict)):
         sb.append("%s = %s" % (bracketize(paths), json.dumps(value)))
         return
 
@@ -503,7 +310,8 @@ def _format_shell_vars(sb, paths, value):
         _format_shell_vars(sb, paths + [subkey], value[subkey])
 
 
-def dbtest_program(logger, executable=None, suites=None, process_kwargs=None, **kwargs):
+def dbtest_program(logger, job_num, test_id=None, executable=None, suites=None, process_kwargs=None,
+                   **kwargs):  # pylint: disable=too-many-arguments
     """Return a Process instance that starts a dbtest with arguments constructed from 'kwargs'."""
 
     executable = utils.default_if_none(executable, config.DEFAULT_DBTEST_EXECUTABLE)
@@ -519,17 +327,19 @@ def dbtest_program(logger, executable=None, suites=None, process_kwargs=None, **
     if config.FLOW_CONTROL is not None:
         kwargs["flowControl"] = (config.FLOW_CONTROL == "on")
 
-    return generic_program(logger, args, process_kwargs=process_kwargs, **kwargs)
+    return generic_program(logger, args, job_num, test_id=test_id, process_kwargs=process_kwargs,
+                           **kwargs)
 
 
-def genny_program(logger, executable=None, process_kwargs=None, **kwargs):
+def genny_program(logger, job_num, test_id=None, executable=None, process_kwargs=None, **kwargs):
     """Return a Process instance that starts a genny executable with arguments constructed from 'kwargs'."""
     executable = utils.default_if_none(executable, config.DEFAULT_GENNY_EXECUTABLE)
     args = [executable]
-    return generic_program(logger, args, process_kwargs, **kwargs)
+    return generic_program(logger, args, job_num, test_id=test_id, process_kwargs=process_kwargs,
+                           **kwargs)
 
 
-def generic_program(logger, args, process_kwargs=None, **kwargs):
+def generic_program(logger, args, job_num, test_id=None, process_kwargs=None, **kwargs):
     """Return a Process instance that starts an arbitrary executable.
 
     The executable arguments are constructed from 'kwargs'.
@@ -543,6 +353,8 @@ def generic_program(logger, args, process_kwargs=None, **kwargs):
     _apply_kwargs(args, kwargs)
 
     process_kwargs = utils.default_if_none(process_kwargs, {})
+    process_kwargs["job_num"] = job_num
+    process_kwargs["test_id"] = test_id
     return make_process(logger, args, **process_kwargs)
 
 

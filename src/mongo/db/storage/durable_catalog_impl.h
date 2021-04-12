@@ -39,7 +39,6 @@
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/bson_collection_catalog_entry.h"
 #include "mongo/db/storage/durable_catalog.h"
-#include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/platform/mutex.h"
 
 namespace mongo {
@@ -137,6 +136,10 @@ public:
 
     void updateCappedSize(OperationContext* opCtx, RecordId catalogId, long long size);
 
+    void updateClusteredIndexTTLSetting(OperationContext* opCtx,
+                                        RecordId catalogId,
+                                        boost::optional<int64_t> expireAfterSeconds);
+
     void updateTTLSetting(OperationContext* opCtx,
                           RecordId catalogId,
                           StringData idxName,
@@ -147,9 +150,7 @@ public:
                              StringData idxName,
                              bool hidden);
 
-    bool isEqualToMetadataUUID(OperationContext* opCtx,
-                               RecordId catalogId,
-                               OptionalCollectionUUID uuid);
+    bool isEqualToMetadataUUID(OperationContext* opCtx, RecordId catalogId, const UUID& uuid);
 
     void setIsTemp(OperationContext* opCtx, RecordId catalogId, bool isTemp);
 
@@ -172,8 +173,7 @@ public:
     Status dropAndRecreateIndexIdentForResume(OperationContext* opCtx,
                                               RecordId catalogId,
                                               const IndexDescriptor* spec,
-                                              StringData ident,
-                                              KVPrefix prefix);
+                                              StringData ident);
 
     boost::optional<UUID> getIndexBuildUUID(OperationContext* opCtx,
                                             RecordId catalogId,
@@ -190,6 +190,12 @@ public:
                             RecordId catalogId,
                             StringData indexName,
                             const MultikeyPaths& multikeyPaths);
+
+    void forceSetIndexIsMultikey(OperationContext* opCtx,
+                                 RecordId catalogId,
+                                 const IndexDescriptor* desc,
+                                 bool isMultikey,
+                                 const MultikeyPaths& multikeyPaths);
 
     CollectionOptions getCollectionOptions(OperationContext* opCtx, RecordId catalogId) const;
 
@@ -211,10 +217,6 @@ public:
 
     bool isIndexReady(OperationContext* opCtx, RecordId catalogId, StringData indexName) const;
 
-    KVPrefix getIndexPrefix(OperationContext* opCtx,
-                            RecordId catalogId,
-                            StringData indexName) const;
-
     void setRand_forTest(const std::string& rand);
 
     std::string getRand_forTest() const;
@@ -231,8 +233,7 @@ private:
     BSONObj _findEntry(OperationContext* opCtx, RecordId catalogId) const;
     StatusWith<Entry> _addEntry(OperationContext* opCtx,
                                 NamespaceString nss,
-                                const CollectionOptions& options,
-                                KVPrefix prefix);
+                                const CollectionOptions& options);
     StatusWith<Entry> _importEntry(OperationContext* opCtx,
                                    NamespaceString nss,
                                    const BSONObj& metadata);

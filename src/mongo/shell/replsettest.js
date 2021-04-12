@@ -180,13 +180,31 @@ var ReplSetTest = function(opts) {
         });
     }
 
+    /**
+     * For all unauthenticated connections passed in, authenticates them with the '__system' user.
+     * If a connection is already authenticated, we will skip authentication for that connection and
+     * assume that it already has the correct privileges. It is up to the caller of this function to
+     * ensure that the connection is appropriately authenticated.
+     */
     function asCluster(conn, fn, keyFileParam = self.keyFile) {
-        if (keyFileParam) {
-            return authutil.asCluster(conn, keyFileParam, fn);
+        let connArray = conn;
+        if (conn.length == null)
+            connArray = [conn];
+
+        const unauthenticatedConns = connArray.filter(connection => {
+            const connStatus = connection.adminCommand({connectionStatus: 1, showPrivileges: true});
+            const connIsAuthenticated = connStatus.authInfo.authenticatedUsers.length > 0;
+            return !connIsAuthenticated;
+        });
+
+        if (keyFileParam && unauthenticatedConns.length > 0) {
+            return authutil.asCluster(unauthenticatedConns, keyFileParam, fn);
         } else {
             return fn();
         }
     }
+
+    this.asCluster = asCluster;
 
     /**
      * Returns 'true' if the "conn" has been configured to run without journaling enabled.
@@ -420,8 +438,9 @@ var ReplSetTest = function(opts) {
      * Returns the OpTime for the specified host by issuing replSetGetStatus.
      */
     function _getLastOpTime(conn) {
-        var replSetStatus =
-            assert.commandWorked(conn.getDB("admin").runCommand({replSetGetStatus: 1}));
+        var replSetStatus = asCluster(
+            conn,
+            () => assert.commandWorked(conn.getDB("admin").runCommand({replSetGetStatus: 1})));
         var connStatus = replSetStatus.members.filter(m => m.self)[0];
         var opTime = connStatus.optime;
         if (_isEmptyOpTime(opTime)) {
@@ -459,8 +478,9 @@ var ReplSetTest = function(opts) {
      * Returns the last applied OpTime otherwise.
      */
     function _getDurableOpTime(conn) {
-        var replSetStatus =
-            assert.commandWorked(conn.getDB("admin").runCommand({replSetGetStatus: 1}));
+        var replSetStatus = asCluster(
+            conn,
+            () => assert.commandWorked(conn.getDB("admin").runCommand({replSetGetStatus: 1})));
 
         var opTimeType = "durableOpTime";
         if (_isRunningWithoutJournaling(conn)) {
@@ -1659,7 +1679,7 @@ var ReplSetTest = function(opts) {
             // Since assert.soon() timeout is 10 minutes (default), setting
             // awaitNodesAgreeOnPrimary() timeout as 1 minute to allow retry of replSetStepUp
             // command on failure of the replica set to agree on the primary.
-            const timeout = 60 * 100;
+            const timeout = 60 * 1000;
             this.awaitNodesAgreeOnPrimary(timeout, this.nodes, node);
 
             // getPrimary() guarantees that there will be only one writable primary for a replica
@@ -1948,7 +1968,8 @@ var ReplSetTest = function(opts) {
 
         assert.retryNoExcept(() => {
             primary = this.getPrimary();
-            primaryConfigVersion = this.getReplSetConfigFromNode().version;
+            primaryConfigVersion =
+                asCluster(primary, () => this.getReplSetConfigFromNode()).version;
             primaryName = primary.host;
             return true;
         }, "ReplSetTest awaitReplication: couldnt get repl set config.", num_attempts, 1000);
@@ -1973,13 +1994,15 @@ var ReplSetTest = function(opts) {
             var secondaryName = secondary.host;
 
             var secondaryConfigVersion =
-                secondary._runWithForcedReadMode("commands",
-                                                 () => secondary.getDB("local")['system.replset']
-                                                           .find()
-                                                           .readConcern("local")
-                                                           .limit(1)
-                                                           .next()
-                                                           .version);
+                asCluster(secondary,
+                          () => secondary._runWithForcedReadMode(
+                              "commands",
+                              () => secondary.getDB("local")['system.replset']
+                                        .find()
+                                        .readConcern("local")
+                                        .limit(1)
+                                        .next()
+                                        .version));
 
             if (primaryConfigVersion != secondaryConfigVersion) {
                 print("ReplSetTest awaitReplication: secondary #" + secondaryCount + ", " +
@@ -2006,7 +2029,9 @@ var ReplSetTest = function(opts) {
             }
 
             // Skip this node if we're connected to an arbiter
-            var res = assert.commandWorked(secondary.adminCommand({replSetGetStatus: 1}));
+            var res = asCluster(
+                secondary,
+                () => assert.commandWorked(secondary.adminCommand({replSetGetStatus: 1})));
             if (res.myState == ReplSetTest.State.ARBITER) {
                 return Progress.Skip;
             }
@@ -2347,7 +2372,8 @@ var ReplSetTest = function(opts) {
                                                                  msgPrefix,
                                                                  ignoreUUIDs,
                                                                  hasSecondaryIndexes,
-                                                                 collectionPrinted);
+                                                                 collectionPrinted) &&
+                        success;
 
                     if (!success) {
                         if (!hasDumpedOplog) {
@@ -2512,8 +2538,13 @@ var ReplSetTest = function(opts) {
             const firstReader = readers[firstReaderIndex];
             let prevOplogEntry;
             assert(firstReader.hasNext(), "oplog is empty while checkOplogs is called");
+            // Track the number of bytes we are reading as we check the oplog. We use this to avoid
+            // out-of-memory issues by calling to garbage collect whenever the memory footprint is
+            // large.
+            let bytesSinceGC = 0;
             while (firstReader.hasNext()) {
                 const oplogEntry = firstReader.next();
+                bytesSinceGC += Object.bsonsize(oplogEntry);
                 if (oplogEntry === kCappedPositionLostSentinel) {
                     // When using legacy OP_QUERY/OP_GET_MORE reads against mongos, it is
                     // possible for hasNext() to return true but for next() to throw an exception.
@@ -2528,6 +2559,7 @@ var ReplSetTest = function(opts) {
                     }
 
                     const otherOplogEntry = readers[i].next();
+                    bytesSinceGC += Object.bsonsize(otherOplogEntry);
                     if (otherOplogEntry && otherOplogEntry !== kCappedPositionLostSentinel) {
                         assertOplogEntriesEq.call(this,
                                                   oplogEntry,
@@ -2536,6 +2568,11 @@ var ReplSetTest = function(opts) {
                                                   readers[i],
                                                   prevOplogEntry);
                     }
+                }
+                // Garbage collect every 10MB.
+                if (bytesSinceGC > (10 * 1024 * 1024)) {
+                    gc();
+                    bytesSinceGC = 0;
                 }
                 prevOplogEntry = oplogEntry;
             }

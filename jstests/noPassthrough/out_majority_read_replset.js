@@ -1,5 +1,7 @@
 // Tests the $out and read concern majority.
-// @tags: [requires_majority_read_concern]
+// @tags: [
+//   requires_majority_read_concern,
+// ]
 (function() {
 "use strict";
 

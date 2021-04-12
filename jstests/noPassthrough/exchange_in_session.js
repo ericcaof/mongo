@@ -2,7 +2,10 @@
  * Be sure that an exchange won't deadlock when one of the consumer's buffers is full. Iterates two
  * consumers on an Exchange with a very small buffer. This test was designed to reproduce
  * SERVER-37499.
- * @tags: [requires_sharding, uses_transactions]
+ * @tags: [
+ *   requires_sharding,
+ *   uses_transactions,
+ * ]
  */
 (function() {
 // This test manually simulates a session, which is not compatible with implicit sessions.

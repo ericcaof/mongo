@@ -40,7 +40,7 @@
 #include "mongo/db/index_names.h"
 #include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/matcher/expression_geo.h"
-#include "mongo/db/matcher/expression_internal_expr_eq.h"
+#include "mongo/db/matcher/expression_internal_expr_comparison.h"
 #include "mongo/db/matcher/expression_text.h"
 #include "mongo/db/query/canonical_query_encoder.h"
 #include "mongo/db/query/collation/collator_interface.h"
@@ -383,9 +383,10 @@ bool QueryPlannerIXSelect::_compatible(const BSONElement& keyPatternElt,
     // We know keyPatternElt.fieldname() == node->path().
     MatchExpression::MatchType exprtype = node->matchType();
 
-    if (exprtype == MatchExpression::INTERNAL_EXPR_EQ &&
+    if (ComparisonMatchExpressionBase::isInternalExprComparison(exprtype) &&
         index.pathHasMultikeyComponent(keyPatternElt.fieldNameStringData())) {
-        // Expression language equality cannot be indexed if the field path has multikey components.
+        // Expression language comparisons cannot be indexed if the field path has multikey
+        // components.
         return false;
     }
 
@@ -483,10 +484,15 @@ bool QueryPlannerIXSelect::_compatible(const BSONElement& keyPatternElt,
             newContext.innermostParentElemMatch = static_cast<ElemMatchValueMatchExpression*>(node);
 
             auto&& children = node->getChildVector();
-            if (!std::all_of(children->begin(), children->end(), [&](MatchExpression* child) {
+            if (!std::all_of(children->begin(), children->end(), [&](auto&& child) {
                     const auto newPath = fullPathToNode.toString() + child->path();
-                    return _compatible(
-                        keyPatternElt, index, keyPatternIdx, child, newPath, collator, newContext);
+                    return _compatible(keyPatternElt,
+                                       index,
+                                       keyPatternIdx,
+                                       child.get(),
+                                       newPath,
+                                       collator,
+                                       newContext);
                 })) {
                 return false;
             }

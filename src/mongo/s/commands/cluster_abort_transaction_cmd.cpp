@@ -32,6 +32,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/transaction_validation.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/cluster_commands_helpers.h"
@@ -57,20 +58,7 @@ public:
 
     void validateResult(const BSONObj& resultObj) final {
         auto ctx = IDLParserErrorContext("AbortReply");
-        auto status = getStatusFromCommandResult(resultObj);
-        auto wcStatus = getWriteConcernStatusFromCommandResult(resultObj);
-
-        if (!wcStatus.isOK()) {
-            if (wcStatus.code() == ErrorCodes::TypeMismatch) {
-                // Result has "writeConcerError" field but it is not valid wce object.
-                uassertStatusOK(wcStatus);
-            }
-        }
-
-        if (!status.isOK()) {
-            // Will throw if the result doesn't match the ErrorReply.
-            ErrorReply::parse(ctx, resultObj);
-        } else {
+        if (!checkIsErrorStatus(resultObj, ctx)) {
             // Will throw if the result doesn't match the abortReply.
             Reply::parse(ctx, resultObj);
         }
@@ -114,10 +102,11 @@ public:
         return Status::OK();
     }
 
-    bool run(OperationContext* opCtx,
-             const std::string& dbName,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) override {
+    bool runWithRequestParser(OperationContext* opCtx,
+                              const std::string& dbName,
+                              const BSONObj& cmdObj,
+                              const RequestParser& requestParser,
+                              BSONObjBuilder& result) final {
         auto txnRouter = TransactionRouter::get(opCtx);
         uassert(ErrorCodes::InvalidOptions,
                 "abortTransaction can only be run within a session",
@@ -126,6 +115,10 @@ public:
         auto abortRes = txnRouter.abortTransaction(opCtx);
         CommandHelpers::filterCommandReplyForPassthrough(abortRes, &result);
         return true;
+    }
+
+    const AuthorizationContract* getAuthorizationContract() const final {
+        return &::mongo::AbortTransaction::kAuthorizationContract;
     }
 
 } clusterAbortTransactionCmd;

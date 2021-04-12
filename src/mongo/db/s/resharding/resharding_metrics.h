@@ -27,15 +27,19 @@
  *    it in the license file.
  */
 
+#pragma once
+
 #include <boost/optional.hpp>
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/s/resharding/common_types_gen.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/duration.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -48,7 +52,8 @@ public:
     ReshardingMetrics(const ReshardingMetrics&) = delete;
     ReshardingMetrics(ReshardingMetrics&&) = delete;
 
-    ReshardingMetrics(ServiceContext* svcCtx) : _svcCtx(svcCtx) {}
+    explicit ReshardingMetrics(ServiceContext* svcCtx)
+        : _svcCtx(svcCtx), _cumulativeOp(svcCtx->getFastClockSource()) {}
 
     static ReshardingMetrics* get(ServiceContext*) noexcept;
 
@@ -62,8 +67,9 @@ public:
     void setRecipientState(RecipientStateEnum) noexcept;
     void setCoordinatorState(CoordinatorStateEnum) noexcept;
 
-    // Allows updating metrics on "documents to copy" so long as the recipient is in cloning state.
+    // Set by donors.
     void setDocumentsToCopy(int64_t documents, int64_t bytes) noexcept;
+    // Allows updating metrics on "documents to copy" so long as the recipient is in cloning state.
     void onDocumentsCopied(int64_t documents, int64_t bytes) noexcept;
 
     // Allows updating "oplog entries to apply" metrics when the recipient is in applying state.
@@ -71,28 +77,52 @@ public:
     void onOplogEntriesApplied(int64_t entries) noexcept;
 
     // Allows tracking writes during a critical section when the donor's state is either of
-    // "preparing-to-mirror" or "mirroring".
+    // "preparing-to-block-writes" or "blocking-writes".
     void onWriteDuringCriticalSection(int64_t writes) noexcept;
 
     // Marks the completion of the current (active) resharding operation. Aborts the process if no
     // resharding operation is in progress.
-    enum class OperationStatus { kUnknown = -1, kSucceeded = 0, kFailed = 1, kCanceled = 2 };
-    void onCompletion(OperationStatus) noexcept;
+    void onCompletion(ReshardingOperationStatusEnum) noexcept;
 
-    void serialize(BSONObjBuilder*) const;
+    struct ReporterOptions {
+        enum class Role { kDonor, kRecipient, kCoordinator };
+        ReporterOptions(Role role, UUID id, NamespaceString nss, BSONObj shardKey, bool unique)
+            : role(role),
+              id(std::move(id)),
+              nss(std::move(nss)),
+              shardKey(std::move(shardKey)),
+              unique(unique) {}
+
+        const Role role;
+        const UUID id;
+        const NamespaceString nss;
+        const BSONObj shardKey;
+        const bool unique;
+    };
+    BSONObj reportForCurrentOp(const ReporterOptions& options) const noexcept;
+
+    // Append metrics to the builder in CurrentOp format for the given `role`.
+    void serializeCurrentOpMetrics(BSONObjBuilder*, ReporterOptions::Role role) const;
+
+    // Append metrics to the builder in CumulativeOp (ServerStatus) format.
+    void serializeCumulativeOpMetrics(BSONObjBuilder*) const;
+
+    // Reports the elapsed time for the active resharding operation, or `boost::none`.
+    boost::optional<Milliseconds> getOperationElapsedTime() const;
 
 private:
     ServiceContext* const _svcCtx;
 
     mutable Mutex _mutex = MONGO_MAKE_LATCH("ReshardingMetrics::_mutex");
 
-    // The following maintain the number of operations that succeeded, failed with an unrecoverable
-    // error, and canceled by the user, respectively.
+    // The following maintain the number of resharding operations that have started, succeeded,
+    // failed with an unrecoverable error, and canceled by the user, respectively.
+    int64_t _started = 0;
     int64_t _succeeded = 0;
     int64_t _failed = 0;
     int64_t _canceled = 0;
 
-    // Metrics for an active resharding operation. Accesses must be serialized using `_mutex`.
+    // Metrics for resharding operation. Accesses must be serialized using `_mutex`.
     struct OperationMetrics {
         // Allows tracking elapsed time for the resharding operation and its sub operations (e.g.,
         // applying oplog entries).
@@ -102,7 +132,6 @@ private:
 
             void start() noexcept;
 
-            void tryEnd() noexcept;
             void end() noexcept;
 
             Milliseconds duration() const noexcept;
@@ -119,14 +148,13 @@ private:
               applyingOplogEntries(clockSource),
               inCriticalSection(clockSource) {}
 
-        void append(BSONObjBuilder*) const;
+        using Role = ReporterOptions::Role;
+        void appendCurrentOpMetrics(BSONObjBuilder*, Role) const;
 
-        bool isCompleted() const noexcept {
-            return completionStatus.has_value();
-        }
+        void appendCumulativeOpMetrics(BSONObjBuilder*) const;
 
         TimeInterval runningOperation;
-        boost::optional<OperationStatus> completionStatus;
+        ReshardingOperationStatusEnum opStatus = ReshardingOperationStatusEnum::kInactive;
 
         TimeInterval copyingDocuments;
         int64_t documentsToCopy = 0;
@@ -146,6 +174,7 @@ private:
         CoordinatorStateEnum coordinatorState = CoordinatorStateEnum::kUnused;
     };
     boost::optional<OperationMetrics> _currentOp;
+    OperationMetrics _cumulativeOp;
 };
 
 }  // namespace mongo

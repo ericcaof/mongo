@@ -1,5 +1,7 @@
 // SERVER-35132 Test that we still honor maxTimeMs during replica set targeting.
-// @tags: [requires_replication]
+// @tags: [
+//   requires_replication,
+// ]
 (function() {
 'use strict';
 var st = new ShardingTest({mongos: 1, shards: 1, rs: {nodes: 2}});

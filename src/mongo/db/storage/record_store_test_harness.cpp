@@ -32,6 +32,7 @@
 #include "mongo/db/storage/record_store_test_harness.h"
 
 
+#include "mongo/db/record_id_helpers.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/unittest/unittest.h"
 
@@ -402,6 +403,190 @@ TEST(RecordStoreTestHarness, Cursor1) {
         }
         ASSERT_EQUALS(0, x);
         ASSERT(!cursor->next());
+    }
+}
+
+TEST(RecordStoreTestHarness, ClusteredRecordStore) {
+    const auto harnessHelper = newRecordStoreHarnessHelper();
+    if (!harnessHelper->getEngine()->supportsClusteredIdIndex()) {
+        // Only WiredTiger supports clustered indexes on _id.
+        return;
+    }
+
+    const std::string ns = "test.system.buckets.a";
+    CollectionOptions options;
+    options.clusteredIndex = ClusteredIndexOptions{};
+    std::unique_ptr<RecordStore> rs = harnessHelper->newNonCappedRecordStore(ns, options);
+    invariant(rs->keyFormat() == KeyFormat::String);
+
+    auto opCtx = harnessHelper->newOperationContext();
+
+    const int numRecords = 100;
+    std::vector<Record> records;
+    std::vector<Timestamp> timestamps(numRecords, Timestamp());
+
+    for (int i = 0; i < numRecords; i++) {
+        BSONObj doc = BSON("_id" << OID::gen() << "i" << i);
+        RecordData recordData = RecordData(doc.objdata(), doc.objsize());
+        recordData.makeOwned();
+
+        RecordId id = uassertStatusOK(record_id_helpers::keyForDoc(doc));
+        records.push_back({id, recordData});
+    }
+
+    {
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_OK(rs->insertRecords(opCtx.get(), &records, timestamps));
+        wuow.commit();
+    }
+
+    {
+        int currRecord = 0;
+        auto cursor = rs->getCursor(opCtx.get(), /*forward=*/true);
+        while (auto record = cursor->next()) {
+            ASSERT_EQ(record->id, records.at(currRecord).id);
+            ASSERT_EQ(0, strcmp(records.at(currRecord).data.data(), record->data.data()));
+            currRecord++;
+        }
+
+        ASSERT_EQ(numRecords, currRecord);
+    }
+
+    {
+        // Verify random cursors work on ObjectId's.
+        auto cursor = rs->getRandomCursor(opCtx.get());
+        auto record = cursor->next();
+        ASSERT(record);
+
+        auto it =
+            std::find_if(records.begin(), records.end(), [&](const Record savedRecord) -> bool {
+                if (savedRecord.id == record->id) {
+                    return true;
+                }
+                return false;
+            });
+
+        ASSERT(it != records.end());
+        ASSERT_EQ(0, strcmp(it->data.data(), record->data.data()));
+    }
+
+    {
+        // Verify that find works with ObjectId.
+        for (int i = 0; i < numRecords; i += 10) {
+            RecordData rd;
+            ASSERT_TRUE(rs->findRecord(opCtx.get(), records.at(i).id, &rd));
+            ASSERT_EQ(0, strcmp(records.at(i).data.data(), rd.data()));
+        }
+
+
+        RecordId minId = record_id_helpers::keyForOID(OID());
+        ASSERT_FALSE(rs->findRecord(opCtx.get(), minId, nullptr));
+
+        RecordId maxId = record_id_helpers::keyForOID(OID::max());
+        ASSERT_FALSE(rs->findRecord(opCtx.get(), maxId, nullptr));
+    }
+
+    {
+        // Verify that update works with ObjectId.
+        BSONObj doc = BSON("i"
+                           << "updated");
+
+        WriteUnitOfWork wuow(opCtx.get());
+        for (int i = 0; i < numRecords; i += 10) {
+            ASSERT_OK(
+                rs->updateRecord(opCtx.get(), records.at(i).id, doc.objdata(), doc.objsize()));
+        }
+        wuow.commit();
+
+        for (int i = 0; i < numRecords; i += 10) {
+            RecordData rd;
+            ASSERT_TRUE(rs->findRecord(opCtx.get(), records.at(i).id, &rd));
+            ASSERT_EQ(0, strcmp(doc.objdata(), rd.data()));
+        }
+    }
+
+    {
+        // Verify that delete works with ObjectId.
+        WriteUnitOfWork wuow(opCtx.get());
+        for (int i = 0; i < numRecords; i += 10) {
+            rs->deleteRecord(opCtx.get(), records.at(i).id);
+        }
+        wuow.commit();
+
+        ASSERT_EQ(numRecords - 10, rs->numRecords(opCtx.get()));
+    }
+}
+
+TEST(RecordStoreTestHarness, ClusteredRecordStoreSeekNear) {
+    const auto harnessHelper = newRecordStoreHarnessHelper();
+    if (!harnessHelper->getEngine()->supportsClusteredIdIndex()) {
+        // Only WiredTiger supports clustered indexes on _id.
+        return;
+    }
+
+    const std::string ns = "test.system.buckets.a";
+    CollectionOptions options;
+    options.clusteredIndex = ClusteredIndexOptions{};
+    std::unique_ptr<RecordStore> rs = harnessHelper->newNonCappedRecordStore(ns, options);
+    invariant(rs->keyFormat() == KeyFormat::String);
+
+    auto opCtx = harnessHelper->newOperationContext();
+
+    const int numRecords = 100;
+    std::vector<Record> records;
+    std::vector<Timestamp> timestamps;
+    for (int i = 0; i < numRecords; i++) {
+        timestamps.push_back(Timestamp(i, 1));
+    }
+
+    // Insert RecordIds where the timestamp part of the OID correlates directly with the seconds in
+    // the Timestamp.
+    for (int i = 0; i < numRecords; i++) {
+        BSONObj doc = BSON("i" << i);
+        RecordData recordData = RecordData(doc.objdata(), doc.objsize());
+        recordData.makeOwned();
+
+        auto oid = OID::gen();
+        oid.setTimestamp(timestamps[i].getSecs());
+
+        auto id = record_id_helpers::keyForOID(oid);
+        auto record = Record{id, recordData};
+        std::vector<Record> recVec = {record};
+
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_OK(rs->insertRecords(opCtx.get(), &recVec, {timestamps[i]}));
+        wuow.commit();
+
+        records.push_back(record);
+    }
+
+    for (int i = 0; i < numRecords; i++) {
+        // Generate an OID RecordId with a timestamp part and high bits elsewhere such that it
+        // always compares greater than or equal to the OIDs we inserted.
+
+
+        auto oid = OID::max();
+        oid.setTimestamp(i);
+
+        auto rid = record_id_helpers::keyForOID(oid);
+        auto cur = rs->getCursor(opCtx.get());
+        auto rec = cur->seekNear(rid);
+        ASSERT(rec);
+        ASSERT_EQ(records[i].id, rec->id);
+    }
+
+    for (int i = 0; i < numRecords; i++) {
+        // Generate an OID RecordId with only a timestamp part and zeroes elsewhere such that it
+        // always compares less than or equal to the OIDs we inserted.
+
+        auto oid = OID();
+        oid.setTimestamp(i);
+
+        auto rid = record_id_helpers::keyForOID(oid);
+        auto cur = rs->getCursor(opCtx.get(), false /* forward */);
+        auto rec = cur->seekNear(rid);
+        ASSERT(rec);
+        ASSERT_EQ(records[i].id, rec->id);
     }
 }
 }  // namespace

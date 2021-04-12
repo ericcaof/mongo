@@ -66,8 +66,6 @@ using FCV = FCVParams::Version;
 
 using namespace fmt::literals;
 
-Lock::ResourceMutex FeatureCompatibilityVersion::fcvLock("featureCompatibilityVersionLock");
-
 namespace {
 
 /**
@@ -190,6 +188,15 @@ private:
     stdx::unordered_map<std::tuple<FCV, FCV, bool>, FCV> _transitions;
 } fcvTransitions;
 
+/**
+ * Taken in shared mode by any operations that should not run while setFeatureCompatibilityVersion
+ * is running.
+ *
+ * setFCV takes this lock in exclusive mode so that it both does not run with the shared mode
+ * operations and does not run with itself.
+ */
+Lock::ResourceMutex fcvLock("featureCompatibilityVersionLock");
+
 bool isWriteableStorageEngine() {
     return !storageGlobalParams.readOnly && (storageGlobalParams.engine != "devnull");
 }
@@ -244,6 +251,7 @@ void runUpdateCommand(OperationContext* opCtx, const FeatureCompatibilityVersion
     client.runCommand(nss.db().toString(), updateCmd.obj(), updateResult);
     uassertStatusOK(getStatusFromWriteCommandReply(updateResult));
 }
+
 }  // namespace
 
 void FeatureCompatibilityVersion::validateSetFeatureCompatibilityVersionRequest(
@@ -259,8 +267,13 @@ void FeatureCompatibilityVersion::updateFeatureCompatibilityVersionDocument(
     OperationContext* opCtx,
     ServerGlobalParams::FeatureCompatibility::Version fromVersion,
     ServerGlobalParams::FeatureCompatibility::Version newVersion,
-    bool isFromConfigServer) {
-    auto transitioningVersion = fromVersion == newVersion
+    bool isFromConfigServer,
+    bool setTargetVersion) {
+
+    // Only transition to fully upgraded or downgraded states when we
+    // have completed all required upgrade/downgrade behavior.
+    auto transitioningVersion = setTargetVersion &&
+            serverGlobalParams.featureCompatibility.isUpgradingOrDowngrading(fromVersion)
         ? fromVersion
         : fcvTransitions.getTransitionalVersion(fromVersion, newVersion, isFromConfigServer);
     FeatureCompatibilityVersionDocument fcvDoc =
@@ -426,6 +439,11 @@ void FeatureCompatibilityVersion::fassertInitializedAfterStartup(OperationContex
     }
 }
 
+Lock::ExclusiveLock FeatureCompatibilityVersion::enterFCVChangeRegion(OperationContext* opCtx) {
+    invariant(!opCtx->lockState()->isLocked());
+    return Lock::ExclusiveLock(opCtx->lockState(), fcvLock);
+}
+
 /**
  * Read-only server parameter for featureCompatibilityVersion.
  */
@@ -453,6 +471,32 @@ Status FeatureCompatibilityVersionParameter::setFromString(const std::string&) {
             str::stream() << name() << " cannot be set via setParameter. See "
                           << feature_compatibility_version_documentation::kCompatibilityLink
                           << "."};
+}
+
+FixedFCVRegion::FixedFCVRegion(OperationContext* opCtx)
+    : _lk([&] {
+          invariant(!opCtx->lockState()->isLocked());
+          return Lock::SharedLock(opCtx->lockState(), fcvLock);
+      }()) {}
+
+FixedFCVRegion::~FixedFCVRegion() = default;
+
+const ServerGlobalParams::FeatureCompatibility& FixedFCVRegion::operator*() const {
+    return serverGlobalParams.featureCompatibility;
+}
+
+const ServerGlobalParams::FeatureCompatibility* FixedFCVRegion::operator->() const {
+    return &serverGlobalParams.featureCompatibility;
+}
+
+bool FixedFCVRegion::operator==(
+    const ServerGlobalParams::FeatureCompatibility::Version& other) const {
+    return serverGlobalParams.featureCompatibility.getVersion() == other;
+}
+
+bool FixedFCVRegion::operator!=(
+    const ServerGlobalParams::FeatureCompatibility::Version& other) const {
+    return !(*this == other);
 }
 
 }  // namespace mongo

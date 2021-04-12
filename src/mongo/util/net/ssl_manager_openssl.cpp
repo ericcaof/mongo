@@ -1129,7 +1129,9 @@ private:
 class SSLManagerOpenSSL : public SSLManagerInterface,
                           public std::enable_shared_from_this<SSLManagerOpenSSL> {
 public:
-    explicit SSLManagerOpenSSL(const SSLParams& params, bool isServer);
+    explicit SSLManagerOpenSSL(const SSLParams& params,
+                               const std::optional<TransientSSLParams>& transientSSLParams,
+                               bool isServer);
     ~SSLManagerOpenSSL() {
         stopJobs();
     }
@@ -1140,7 +1142,6 @@ public:
      */
     Status initSSLContext(SSL_CTX* context,
                           const SSLParams& params,
-                          const TransientSSLParams& transientParams,
                           ConnectionDirection direction) final;
 
     SSLConnectionInterface* connect(Socket* socket) final;
@@ -1168,6 +1169,10 @@ public:
     const SSLConfiguration& getSSLConfiguration() const final {
         return _sslConfiguration;
     }
+
+    bool isTransient() const final;
+
+    std::string getTargetedClusterConnectionString() const final;
 
     int SSL_read(SSLConnectionInterface* conn, void* buf, int num) final;
 
@@ -1198,6 +1203,9 @@ private:
     bool _allowInvalidHostnames;
     bool _suppressNoCertificateWarning;
     SSLConfiguration _sslConfiguration;
+    // If set, this manager is an instance providing authentication with remote server specified
+    // with TransientSSLParams::targetedClusterConnectionString.
+    const std::optional<TransientSSLParams> _transientSSLParams;
 
     Mutex _sharedResponseMutex = MONGO_MAKE_LATCH("OCSPStaplingJobRunner::_sharedResponseMutex");
     std::shared_ptr<OCSPStaplingContext> _ocspStaplingContext;
@@ -1263,6 +1271,7 @@ private:
 
         std::string _prompt;
     };
+
     PasswordFetcher _serverPEMPassword;
     PasswordFetcher _clusterPEMPassword;
 
@@ -1292,6 +1301,7 @@ private:
      * and extract server certificate notAfter date.
      * @param keyFile referencing the PEM file to be read.
      * @param subjectName as a pointer to the subject name variable being set.
+     * @param verifyHasSubjectAlternativeName to generate warning if SAN is absent.
      * @param serverNotAfter a Date_t object pointer that is valued if the
      * date is to be checked (as for a server certificate) and null otherwise.
      * @return Status::Ok showing if the function was successful.
@@ -1299,17 +1309,20 @@ private:
     Status _parseAndValidateCertificate(const std::string& keyFile,
                                         PasswordFetcher* keyPassword,
                                         SSLX509Name* subjectName,
+                                        bool verifyHasSubjectAlternativeName,
                                         Date_t* serverNotAfter);
 
     Status _parseAndValidateCertificateFromBIO(UniqueBIO inBio,
                                                PasswordFetcher* keyPassword,
                                                StringData fileNameForLogging,
                                                SSLX509Name* subjectName,
+                                               bool verifyHasSubjectAlternativeName,
                                                Date_t* serverNotAfter);
 
     Status _parseAndValidateCertificateFromMemory(StringData buffer,
                                                   PasswordFetcher* keyPassword,
                                                   SSLX509Name* subjectName,
+                                                  bool verifyHasSubjectAlternativeName,
                                                   Date_t* serverNotAfter);
     /*
      * Parse and return x509 object from the provided keyfile.
@@ -1444,9 +1457,17 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManager, ("SetupOpenSSL", "EndStartupOpt
     }
 }
 
+std::shared_ptr<SSLManagerInterface> SSLManagerInterface::create(
+    const SSLParams& params,
+    const std::optional<TransientSSLParams>& transientSSLParams,
+    bool isServer) {
+    return std::make_shared<SSLManagerOpenSSL>(params, transientSSLParams, isServer);
+}
+
 std::shared_ptr<SSLManagerInterface> SSLManagerInterface::create(const SSLParams& params,
                                                                  bool isServer) {
-    return std::make_shared<SSLManagerOpenSSL>(params, isServer);
+    return std::make_shared<SSLManagerOpenSSL>(
+        params, std::optional<TransientSSLParams>{}, isServer);
 }
 
 SSLX509Name getCertificateSubjectX509Name(X509* cert) {
@@ -1537,18 +1558,28 @@ SSLConnectionOpenSSL::~SSLConnectionOpenSSL() {
     }
 }
 
-SSLManagerOpenSSL::SSLManagerOpenSSL(const SSLParams& params, bool isServer)
+SSLManagerOpenSSL::SSLManagerOpenSSL(const SSLParams& params,
+                                     const std::optional<TransientSSLParams>& transientSSLParams,
+                                     bool isServer)
     : _serverContext(nullptr),
       _clientContext(nullptr),
       _weakValidation(params.sslWeakCertificateValidation),
       _allowInvalidCertificates(params.sslAllowInvalidCertificates),
       _allowInvalidHostnames(params.sslAllowInvalidHostnames),
       _suppressNoCertificateWarning(params.suppressNoTLSPeerCertificateWarning),
+      _transientSSLParams(transientSSLParams),
       _fetcher(this),
       _serverPEMPassword(params.sslPEMKeyPassword, "Enter PEM passphrase"),
       _clusterPEMPassword(params.sslClusterPassword, "Enter cluster certificate passphrase") {
     if (!_initSynchronousSSLContext(&_clientContext, params, ConnectionDirection::kOutgoing)) {
         uasserted(16768, "ssl initialization problem");
+    }
+
+    if (_transientSSLParams.has_value()) {
+        // No other initialization is necessary: this is egress connection manager that
+        // is not using local PEM files.
+        LOGV2_DEBUG(54090, 1, "Default params are ignored for transient SSL manager");
+        return;
     }
 
     // pick the certificate for use in outgoing connections,
@@ -1567,7 +1598,7 @@ SSLManagerOpenSSL::SSLManagerOpenSSL(const SSLParams& params, bool isServer)
 
     if (!clientPEM.empty()) {
         auto status = _parseAndValidateCertificate(
-            clientPEM, clientPassword, &_sslConfiguration.clientSubjectName, nullptr);
+            clientPEM, clientPassword, &_sslConfiguration.clientSubjectName, false, nullptr);
         uassertStatusOKWithContext(
             status,
             str::stream() << "ssl client initialization problem for certificate: " << clientPEM);
@@ -1584,6 +1615,7 @@ SSLManagerOpenSSL::SSLManagerOpenSSL(const SSLParams& params, bool isServer)
             _parseAndValidateCertificate(params.sslPEMKeyFile,
                                          &_serverPEMPassword,
                                          &serverSubjectName,
+                                         true,
                                          &_sslConfiguration.serverCertificateExpirationDate);
         uassertStatusOKWithContext(status,
                                    str::stream()
@@ -1979,6 +2011,11 @@ Status OCSPFetcher::start(SSL_CTX* context, bool asyncOCSPStaple) {
     fetchAndStaple(promisePtr)
         .getAsync([this, sm = _manager->shared_from_this()](
                       StatusWith<Milliseconds> swDurationInitial) mutable {
+            if (!swDurationInitial.isOK()) {
+                LOGV2_WARNING(5512202,
+                              "Server was unable to staple OCSP Response",
+                              "reason"_attr = swDurationInitial.getStatus());
+            }
             startPeriodicJob(swDurationInitial);
         });
 
@@ -2029,6 +2066,12 @@ void OCSPFetcher::startPeriodicJob(StatusWith<Milliseconds> swDurationInitial) {
 void OCSPFetcher::doPeriodicJob() {
     fetchAndStaple(nullptr).getAsync(
         [this, sm = _manager->shared_from_this()](StatusWith<Milliseconds> swDuration) {
+            if (!swDuration.isOK()) {
+                LOGV2_WARNING(5512201,
+                              "Server was unable to staple OCSP Response",
+                              "reason"_attr = swDuration.getStatus());
+            }
+
             stdx::lock_guard<Latch> lock(this->_staplingMutex);
 
             if (_shutdown) {
@@ -2038,6 +2081,15 @@ void OCSPFetcher::doPeriodicJob() {
             this->_ocspStaplingAnchor.setPeriod(getPeriodForStapleJob(swDuration));
         });
 }
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+void sslContextGetOtherCerts(SSL_CTX* ctx, STACK_OF(X509) * *sk) {
+    SSL_CTX_get_extra_chain_certs(ctx, sk);
+}
+#else
+void sslContextGetOtherCerts(SSL_CTX* ctx, STACK_OF(X509) * *sk) {
+    SSL_CTX_get0_chain_certs(ctx, sk);
+}
+#endif
 
 Future<Milliseconds> OCSPFetcher::fetchAndStaple(Promise<void>* promise) {
     // Generate a new verified X509StoreContext to get our own certificate chain
@@ -2051,6 +2103,10 @@ Future<Milliseconds> OCSPFetcher::fetchAndStaple(Promise<void>* promise) {
     }
 
     X509_STORE_CTX_set_cert(storeCtx.get(), _cert);
+    STACK_OF(X509) * sk;
+
+    sslContextGetOtherCerts(_context, &sk);
+    X509_STORE_CTX_set_chain(storeCtx.get(), sk);
 
     if (X509_verify_cert(storeCtx.get()) <= 0) {
         return getSSLFailure("Could not verify X509 certificate store for OCSP Stapling.");
@@ -2131,11 +2187,28 @@ Milliseconds SSLManagerOpenSSL::updateOcspStaplingContextWithResponse(
     return swResponse.getValue().fetchNewResponseDuration();
 }
 
+bool SSLManagerOpenSSL::isTransient() const {
+    return _transientSSLParams.has_value();
+}
+
+std::string SSLManagerOpenSSL::getTargetedClusterConnectionString() const {
+    if (_transientSSLParams.has_value()) {
+        return (*_transientSSLParams).targetedClusterConnectionString.toString();
+    }
+    return {};
+}
 
 Status SSLManagerOpenSSL::initSSLContext(SSL_CTX* context,
                                          const SSLParams& params,
-                                         const TransientSSLParams& transientParams,
                                          ConnectionDirection direction) {
+    if (isTransient()) {
+        LOGV2_DEBUG(5270602,
+                    2,
+                    "Initializing transient egress SSL context",
+                    "targetClusterConnectionString"_attr =
+                        (*_transientSSLParams).targetedClusterConnectionString);
+    }
+
     // SSL_OP_ALL - Activate all bug workaround options, to support buggy client SSL's.
     // SSL_OP_NO_SSLv2 - Disable SSL v2 support
     // SSL_OP_NO_SSLv3 - Disable SSL v3 support
@@ -2197,24 +2270,25 @@ Status SSLManagerOpenSSL::initSSLContext(SSL_CTX* context,
     }
 
 
-    if (direction == ConnectionDirection::kOutgoing &&
-        !transientParams.sslClusterPEMPayload.empty()) {
+    if (direction == ConnectionDirection::kOutgoing && _transientSSLParams) {
 
         // Transient params for outgoing connection have priority over global params.
         if (!_setupPEMFromMemoryPayload(
                 context,
-                transientParams.sslClusterPEMPayload,
+                (*_transientSSLParams).sslClusterPEMPayload,
                 &_clusterPEMPassword,
-                transientParams.targetedClusterConnectionString.toString())) {
+                (*_transientSSLParams).targetedClusterConnectionString.toString())) {
             return Status(ErrorCodes::InvalidSSLConfiguration,
                           str::stream() << "Can not set up transient ssl cluster certificate for "
-                                        << transientParams.targetedClusterConnectionString);
+                                        << (*_transientSSLParams).targetedClusterConnectionString);
         }
 
-        auto status = _parseAndValidateCertificateFromMemory(transientParams.sslClusterPEMPayload,
-                                                             &_clusterPEMPassword,
-                                                             &_sslConfiguration.clientSubjectName,
-                                                             nullptr);
+        auto status =
+            _parseAndValidateCertificateFromMemory((*_transientSSLParams).sslClusterPEMPayload,
+                                                   &_clusterPEMPassword,
+                                                   &_sslConfiguration.clientSubjectName,
+                                                   false,
+                                                   nullptr);
         if (!status.isOK()) {
             return status.withContext("Could not validate transient certificate");
         }
@@ -2317,7 +2391,7 @@ bool SSLManagerOpenSSL::_initSynchronousSSLContext(UniqueSSLContext* contextPtr,
                                                    ConnectionDirection direction) {
     *contextPtr = UniqueSSLContext(SSL_CTX_new(SSLv23_method()));
 
-    uassertStatusOK(initSSLContext(contextPtr->get(), params, TransientSSLParams(), direction));
+    uassertStatusOK(initSSLContext(contextPtr->get(), params, direction));
 
     // If renegotiation is needed, don't return from recv() or send() until it's successful.
     // Note: this is for blocking sockets only.
@@ -2329,6 +2403,7 @@ bool SSLManagerOpenSSL::_initSynchronousSSLContext(UniqueSSLContext* contextPtr,
 Status SSLManagerOpenSSL::_parseAndValidateCertificate(const std::string& keyFile,
                                                        PasswordFetcher* keyPassword,
                                                        SSLX509Name* subjectName,
+                                                       bool verifyHasSubjectAlternativeName,
                                                        Date_t* serverCertificateExpirationDate) {
     UniqueBIO inBio(BIO_new(BIO_s_file()));
     if (!inBio) {
@@ -2343,14 +2418,19 @@ Status SSLManagerOpenSSL::_parseAndValidateCertificate(const std::string& keyFil
                           keyFile, getSSLErrorMessage(ERR_get_error())));
     }
 
-    return _parseAndValidateCertificateFromBIO(
-        std::move(inBio), keyPassword, keyFile, subjectName, serverCertificateExpirationDate);
+    return _parseAndValidateCertificateFromBIO(std::move(inBio),
+                                               keyPassword,
+                                               keyFile,
+                                               subjectName,
+                                               verifyHasSubjectAlternativeName,
+                                               serverCertificateExpirationDate);
 }
 
 Status SSLManagerOpenSSL::_parseAndValidateCertificateFromMemory(
     StringData buffer,
     PasswordFetcher* keyPassword,
     SSLX509Name* subjectName,
+    bool verifyHasSubjectAlternativeName,
     Date_t* serverCertificateExpirationDate) {
     logv2::DynamicAttributes errorAttrs;
 
@@ -2371,6 +2451,7 @@ Status SSLManagerOpenSSL::_parseAndValidateCertificateFromMemory(
                                                keyPassword,
                                                "transient"_sd,
                                                subjectName,
+                                               verifyHasSubjectAlternativeName,
                                                serverCertificateExpirationDate);
 }
 
@@ -2379,6 +2460,7 @@ Status SSLManagerOpenSSL::_parseAndValidateCertificateFromBIO(
     PasswordFetcher* keyPassword,
     StringData fileNameForLogging,
     SSLX509Name* subjectName,
+    bool verifyHasSubjectAlternativeName,
     Date_t* serverCertificateExpirationDate) {
     X509* x509 = PEM_read_bio_X509(
         inBio.get(), nullptr, &SSLManagerOpenSSL::password_cb, static_cast<void*>(&keyPassword));
@@ -2391,6 +2473,24 @@ Status SSLManagerOpenSSL::_parseAndValidateCertificateFromBIO(
     ON_BLOCK_EXIT([&] { X509_free(x509); });
 
     *subjectName = getCertificateSubjectX509Name(x509);
+
+    if (verifyHasSubjectAlternativeName) {
+        bool hasSan = false;
+        STACK_OF(GENERAL_NAME)* sanNames = static_cast<STACK_OF(GENERAL_NAME)*>(
+            X509_get_ext_d2i(x509, NID_subject_alt_name, nullptr, nullptr));
+        if (nullptr != sanNames) {
+            int sanNamesCount = sk_GENERAL_NAME_num(sanNames);
+            hasSan = (0 != sanNamesCount);
+            sk_GENERAL_NAME_pop_free(sanNames, GENERAL_NAME_free);
+        }
+
+        if (!hasSan) {
+            LOGV2_WARNING_OPTIONS(551190,
+                                  {logv2::LogTag::kStartupWarnings},
+                                  "Server certificate has no compatible Subject Alternative Name. "
+                                  "This may prevent TLS clients from connecting");
+        }
+    }
 
     auto notBeforeMillis = convertASN1ToMillis(X509_get_notBefore(x509));
     if (notBeforeMillis == Date_t()) {

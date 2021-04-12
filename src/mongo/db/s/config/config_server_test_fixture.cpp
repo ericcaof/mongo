@@ -45,7 +45,7 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/query/cursor_response.h"
-#include "mongo/db/query/query_request.h"
+#include "mongo/db/query/query_request_helper.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_settings.h"
@@ -139,8 +139,9 @@ void ConfigServerTestFixture::_setUp(std::function<void()> onPreInitGlobalStateF
 
     _addShardNetworkTestEnv =
         std::make_unique<NetworkTestEnv>(_executorForAddShard, _mockNetworkForAddShard);
-    CatalogCacheLoader::set(getServiceContext(),
-                            std::make_unique<ConfigServerCatalogCacheLoader>());
+    auto configServerCatalogCacheLoader = std::make_unique<ConfigServerCatalogCacheLoader>();
+    configServerCatalogCacheLoader->setAvoidSnapshotForRefresh_ForTest();
+    CatalogCacheLoader::set(getServiceContext(), std::move(configServerCatalogCacheLoader));
 
     onPreInitGlobalStateFn();
 
@@ -192,16 +193,17 @@ std::shared_ptr<Shard> ConfigServerTestFixture::getConfigShard() const {
 Status ConfigServerTestFixture::insertToConfigCollection(OperationContext* opCtx,
                                                          const NamespaceString& ns,
                                                          const BSONObj& doc) {
-    auto insertResponse = getConfigShard()->runCommand(opCtx,
-                                                       kReadPref,
-                                                       ns.db().toString(),
-                                                       [&]() {
-                                                           write_ops::Insert insertOp(ns);
-                                                           insertOp.setDocuments({doc});
-                                                           return insertOp.toBSON({});
-                                                       }(),
-                                                       Shard::kDefaultConfigCommandTimeout,
-                                                       Shard::RetryPolicy::kNoRetry);
+    auto insertResponse =
+        getConfigShard()->runCommand(opCtx,
+                                     kReadPref,
+                                     ns.db().toString(),
+                                     [&]() {
+                                         write_ops::InsertCommandRequest insertOp(ns);
+                                         insertOp.setDocuments({doc});
+                                         return insertOp.toBSON({});
+                                     }(),
+                                     Shard::kDefaultConfigCommandTimeout,
+                                     Shard::RetryPolicy::kNoRetry);
 
     BatchedCommandResponse batchResponse;
     auto status = Shard::CommandResponse::processBatchWriteResponse(insertResponse, &batchResponse);
@@ -218,7 +220,7 @@ Status ConfigServerTestFixture::updateToConfigCollection(OperationContext* opCtx
         kReadPref,
         ns.db().toString(),
         [&]() {
-            write_ops::Update updateOp(ns);
+            write_ops::UpdateCommandRequest updateOp(ns);
             updateOp.setUpdates({[&] {
                 write_ops::UpdateOpEntry entry;
                 entry.setQ(query);
@@ -241,21 +243,22 @@ Status ConfigServerTestFixture::deleteToConfigCollection(OperationContext* opCtx
                                                          const NamespaceString& ns,
                                                          const BSONObj& doc,
                                                          const bool multi) {
-    auto deleteResponse = getConfigShard()->runCommand(opCtx,
-                                                       kReadPref,
-                                                       ns.db().toString(),
-                                                       [&]() {
-                                                           write_ops::Delete deleteOp(ns);
-                                                           deleteOp.setDeletes({[&] {
-                                                               write_ops::DeleteOpEntry entry;
-                                                               entry.setQ(doc);
-                                                               entry.setMulti(multi);
-                                                               return entry;
-                                                           }()});
-                                                           return deleteOp.toBSON({});
-                                                       }(),
-                                                       Shard::kDefaultConfigCommandTimeout,
-                                                       Shard::RetryPolicy::kNoRetry);
+    auto deleteResponse =
+        getConfigShard()->runCommand(opCtx,
+                                     kReadPref,
+                                     ns.db().toString(),
+                                     [&]() {
+                                         write_ops::DeleteCommandRequest deleteOp(ns);
+                                         deleteOp.setDeletes({[&] {
+                                             write_ops::DeleteOpEntry entry;
+                                             entry.setQ(doc);
+                                             entry.setMulti(multi);
+                                             return entry;
+                                         }()});
+                                         return deleteOp.toBSON({});
+                                     }(),
+                                     Shard::kDefaultConfigCommandTimeout,
+                                     Shard::RetryPolicy::kNoRetry);
 
 
     BatchedCommandResponse batchResponse;
@@ -309,7 +312,29 @@ StatusWith<ShardType> ConfigServerTestFixture::getShardDoc(OperationContext* opC
 void ConfigServerTestFixture::setupCollection(const NamespaceString& nss,
                                               const KeyPattern& shardKey,
                                               const std::vector<ChunkType>& chunks) {
-    CollectionType coll(nss, chunks[0].getVersion().epoch(), Date_t::now(), UUID::gen());
+    auto dbDoc = findOneOnConfigCollection(
+        operationContext(), DatabaseType::ConfigNS, BSON(DatabaseType::name(nss.db().toString())));
+    if (!dbDoc.isOK()) {
+        // If the database is not setup, choose the first available shard as primary to implicitly
+        // create the db
+        auto swShardDoc =
+            findOneOnConfigCollection(operationContext(), ShardType::ConfigNS, BSONObj());
+        invariant(swShardDoc.isOK(),
+                  "At least one shard should be setup when initializing a collection");
+        auto shard = uassertStatusOK(ShardType::fromBSON(swShardDoc.getValue()));
+        setupDatabase(nss.db().toString(), ShardId(shard.getName()), true /* sharded */);
+    }
+
+    const auto collUUID = [&]() {
+        const auto& chunk = chunks.front();
+        if (chunk.getVersion().getTimestamp()) {
+            return chunk.getCollectionUUID();
+        } else {
+            return UUID::gen();
+        }
+    }();
+    CollectionType coll(nss, chunks[0].getVersion().epoch(), Date_t::now(), collUUID);
+    coll.setTimestamp(chunks.front().getVersion().getTimestamp());
     coll.setKeyPattern(shardKey);
     ASSERT_OK(
         insertToConfigCollection(operationContext(), CollectionType::ConfigNS, coll.toBSON()));

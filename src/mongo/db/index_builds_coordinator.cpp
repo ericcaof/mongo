@@ -49,6 +49,7 @@
 #include "mongo/db/index_build_entry_helpers.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/cloner_utils.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/timestamp_block.h"
@@ -342,8 +343,13 @@ repl::OpTime getLatestOplogOpTime(OperationContext* opCtx) {
     // Helpers::getLast will bypass the oplog visibility rules by doing a backwards collection
     // scan.
     BSONObj oplogEntryBSON;
-    invariant(
-        Helpers::getLast(opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), oplogEntryBSON));
+    // This operation does not perform any writes, but the index building code is sensitive to
+    // exceptions and we must protect it from unanticipated write conflicts from reads.
+    writeConflictRetry(
+        opCtx, "getLatestOplogOpTime", NamespaceString::kRsOplogNamespace.ns(), [&]() {
+            invariant(Helpers::getLast(
+                opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), oplogEntryBSON));
+        });
 
     auto optime = repl::OpTime::parseFromOplogEntry(oplogEntryBSON);
     invariant(optime.isOK(),
@@ -390,11 +396,6 @@ bool isIndexBuildResumable(OperationContext* opCtx,
               "Index build: in replication recovery. Not waiting for last optime before "
               "interceptors to be majority committed",
               "buildUUID"_attr = replState.buildUUID);
-        return false;
-    }
-
-    // TODO(SERVER-50479): Remove this check when resumable index builds work with ESE in GCM mode.
-    if (EncryptionHooks::get(opCtx->getServiceContext())->enabled()) {
         return false;
     }
 
@@ -770,6 +771,34 @@ void IndexBuildsCoordinator::abortDatabaseIndexBuilds(OperationContext* opCtx,
     }
 }
 
+void IndexBuildsCoordinator::abortTenantIndexBuilds(OperationContext* opCtx,
+                                                    StringData tenantId,
+                                                    const std::string& reason) {
+    LOGV2(4886203,
+          "About to abort all index builders running for collections belonging to the given tenant",
+          "tenantId"_attr = tenantId,
+          "reason"_attr = reason);
+
+    auto builds = [&]() -> std::vector<std::shared_ptr<ReplIndexBuildState>> {
+        auto indexBuildFilter = [=](const auto& replState) {
+            return repl::ClonerUtils::isDatabaseForTenant(replState.dbName, tenantId);
+        };
+        return activeIndexBuilds.filterIndexBuilds(indexBuildFilter);
+    }();
+    for (auto replState : builds) {
+        if (!abortIndexBuildByBuildUUID(
+                opCtx, replState->buildUUID, IndexBuildAction::kTenantMigrationAbort, reason)) {
+            // The index build may already be in the midst of tearing down.
+            LOGV2(4886204,
+                  "Index build: failed to abort index build for tenant migration",
+                  "tenantId"_attr = tenantId,
+                  "buildUUID"_attr = replState->buildUUID,
+                  "db"_attr = replState->dbName,
+                  "collectionUUID"_attr = replState->collectionUUID);
+        }
+    }
+}
+
 void IndexBuildsCoordinator::abortAllIndexBuildsForInitialSync(OperationContext* opCtx,
                                                                const std::string& reason) {
     LOGV2(4833200, "About to abort all index builders running", "reason"_attr = reason);
@@ -1084,7 +1113,8 @@ bool IndexBuildsCoordinator::abortIndexBuildByBuildUUID(OperationContext* opCtx,
                 signalAction = IndexBuildAction::kInitialSyncAbort;
             }
 
-            if (IndexBuildAction::kPrimaryAbort == signalAction &&
+            if ((IndexBuildAction::kPrimaryAbort == signalAction ||
+                 IndexBuildAction::kTenantMigrationAbort == signalAction) &&
                 !replCoord->canAcceptWritesFor(opCtx, dbAndUUID)) {
                 uassertStatusOK({ErrorCodes::NotWritablePrimary,
                                  str::stream()
@@ -1173,6 +1203,7 @@ void IndexBuildsCoordinator::_completeAbort(OperationContext* opCtx,
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     switch (signalAction) {
         // Replicates an abortIndexBuild oplog entry and deletes the index from the durable catalog.
+        case IndexBuildAction::kTenantMigrationAbort:
         case IndexBuildAction::kPrimaryAbort: {
             // Single-phase builds are aborted on step-down, so it's possible to no longer be
             // primary after we process an abort. We must continue with the abort, but since
@@ -1674,23 +1705,26 @@ IndexBuildsCoordinator::_filterSpecsAndRegisterBuild(OperationContext* opCtx,
     AutoGetCollection autoColl(opCtx, nssOrUuid, MODE_X);
     CollectionWriter collection(autoColl);
 
+    const auto& ns = collection.get()->ns();
+    auto css = CollectionShardingState::get(opCtx, ns);
+
     // Disallow index builds on drop-pending namespaces (system.drop.*) if we are primary.
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     if (replCoord->getSettings().usingReplSets() &&
         replCoord->canAcceptWritesFor(opCtx, nssOrUuid)) {
         uassert(ErrorCodes::NamespaceNotFound,
-                str::stream() << "drop-pending collection: " << collection.get()->ns(),
-                !collection.get()->ns().isDropPendingNamespace());
+                str::stream() << "drop-pending collection: " << ns,
+                !ns.isDropPendingNamespace());
     }
 
     // This check is for optimization purposes only as since this lock is released after this,
     // and is acquired again when we build the index in _setUpIndexBuild.
-    CollectionShardingState::get(opCtx, collection.get()->ns())->checkShardVersionOrThrow(opCtx);
+    css->checkShardVersionOrThrow(opCtx);
+    css->getCollectionDescription(opCtx).throwIfReshardingInProgress(ns);
 
     std::vector<BSONObj> filteredSpecs;
     try {
-        filteredSpecs =
-            prepareSpecListForCreate(opCtx, collection.get(), collection.get()->ns(), specs);
+        filteredSpecs = prepareSpecListForCreate(opCtx, collection.get(), ns, specs);
     } catch (const DBException& ex) {
         return ex.toStatus();
     }
@@ -1716,15 +1750,12 @@ IndexBuildsCoordinator::_filterSpecsAndRegisterBuild(OperationContext* opCtx,
             // commitIndexBuild oplog entries, this optimization will fail to accurately timestamp
             // the catalog update when it uses the timestamp from the startIndexBuild, rather than
             // the commitIndexBuild, oplog entry.
-            writeConflictRetry(opCtx,
-                               "IndexBuildsCoordinator::_filterSpecsAndRegisterBuild",
-                               collection.get()->ns().ns(),
-                               [&] {
-                                   WriteUnitOfWork wuow(opCtx);
-                                   createIndexesOnEmptyCollection(
-                                       opCtx, collection, filteredSpecs, false);
-                                   wuow.commit();
-                               });
+            writeConflictRetry(
+                opCtx, "IndexBuildsCoordinator::_filterSpecsAndRegisterBuild", ns.ns(), [&] {
+                    WriteUnitOfWork wuow(opCtx);
+                    createIndexesOnEmptyCollection(opCtx, collection, filteredSpecs, false);
+                    wuow.commit();
+                });
         } catch (DBException& ex) {
             ex.addContext(str::stream() << "index build on empty collection failed: " << buildUUID);
             return ex.toStatus();
@@ -2058,9 +2089,8 @@ void IndexBuildsCoordinator::_runIndexBuildInner(
     // This Status stays unchanged unless we catch an exception in the following try-catch block.
     auto status = Status::OK();
     try {
-        while (MONGO_unlikely(hangAfterInitializingIndexBuild.shouldFail())) {
-            hangAfterInitializingIndexBuild.pauseWhileSet(opCtx);
-        }
+
+        hangAfterInitializingIndexBuild.pauseWhileSet(opCtx);
 
         if (resumeInfo) {
             _resumeIndexBuildFromPhase(opCtx, replState, indexBuildOptions, resumeInfo.get());
@@ -2095,6 +2125,8 @@ void IndexBuildsCoordinator::_runIndexBuildInner(
     // commit-time, there is no work to do. This is the most routine case, since index
     // constraint checking happens at commit-time for index builds.
     if (replState->isAborted()) {
+        if (ErrorCodes::isTenantMigrationError(replState->getAbortStatus()))
+            uassertStatusOK(replState->getAbortStatus());
         uassertStatusOK(status);
     }
 
@@ -2151,12 +2183,12 @@ void IndexBuildsCoordinator::_resumeIndexBuildFromPhase(
 
     if (resumeInfo.getPhase() == IndexBuildPhaseEnum::kInitialized ||
         resumeInfo.getPhase() == IndexBuildPhaseEnum::kCollectionScan) {
-        _scanCollectionAndInsertSortedKeysIntoIndex(
-            opCtx,
-            replState,
-            resumeInfo.getCollectionScanPosition()
-                ? boost::make_optional<RecordId>(RecordId(*resumeInfo.getCollectionScanPosition()))
-                : boost::none);
+        boost::optional<RecordId> resumeAfterRecordId;
+        if (resumeInfo.getCollectionScanPosition()) {
+            resumeAfterRecordId = *resumeInfo.getCollectionScanPosition();
+        }
+
+        _scanCollectionAndInsertSortedKeysIntoIndex(opCtx, replState, resumeAfterRecordId);
     } else if (resumeInfo.getPhase() == IndexBuildPhaseEnum::kBulkLoad) {
         _insertSortedKeysIntoIndexForResume(opCtx, replState);
     }
@@ -2720,7 +2752,7 @@ std::vector<BSONObj> IndexBuildsCoordinator::prepareSpecListForCreate(
         return indexSpecs;
     }
 
-    // Normalize the specs' collations, wildcard projections, and partial filters as applicable.
+    // Normalize the specs' collations, wildcard projections, and any other fields as applicable.
     auto normalSpecs = normalizeIndexSpecs(opCtx, collection, indexSpecs);
 
     // Remove any index specifications which already exist in the catalog.
@@ -2754,20 +2786,12 @@ std::vector<BSONObj> IndexBuildsCoordinator::normalizeIndexSpecs(
     auto normalSpecs =
         uassertStatusOK(collection->addCollationDefaultsToIndexSpecsForCreate(opCtx, indexSpecs));
 
-    // If the index spec has a partialFilterExpression, we normalize it by parsing to an optimized,
-    // sorted MatchExpression tree, re-serialize it to BSON, and add it back into the index spec.
-    const auto expCtx = make_intrusive<ExpressionContext>(opCtx, nullptr, collection->ns());
-    std::transform(normalSpecs.begin(), normalSpecs.end(), normalSpecs.begin(), [&](auto& spec) {
-        const auto kPartialFilterName = IndexDescriptor::kPartialFilterExprFieldName;
-        auto partialFilterExpr = spec.getObjectField(kPartialFilterName);
-        if (partialFilterExpr.isEmpty()) {
-            return spec;
-        }
-        // Parse, optimize and sort the MatchExpression to reduce it to its normalized form.
-        // Serialize the normalized filter back into the index spec before returning.
-        auto partialFilter = MatchExpressionParser::parseAndNormalize(partialFilterExpr, expCtx);
-        return spec.addField(BSON(kPartialFilterName << partialFilter->serialize()).firstElement());
-    });
+    // We choose not to normalize the spec's partialFilterExpression at this point, if it exists.
+    // Doing so often reduces the legibility of the filter to the end-user, and makes it difficult
+    // for clients to validate (via the listIndexes output) whether a given partialFilterExpression
+    // is equivalent to the filter that they originally submitted. Omitting this normalization does
+    // not impact our internal index comparison semantics, since we compare based on the parsed
+    // MatchExpression trees rather than the serialized BSON specs. See SERVER-54357.
 
     // If any of the specs describe wildcard indexes, normalize the wildcard projections if present.
     // This will change all specs of the form {"a.b.c": 1} to normalized form {a: {b: {c : 1}}}.

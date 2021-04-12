@@ -33,6 +33,7 @@
 #include <boost/optional.hpp>
 
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/s/range_deletion_task_gen.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/catalog/type_chunk.h"
 
@@ -74,4 +75,28 @@ SharedSemiFuture<void> removeDocumentsInRange(
     int numDocsToRemovePerBatch,
     Seconds delayForActiveQueriesOnSecondariesToComplete,
     Milliseconds delayBetweenBatches);
+
+/**
+ * - Retrieves source collection's persistent range deletion tasks from `config.rangeDeletions`
+ * - Associates tasks to the target collection
+ * - Stores tasks in `config.rangeDeletionsForRename`
+ */
+void snapshotRangeDeletionsForRename(OperationContext* opCtx,
+                                     const NamespaceString& fromNss,
+                                     const NamespaceString& toNss);
+
+/**
+ * Copies `config.rangeDeletionsForRename` tasks for the specified namespace to
+ * `config.rangeDeletions`.
+ */
+void restoreRangeDeletionTasksForRename(OperationContext* opCtx, const NamespaceString& nss);
+
+/**
+ * - Deletes range deletion tasks for the FROM namespace from `config.rangeDeletions`.
+ * - Deletes range deletion tasks for the TO namespace from `config.rangeDeletionsForRename`
+ */
+void deleteRangeDeletionTasksForRename(OperationContext* opCtx,
+                                       const NamespaceString& fromNss,
+                                       const NamespaceString& toNss);
+
 }  // namespace mongo

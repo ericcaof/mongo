@@ -70,6 +70,7 @@ Status KVEngine::createRecordStore(OperationContext* opCtx,
                                    StringData ns,
                                    StringData ident,
                                    const CollectionOptions& options) {
+    uassert(5555900, "The 'clusteredIndex' option is not supported", !options.clusteredIndex);
     stdx::lock_guard lock(_identsLock);
     _idents[ident.toString()] = true;
     return Status::OK();
@@ -99,14 +100,11 @@ std::unique_ptr<mongo::RecordStore> KVEngine::getRecordStore(OperationContext* u
                                                              const CollectionOptions& options) {
     std::unique_ptr<mongo::RecordStore> recordStore;
     if (options.capped) {
-        recordStore = std::make_unique<RecordStore>(
-            ns,
-            ident,
-            options.capped,
-            options.cappedSize ? options.cappedSize : kDefaultCappedSizeBytes,
-            options.cappedMaxDocs ? options.cappedMaxDocs : -1,
-            /*cappedCallback*/ nullptr,
-            _visibilityManager.get());
+        recordStore = std::make_unique<RecordStore>(ns,
+                                                    ident,
+                                                    options.capped,
+                                                    /*cappedCallback*/ nullptr,
+                                                    _visibilityManager.get());
     } else {
         recordStore = std::make_unique<RecordStore>(ns, ident, options.capped);
     }
@@ -148,7 +146,11 @@ Status KVEngine::importSortedDataInterface(OperationContext* opCtx,
 }
 
 std::unique_ptr<mongo::SortedDataInterface> KVEngine::getSortedDataInterface(
-    OperationContext* opCtx, StringData ident, const IndexDescriptor* desc) {
+    OperationContext* opCtx,
+    const CollectionOptions& collOptions,
+    StringData ident,
+    const IndexDescriptor* desc) {
+    invariant(!collOptions.clusteredIndex);
     {
         stdx::lock_guard lock(_identsLock);
         _idents[ident.toString()] = false;
@@ -258,6 +260,9 @@ public:
         return {};
     }
     boost::optional<Record> seekExact(const RecordId& id) final {
+        return {};
+    }
+    boost::optional<Record> seekNear(const RecordId& id) final {
         return {};
     }
     void save() final {}

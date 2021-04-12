@@ -7,12 +7,6 @@ selector:
   # These tests already run with transactions.
   - jstests/core/txns/*.js
 
-  # These tests are not expected to pass with replica-sets:
-  - jstests/core/capped_update.js
-  - jstests/core/dbadmin.js
-  - jstests/core/opcounters_write_cmd.js
-  - jstests/core/read_after_optime.js
-
   ##
   ## Limitations with the way the runner file injects transactions.
   ##
@@ -86,6 +80,7 @@ selector:
   - jstests/core/collation.js
   - jstests/core/explain_shell_helpers.js
   - jstests/core/index_partial_read_ops.js
+  - jstests/core/explain_server_params.js
   - jstests/core/optimized_match_explain.js
   - jstests/core/sort_array.js
   - jstests/core/views/views_collation.js
@@ -121,6 +116,7 @@ selector:
   - jstests/core/update_dbref.js
   - jstests/core/updatel.js
   - jstests/core/write_result.js
+  - jstests/core/positional_projection.js
 
   # Trick for bypassing mongo shell validation in the test doesn't work because txn_override
   # retry logic will hit the shell validation.
@@ -176,9 +172,6 @@ selector:
   - jstests/core/json_schema/misc_validation.js
   - jstests/core/views/views_all_commands.js
 
-  # Fails with implicit sessions because it will use multiple sessions on the same Mongo connection.
-  - jstests/core/dropdb.js
-
   # Committing a transaction when the server is fsync locked fails.
   - jstests/core/fsync.js
 
@@ -225,7 +218,6 @@ selector:
   - jstests/core/cursora.js
 
   # Expect drops/creates to fail or have a certain response:
-  - jstests/core/drop.js
   - jstests/core/explain_upsert.js
 
   # Expect certain responses, but retries of successfully completed commands may return
@@ -236,11 +228,6 @@ selector:
   # Expect results to return in a certain order, secondaries may apply ops out of order.
   - jstests/core/coveredIndex1.js
   - jstests/core/sortc.js
-
-  # Assert on the isWritablePrimary field of a hello response. If a primary steps down after
-  # accepting a hello command and returns before its connection is closed, the response can
-  # contain isWritablePrimary: false.
-  - jstests/core/hello_response_validation.js
 
   - jstests/core/bench_test*.js # benchRun() used for writes
   - jstests/core/benchrun_pipeline_updates.js # benchRun() used for writes
@@ -260,6 +247,7 @@ selector:
   - jstests/core/find_and_modify_server7660.js
   - jstests/core/upsert_shell.js
   exclude_with_any_tags:
+  - assumes_standalone_mongod
   ##
   # The next four tags correspond to the special errors thrown by the auto_retry_on_network_error.js
   # override when it refuses to run a certain command. Above each tag are the message(s) that cause
@@ -305,8 +293,7 @@ selector:
   - requires_profiling
   # Retrying a query can change whether a plan cache entry is active.
   - inspects_whether_plan_cache_entry_is_active
-  # $out is not supported in transactions
-  - uses_$out
+  - does_not_support_transactions
   # Operations in the main test shell aren't guaranteed to be causally consistent with operations
   # performed earlier in a parallel shell if multiple nodes are electable because the latest
   # operation and cluster times aren't shared between shells.

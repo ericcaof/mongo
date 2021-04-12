@@ -32,6 +32,7 @@
 #include "mongo/base/status.h"
 #include "mongo/db/range_arithmetic.h"
 #include "mongo/db/s/collection_metadata.h"
+#include "mongo/db/s/resharding_util.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/sharding_test_fixture_common.h"
@@ -115,17 +116,20 @@ protected:
         TypeCollectionReshardingFields reshardingFields{reshardingUuid};
         reshardingFields.setState(state);
 
-        if (state == CoordinatorStateEnum::kCommitted || state == CoordinatorStateEnum::kRenaming) {
+        if (state == CoordinatorStateEnum::kDecisionPersisted) {
             TypeCollectionRecipientFields recipientFields{
-                {kThisShard, kOtherShard}, existingUuid, kNss};
+                {kThisShard, kOtherShard}, existingUuid, kNss, 5000};
             reshardingFields.setRecipientFields(std::move(recipientFields));
-        } else if (state == CoordinatorStateEnum::kMirroring) {
-            TypeCollectionDonorFields donorFields{KeyPattern{BSON("newKey" << 1)}};
+        } else if (state == CoordinatorStateEnum::kBlockingWrites) {
+            TypeCollectionDonorFields donorFields{
+                constructTemporaryReshardingNss(kNss.db(), existingUuid),
+                KeyPattern{BSON("newKey" << 1)},
+                {kThisShard, kOtherShard}};
             reshardingFields.setDonorFields(std::move(donorFields));
         }
 
-        auto metadataUuid =
-            (state >= CoordinatorStateEnum::kCommitted && state != CoordinatorStateEnum::kError)
+        auto metadataUuid = (state >= CoordinatorStateEnum::kDecisionPersisted &&
+                             state != CoordinatorStateEnum::kError)
             ? reshardingUuid
             : existingUuid;
 
@@ -201,37 +205,37 @@ TEST_F(NoChunkFixture, OrphanedDataRangeEnd) {
     ASSERT(!metadata.getNextOrphanRange(pending, metadata.getMaxKey()));
 }
 
-TEST_F(NoChunkFixture, DisallowWritesInRenamingWithOrigUUID) {
+TEST_F(NoChunkFixture, DisallowWritesInDecisionPersistedWithOrigUUID) {
     UUID originalUUID = UUID::gen();
     UUID reshardingUUID = UUID::gen();
 
-    auto metadata =
-        makeCollectionMetadata(originalUUID, reshardingUUID, CoordinatorStateEnum::kRenaming);
+    auto metadata = makeCollectionMetadata(
+        originalUUID, reshardingUUID, CoordinatorStateEnum::kDecisionPersisted);
 
     // Writes should be disallowed if the collection metadata's UUID matches the original
     // collection's UUID.
     ASSERT(metadata.disallowWritesForResharding(originalUUID));
 }
 
-TEST_F(NoChunkFixture, AllowWritesInRenamingWithReshardingUUID) {
+TEST_F(NoChunkFixture, AllowWritesInDecisionPersistedWithReshardingUUID) {
     UUID originalUUID = UUID::gen();
     UUID reshardingUUID = UUID::gen();
 
-    auto metadata =
-        makeCollectionMetadata(originalUUID, reshardingUUID, CoordinatorStateEnum::kRenaming);
+    auto metadata = makeCollectionMetadata(
+        originalUUID, reshardingUUID, CoordinatorStateEnum::kDecisionPersisted);
 
     // Writes should NOT be disallowed when the UUID matches the temp collection's
     // UUID.
     ASSERT(!metadata.disallowWritesForResharding(reshardingUUID));
 }
 
-TEST_F(NoChunkFixture, DisallowWritesInRenamingThrows) {
+TEST_F(NoChunkFixture, DisallowWritesInDecisionPersistedThrows) {
     UUID originalUUID = UUID::gen();
     UUID reshardingUUID = UUID::gen();
     UUID rogueUUID = UUID::gen();
 
-    auto metadata =
-        makeCollectionMetadata(originalUUID, reshardingUUID, CoordinatorStateEnum::kRenaming);
+    auto metadata = makeCollectionMetadata(
+        originalUUID, reshardingUUID, CoordinatorStateEnum::kDecisionPersisted);
 
     // If the collection's UUID matches neither the original UUID nor the resharding UUID,
     // expect an exception.
@@ -251,14 +255,14 @@ TEST_F(NoChunkFixture, DisallowWritesInApplyingWithOrigUUID) {
     ASSERT(!metadata.disallowWritesForResharding(originalUUID));
 }
 
-TEST_F(NoChunkFixture, DisallowWritesInMirroringWithOrigUUID) {
+TEST_F(NoChunkFixture, DisallowWritesInBlockingWritesWithOrigUUID) {
     UUID originalUUID = UUID::gen();
     UUID reshardingUUID = UUID::gen();
 
     auto metadata =
-        makeCollectionMetadata(originalUUID, reshardingUUID, CoordinatorStateEnum::kMirroring);
+        makeCollectionMetadata(originalUUID, reshardingUUID, CoordinatorStateEnum::kBlockingWrites);
 
-    // Writes should be disallowed if the coordinator state is mirroring.
+    // Writes should be disallowed if the coordinator state is blocking-writes.
     ASSERT(metadata.disallowWritesForResharding(originalUUID));
 }
 

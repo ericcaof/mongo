@@ -218,7 +218,8 @@ void PrimaryOnlyServiceRegistry::onStepDown() {
 void PrimaryOnlyServiceRegistry::reportServiceInfoForServerStatus(BSONObjBuilder* result) noexcept {
     BSONObjBuilder subBuilder(result->subobjStart("primaryOnlyServices"));
     for (auto& service : _servicesByName) {
-        subBuilder.appendNumber(service.first, service.second->getNumberOfInstances());
+        subBuilder.appendNumber(service.first,
+                                static_cast<long long>(service.second->getNumberOfInstances()));
     }
 }
 
@@ -236,7 +237,7 @@ PrimaryOnlyService::PrimaryOnlyService(ServiceContext* serviceContext)
 
 size_t PrimaryOnlyService::getNumberOfInstances() {
     stdx::lock_guard lk(_mutex);
-    return _instances.size();
+    return _activeInstances.size();
 }
 
 void PrimaryOnlyService::reportInstanceInfoForCurrentOp(
@@ -245,8 +246,8 @@ void PrimaryOnlyService::reportInstanceInfoForCurrentOp(
     std::vector<BSONObj>* ops) noexcept {
 
     stdx::lock_guard lk(_mutex);
-    for (auto& [_, instance] : _instances) {
-        auto op = instance->reportForCurrentOp(connMode, sessionMode);
+    for (auto& [_, instance] : _activeInstances) {
+        auto op = instance.getInstance()->reportForCurrentOp(connMode, sessionMode);
         if (op.has_value()) {
             ops->push_back(std::move(op.get()));
         }
@@ -321,7 +322,7 @@ void PrimaryOnlyService::startup(OperationContext* opCtx) {
 }
 
 void PrimaryOnlyService::onStepUp(const OpTime& stepUpOpTime) {
-    InstanceMap savedInstances;
+    SimpleBSONObjUnorderedMap<ActiveInstance> savedInstances;
     invariant(_getHasExecutor());
     auto newThenOldScopedExecutor =
         std::make_shared<executor::ScopedTaskExecutor>(_executor, kExecutorShutdownStatus);
@@ -337,13 +338,14 @@ void PrimaryOnlyService::onStepUp(const OpTime& stepUpOpTime) {
                   str::stream() << "term " << newTerm << " is not greater than " << _term);
         _term = newTerm;
         _state = State::kRebuilding;
+        _source = CancellationSource();
 
         // Install a new executor, while moving the old one into 'newThenOldScopedExecutor' so it
         // can be accessed outside of _mutex.
         using std::swap;
         swap(newThenOldScopedExecutor, _scopedExecutor);
         // Don't destroy the Instances until all outstanding tasks run against them are complete.
-        swap(savedInstances, _instances);
+        swap(savedInstances, _activeInstances);
     }
 
     // Ensure that all tasks from the previous term have completed before allowing tasks to be
@@ -355,8 +357,7 @@ void PrimaryOnlyService::onStepUp(const OpTime& stepUpOpTime) {
 
     // This ensures that all instances from previous term have joined.
     for (auto& instance : savedInstances) {
-        if (instance.second->_running)
-            instance.second->_finishedNotifyFuture->wait();
+        instance.second.waitForCompletion();
     }
 
     // Now wait for the first write of the new term to be majority committed, so that we know
@@ -365,7 +366,7 @@ void PrimaryOnlyService::onStepUp(const OpTime& stepUpOpTime) {
     stdx::lock_guard lk(_mutex);
     auto term = _term;
     WaitForMajorityService::get(_serviceContext)
-        .waitUntilMajority(stepUpOpTime)
+        .waitUntilMajority(stepUpOpTime, _source.token())
         .thenRunOn(**_scopedExecutor)
         .then([this] {
             if (MONGO_unlikely(PrimaryOnlyServiceSkipRebuildingInstances.shouldFail())) {
@@ -376,6 +377,23 @@ void PrimaryOnlyService::onStepUp(const OpTime& stepUpOpTime) {
         })
         .then([this, term] { _rebuildInstances(term); })
         .getAsync([](auto&&) {});  // Ignore the result Future
+}
+
+void PrimaryOnlyService::_interruptInstances(WithLock, Status status) {
+    _source.cancel();
+
+    if (_scopedExecutor) {
+        (*_scopedExecutor)->shutdown();
+    }
+
+    for (auto& [instanceId, instance] : _activeInstances) {
+        instance.interrupt(status);
+    }
+
+    for (auto opCtx : _opCtxs) {
+        stdx::lock_guard<Client> clientLock(*opCtx->getClient());
+        _serviceContext->killOperation(clientLock, opCtx, status.code());
+    }
 }
 
 void PrimaryOnlyService::onStepDown() {
@@ -389,34 +407,21 @@ void PrimaryOnlyService::onStepDown() {
                "currently running instances and {numOperationContexts} associated operations",
                "Interrupting PrimaryOnlyService due to stepDown",
                "service"_attr = getServiceName(),
-               "numInstances"_attr = _instances.size(),
+               "numInstances"_attr = _activeInstances.size(),
                "numOperationContexts"_attr = _opCtxs.size());
 
-    // Reset the cancelation source on stepdown to prepare for the next elected primary.
-    _source.cancel();
-    _source = CancelationSource();
-
-    if (_scopedExecutor) {
-        (*_scopedExecutor)->shutdown();
-    }
-
-    for (auto& instance : _instances) {
-        instance.second->interrupt({ErrorCodes::InterruptedDueToReplStateChange,
-                                    "PrimaryOnlyService interrupted due to stepdown"});
-    }
-
-    for (auto opCtx : _opCtxs) {
-        stdx::lock_guard<Client> clientLock(*opCtx->getClient());
-        _serviceContext->killOperation(
-            clientLock, opCtx, ErrorCodes::InterruptedDueToReplStateChange);
-    }
+    _interruptInstances(lk,
+                        {ErrorCodes::InterruptedDueToReplStateChange,
+                         "PrimaryOnlyService interrupted due to stepdown"});
 
     _state = State::kPaused;
     _rebuildStatus = Status::OK();
+
+    _afterStepDown();
 }
 
 void PrimaryOnlyService::shutdown() {
-    InstanceMap savedInstances;
+    SimpleBSONObjUnorderedMap<ActiveInstance> savedInstances;
     std::shared_ptr<executor::TaskExecutor> savedExecutor;
     std::shared_ptr<executor::ScopedTaskExecutor> savedScopedExecutor;
 
@@ -430,33 +435,29 @@ void PrimaryOnlyService::shutdown() {
             "instances and {numOperationContexts} associated operations",
             "Shutting down PrimaryOnlyService",
             "service"_attr = getServiceName(),
-            "numInstances"_attr = _instances.size(),
+            "numInstances"_attr = _activeInstances.size(),
             "numOperationContexts"_attr = _opCtxs.size());
 
+        // If the _state is already kPaused, the instances have already been interrupted.
+        if (_state != State::kPaused) {
+            _interruptInstances(lk,
+                                {ErrorCodes::InterruptedAtShutdown,
+                                 "PrimaryOnlyService interrupted due to shutdown"});
+        }
+
         // Save the executor to join() with it outside of _mutex.
-        using std::swap;
-        swap(savedScopedExecutor, _scopedExecutor);
+        std::swap(savedScopedExecutor, _scopedExecutor);
 
         // Maintain the lifetime of the instances until all outstanding tasks using them are
         // complete.
-        swap(savedInstances, _instances);
+        std::swap(savedInstances, _activeInstances);
 
         _state = State::kShutdown;
         // shutdown can race with startup, so access _hasExecutor in this critical section.
         hasExecutor = _getHasExecutor();
     }
 
-    _source.cancel();
-
-    for (auto& instance : savedInstances) {
-        instance.second->interrupt(
-            {ErrorCodes::InterruptedAtShutdown, "PrimaryOnlyService interrupted due to shutdown"});
-    }
-
     if (savedScopedExecutor) {
-        // Make sure to shut down the scoped executor before the parent executor to avoid
-        // SERVER-50612.
-        (*savedScopedExecutor)->shutdown();
         // Ensures all work on scoped task executor is completed; in-turn ensures that
         // Instance::_finishedNotifyFuture gets set if instance is running.
         (*savedScopedExecutor)->join();
@@ -464,9 +465,8 @@ void PrimaryOnlyService::shutdown() {
 
     // Ensures that the instance cleanup (if any) gets completed before shutting down the
     // parent task executor.
-    for (auto& instance : savedInstances) {
-        if (instance.second->_running)
-            instance.second->_finishedNotifyFuture->wait();
+    for (auto& [instanceId, instance] : savedInstances) {
+        instance.waitForCompletion();
     }
 
     if (hasExecutor) {
@@ -476,8 +476,8 @@ void PrimaryOnlyService::shutdown() {
     savedInstances.clear();
 }
 
-std::shared_ptr<PrimaryOnlyService::Instance> PrimaryOnlyService::getOrCreateInstance(
-    OperationContext* opCtx, BSONObj initialState) {
+std::pair<std::shared_ptr<PrimaryOnlyService::Instance>, bool>
+PrimaryOnlyService::getOrCreateInstance(OperationContext* opCtx, BSONObj initialState) {
     const auto idElem = initialState["_id"];
     uassert(4908702,
             str::stream() << "Missing _id element when adding new instance of PrimaryOnlyService \""
@@ -497,18 +497,13 @@ std::shared_ptr<PrimaryOnlyService::Instance> PrimaryOnlyService::getOrCreateIns
                       << getServiceName(),
         _state == State::kRunning);
 
-    auto it = _instances.find(instanceID);
-    if (it != _instances.end()) {
-        return it->second;
+    auto it = _activeInstances.find(instanceID);
+    if (it != _activeInstances.end()) {
+        return {it->second.getInstance(), false};
     }
-    auto [it2, inserted] =
-        _instances.emplace(instanceID, constructInstance(std::move(initialState)));
-    invariant(inserted);
-
-    // Kick off async work to run the instance
-    _scheduleRun(lk, it2->second, instanceID);
-
-    return it2->second;
+    auto newInstance =
+        _insertNewInstance(lk, constructInstance(std::move(initialState)), std::move(instanceID));
+    return {newInstance, true};
 }
 
 boost::optional<std::shared_ptr<PrimaryOnlyService::Instance>> PrimaryOnlyService::lookupInstance(
@@ -523,7 +518,7 @@ boost::optional<std::shared_ptr<PrimaryOnlyService::Instance>> PrimaryOnlyServic
         _rebuildCV, lk, [this]() { return _state != State::kRebuilding; });
 
     if (_state == State::kShutdown || _state == State::kPaused) {
-        invariant(_instances.empty());
+        invariant(_activeInstances.empty());
         return boost::none;
     }
     if (_state == State::kRebuildFailed) {
@@ -532,22 +527,40 @@ boost::optional<std::shared_ptr<PrimaryOnlyService::Instance>> PrimaryOnlyServic
     invariant(_state == State::kRunning);
 
 
-    auto it = _instances.find(id);
-    if (it == _instances.end()) {
+    auto it = _activeInstances.find(id);
+    if (it == _activeInstances.end()) {
         return boost::none;
     }
 
-    return it->second;
+    return it->second.getInstance();
 }
 
-void PrimaryOnlyService::releaseInstance(const InstanceID& id) {
-    stdx::lock_guard lk(_mutex);
-    _instances.erase(id);
+void PrimaryOnlyService::releaseInstance(const InstanceID& id, Status status) {
+    auto savedInstanceNodeHandle = [&]() {
+        stdx::lock_guard lk(_mutex);
+        return _activeInstances.extract(id);
+    }();
+
+    if (!status.isOK() && savedInstanceNodeHandle) {
+        savedInstanceNodeHandle.mapped().interrupt(std::move(status));
+    }
 }
 
-void PrimaryOnlyService::releaseAllInstances() {
-    stdx::lock_guard lk(_mutex);
-    _instances.clear();
+void PrimaryOnlyService::releaseAllInstances(Status status) {
+    auto savedInstances = [&] {
+        stdx::lock_guard lk(_mutex);
+        SimpleBSONObjUnorderedMap<ActiveInstance> savedInstances;
+        // After this _activeInstances will be empty and savedInstances will contain
+        // the contents of _activeInstances.
+        std::swap(_activeInstances, savedInstances);
+        return savedInstances;
+    }();
+
+    if (!status.isOK()) {
+        for (auto& [instanceId, instance] : savedInstances) {
+            instance.interrupt(status);
+        }
+    }
 }
 
 void PrimaryOnlyService::_setHasExecutor(WithLock) {
@@ -574,7 +587,7 @@ void PrimaryOnlyService::_rebuildInstances(long long term) noexcept {
                     2,
                     "Querying {ns} to look for state documents while rebuilding PrimaryOnlyService "
                     "{service}",
-                    "Querying to look for state documents while rebuiding PrimaryOnlyService",
+                    "Querying to look for state documents while rebuilding PrimaryOnlyService",
                     "ns"_attr = ns,
                     "service"_attr = serviceName);
 
@@ -641,7 +654,7 @@ void PrimaryOnlyService::_rebuildInstances(long long term) noexcept {
         _rebuildCV.notify_all();
         return;
     }
-    invariant(_instances.empty());
+    invariant(_activeInstances.empty());
     invariant(_term == term);
 
     LOGV2_DEBUG(5123003,
@@ -658,44 +671,41 @@ void PrimaryOnlyService::_rebuildInstances(long long term) noexcept {
         fassert(4923602, !idElem.eoo());
         auto instanceID = idElem.wrap().getOwned();
         auto instance = constructInstance(std::move(doc));
-
-        auto [_, inserted] = _instances.emplace(instanceID, instance);
-        invariant(inserted);
-        _scheduleRun(lk, std::move(instance), instanceID);
+        [[maybe_unused]] auto newInstance =
+            _insertNewInstance(lk, std::move(instance), std::move(instanceID));
     }
     _state = State::kRunning;
     _rebuildCV.notify_all();
 }
 
-void PrimaryOnlyService::_scheduleRun(WithLock wl,
-                                      std::shared_ptr<Instance> instance,
-                                      InstanceID instanceID) {
-    (*_scopedExecutor)
-        ->schedule([this,
-                    instance = std::move(instance),
-                    scopedExecutor = _scopedExecutor,
-                    instanceID](auto status) {
-            if (ErrorCodes::isCancelationError(status) ||
-                ErrorCodes::InterruptedDueToReplStateChange ==  // from kExecutorShutdownStatus
-                    status) {
-                return;
-            }
-            invariant(status);
+std::shared_ptr<PrimaryOnlyService::Instance> PrimaryOnlyService::_insertNewInstance(
+    WithLock wl, std::shared_ptr<Instance> instance, InstanceID instanceID) {
+    CancellationSource instanceSource(_source.token());
+    auto instanceCompleteFuture =
+        ExecutorFuture<void>(**_scopedExecutor)
+            .then([serviceName = getServiceName(),
+                   instance,
+                   scopedExecutor = _scopedExecutor,
+                   token = instanceSource.token(),
+                   instanceID] {
+                LOGV2_DEBUG(5123002,
+                            3,
+                            "Starting instance of PrimaryOnlyService {service} with InstanceID "
+                            "{instanceID}",
+                            "Starting instance of PrimaryOnlyService",
+                            "service"_attr = serviceName,
+                            "instanceID"_attr = instanceID);
 
-            invariant(!instance->_running);
-            instance->_running = true;
+                return instance->run(std::move(scopedExecutor), std::move(token));
+            })
+            .semi();
 
-            LOGV2_DEBUG(
-                5123002,
-                3,
-                "Starting instance of PrimaryOnlyService {service} with InstanceID {instanceID}",
-                "Starting instance of PrimaryOnlyService",
-                "service"_attr = getServiceName(),
-                "instanceID"_attr = instanceID);
-            instance->_source = CancelationSource(_source.token());
-            instance->_finishedNotifyFuture =
-                instance->run(std::move(scopedExecutor), instance->_source.token());
-        });
+    auto [it, inserted] = _activeInstances.try_emplace(instanceID,
+                                                       std::move(instance),
+                                                       std::move(instanceSource),
+                                                       std::move(instanceCompleteFuture));
+    invariant(inserted);
+    return it->second.getInstance();
 }
 
 PrimaryOnlyService::AllowOpCtxWhenServiceRebuildingBlock::AllowOpCtxWhenServiceRebuildingBlock(

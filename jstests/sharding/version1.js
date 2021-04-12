@@ -1,6 +1,8 @@
 (function() {
 'use strict';
 
+load("jstests/sharding/libs/find_chunks_util.js");
+
 var s = new ShardingTest({name: "version1", shards: 1});
 
 assert.commandWorked(s.s0.adminCommand({enablesharding: "alleyinsider"}));
@@ -39,7 +41,7 @@ assert.commandFailed(a.runCommand({
 }),
                      "should have failed because version is config is 1|0");
 
-var epoch = s.getDB('config').chunks.findOne({"ns": "alleyinsider.foo"}).lastmodEpoch;
+var epoch = findChunksUtil.findOneChunkByNs(s.getDB('config'), "alleyinsider.foo").lastmodEpoch;
 assert.commandWorked(a.runCommand({
     setShardVersion: "alleyinsider.foo",
     configdb: s._configDB,
@@ -78,8 +80,6 @@ assert.commandFailed(a.runCommand({
 // assert.eq( a.runCommand( { "setShardVersion" : "alleyinsider.foo" , configdb : s._configDB ,
 // version : 3 } ).oldVersion.i , 2 , "oldVersion" );
 
-// assert.eq( a.runCommand( { "getShardVersion" : "alleyinsider.foo" } ).mine.i , 3 , "my get
-// version A" );
 // assert.eq( a.runCommand( { "getShardVersion" : "alleyinsider.foo" } ).global.i , 3 , "my get
 // version B" );
 

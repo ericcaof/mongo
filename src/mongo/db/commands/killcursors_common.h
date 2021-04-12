@@ -92,19 +92,19 @@ public:
             const auto& nss = killCursorsRequest.getNamespace();
             for (CursorId id : killCursorsRequest.getCursorIds()) {
                 auto status = Impl::doCheckAuth(opCtx, nss, id);
+                audit::logKillCursorsAuthzCheck(opCtx->getClient(), nss, id, status.code());
                 if (!status.isOK()) {
                     if (status.code() == ErrorCodes::CursorNotFound) {
                         // Not found isn't an authorization issue.
                         // run() will raise it as a return value.
                         continue;
                     }
-                    audit::logKillCursorsAuthzCheck(opCtx->getClient(), nss, id, status.code());
                     uassertStatusOK(status);  // throws
                 }
             }
         }
 
-        KillCursorsReply typedRun(OperationContext* opCtx) final {
+        KillCursorsCommandReply typedRun(OperationContext* opCtx) final {
             auto killCursorsRequest = this->request();
 
             std::vector<CursorId> cursorsKilled;
@@ -120,12 +120,9 @@ public:
                 } else {
                     cursorsAlive.push_back(id);
                 }
-
-                audit::logKillCursorsAuthzCheck(
-                    opCtx->getClient(), killCursorsRequest.getNamespace(), id, status.code());
             }
 
-            KillCursorsReply reply;
+            KillCursorsCommandReply reply;
             reply.setCursorsKilled(std::move(cursorsKilled));
             reply.setCursorsNotFound(std::move(cursorsNotFound));
             reply.setCursorsAlive(std::move(cursorsAlive));

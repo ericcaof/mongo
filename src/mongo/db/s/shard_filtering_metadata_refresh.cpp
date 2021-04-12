@@ -94,73 +94,6 @@ void onDbVersionMismatch(OperationContext* opCtx,
     forceDatabaseRefresh(opCtx, dbName);
 }
 
-SharedSemiFuture<void> recoverRefreshShardVersion(ServiceContext* serviceContext,
-                                                  const NamespaceString nss,
-                                                  bool runRecover) {
-    return ExecutorFuture<void>(Grid::get(serviceContext)->getExecutorPool()->getFixedExecutor())
-        .then([=] {
-            ThreadClient tc("RecoverRefreshThread", serviceContext);
-            {
-                stdx::lock_guard<Client> lk(*tc.get());
-                tc->setSystemOperationKillableByStepdown(lk);
-            }
-
-            if (MONGO_unlikely(hangInRecoverRefreshThread.shouldFail())) {
-                hangInRecoverRefreshThread.pauseWhileSet();
-            }
-
-            auto opCtxHolder = tc->makeOperationContext();
-            auto const opCtx = opCtxHolder.get();
-
-            boost::optional<CollectionMetadata> currentMetadata;
-
-            ON_BLOCK_EXIT([&] {
-                UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-                // A view can potentially be created after spawning a thread to recover nss's shard
-                // version. It is then ok to lock views in order to clear filtering metadata.
-                //
-                // DBLock and CollectionLock are used here to avoid throwing further recursive stale
-                // config errors.
-                Lock::DBLock dbLock(opCtx, nss.db(), MODE_IX);
-                Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
-
-                auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
-
-                if (currentMetadata) {
-                    csr->setFilteringMetadata(opCtx, *currentMetadata);
-                } else {
-                    // If currentMetadata is uninitialized, an error occurred in the current spawned
-                    // thread. Filtering metadata is cleared to force a new recover/refresh.
-                    csr->clearFilteringMetadata(opCtx);
-                }
-
-                auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(opCtx, csr);
-                csr->resetShardVersionRecoverRefreshFuture(csrLock);
-            });
-
-            if (runRecover) {
-                auto* const replCoord = repl::ReplicationCoordinator::get(opCtx);
-                if (!replCoord->isReplEnabled() || replCoord->getMemberState().primary()) {
-                    migrationutil::recoverMigrationCoordinations(opCtx, nss);
-                }
-            }
-
-            currentMetadata = forceGetCurrentMetadata(opCtx, nss);
-
-            if (currentMetadata && currentMetadata->isSharded()) {
-                // If the collection metadata after a refresh has 'reshardingFields', then pass it
-                // to the resharding subsystem to process.
-                const auto& reshardingFields = currentMetadata->getReshardingFields();
-                if (reshardingFields) {
-                    resharding::processReshardingFieldsForCollection(
-                        opCtx, nss, *currentMetadata, *reshardingFields);
-                }
-            }
-        })
-        .semi()
-        .share();
-}
-
 // Return true if joins a shard version update/recover/refresh (in that case, all locks are dropped)
 bool joinShardVersionOperation(OperationContext* opCtx,
                                CollectionShardingRuntime* csr,
@@ -195,6 +128,78 @@ bool joinShardVersionOperation(OperationContext* opCtx,
 }
 
 }  // namespace
+
+SharedSemiFuture<void> recoverRefreshShardVersion(ServiceContext* serviceContext,
+                                                  const NamespaceString nss,
+                                                  bool runRecover) {
+    return ExecutorFuture<void>(Grid::get(serviceContext)->getExecutorPool()->getFixedExecutor())
+        .then([=] {
+            ThreadClient tc("RecoverRefreshThread", serviceContext);
+            {
+                stdx::lock_guard<Client> lk(*tc.get());
+                tc->setSystemOperationKillableByStepdown(lk);
+            }
+
+            if (MONGO_unlikely(hangInRecoverRefreshThread.shouldFail())) {
+                hangInRecoverRefreshThread.pauseWhileSet();
+            }
+
+            auto opCtxHolder = tc->makeOperationContext();
+            auto const opCtx = opCtxHolder.get();
+
+            boost::optional<CollectionMetadata> currentMetadataToInstall;
+
+            ON_BLOCK_EXIT([&] {
+                UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+                // A view can potentially be created after spawning a thread to recover nss's shard
+                // version. It is then ok to lock views in order to clear filtering metadata.
+                //
+                // DBLock and CollectionLock are used here to avoid throwing further recursive stale
+                // config errors.
+                Lock::DBLock dbLock(opCtx, nss.db(), MODE_IX);
+                Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
+
+                auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
+
+                if (currentMetadataToInstall) {
+                    csr->setFilteringMetadata(opCtx, *currentMetadataToInstall);
+                } else {
+                    // If currentMetadataToInstall is uninitialized, an error occurred in the
+                    // current spawned thread. Filtering metadata is cleared to force a new
+                    // recover/refresh.
+                    csr->clearFilteringMetadata(opCtx);
+                }
+
+                auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(opCtx, csr);
+                csr->resetShardVersionRecoverRefreshFuture(csrLock);
+            });
+
+            if (runRecover) {
+                auto* const replCoord = repl::ReplicationCoordinator::get(opCtx);
+                if (!replCoord->isReplEnabled() || replCoord->getMemberState().primary()) {
+                    migrationutil::recoverMigrationCoordinations(opCtx, nss);
+                }
+            }
+
+            auto currentMetadata = forceGetCurrentMetadata(opCtx, nss);
+
+            if (currentMetadata.isSharded()) {
+                // If the collection metadata after a refresh has 'reshardingFields', then pass it
+                // to the resharding subsystem to process.
+                const auto& reshardingFields = currentMetadata.getReshardingFields();
+                if (reshardingFields) {
+                    resharding::processReshardingFieldsForCollection(
+                        opCtx, nss, currentMetadata, *reshardingFields);
+                }
+            }
+
+            // Only if all actions taken as part of refreshing the shard version completed
+            // successfully do we want to install the current metadata.
+            currentMetadataToInstall = std::move(currentMetadata);
+        })
+        .semi()
+        .share();
+}
 
 void onShardVersionMismatch(OperationContext* opCtx,
                             const NamespaceString& nss,

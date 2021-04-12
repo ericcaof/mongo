@@ -48,9 +48,6 @@ public:
     bool supportsCappedCollections() const final {
         return true;
     }
-    bool supportsCheckpoints() const final {
-        return false;
-    }
     bool isDurable() const final {
         return false;
     }
@@ -106,6 +103,9 @@ public:
         return nullptr;
     }
     void setJournalListener(JournalListener* jl) final {}
+    bool supportsClusteredIdIndex() const final {
+        return false;
+    }
     bool supportsRecoverToStableTimestamp() const final {
         return false;
     }
@@ -196,7 +196,8 @@ public:
         return nullptr;
     }
 
-    StatusWith<Timestamp> pinOldestTimestamp(const std::string& requestingServiceName,
+    StatusWith<Timestamp> pinOldestTimestamp(OperationContext* opCtx,
+                                             const std::string& requestingServiceName,
                                              Timestamp requestedTimestamp,
                                              bool roundUpIfTooOld) final {
         return Status::OK();

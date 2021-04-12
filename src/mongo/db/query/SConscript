@@ -70,6 +70,7 @@ env.Library(
         "query_knobs",
     ],
     LIBDEPS_PRIVATE=[
+        "$BUILD_DIR/mongo/db/record_id_helpers",
         "$BUILD_DIR/mongo/idl/server_parameter",
     ],
 )
@@ -126,6 +127,7 @@ env.Library(
     target="explain_options",
     source=[
         "explain_options.cpp",
+        "explain_verbosity.idl"
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
@@ -141,6 +143,18 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/namespace_string',
+    ],
+)
+
+env.Library(
+    target='cursor_response_idl',
+    source=[
+        'cursor_response.idl',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/idl/basic_types',
+        '$BUILD_DIR/mongo/idl/idl_parser',
     ],
 )
 
@@ -168,7 +182,10 @@ env.Library(
         '$BUILD_DIR/mongo/rpc/command_status',
         '$BUILD_DIR/mongo/rpc/rpc',
         'query_request',
-    ]
+    ],
+    LIBDEPS_PRIVATE=[
+        "cursor_response_idl",
+    ],
 )
 
 env.Library(
@@ -176,20 +193,24 @@ env.Library(
     source=[
         "distinct_command.idl",
         "find_command.idl",
-        "query_request.cpp",
+        "getmore_command.idl",
+        "query_request_helper.cpp",
+        "max_time_ms_parser.cpp",
         "tailable_mode.cpp",
         "tailable_mode.idl",
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
         "$BUILD_DIR/mongo/db/api_parameters",
+        '$BUILD_DIR/mongo/db/auth/authprivilege',
         "$BUILD_DIR/mongo/db/catalog/collection_catalog",
-        # TODO: This dependency edge can be removed when the 'allowDiskUse' option no longer depends
-        # on enabling test commands.
         "$BUILD_DIR/mongo/db/commands/test_commands_enabled",
         "$BUILD_DIR/mongo/db/pipeline/runtime_constants_idl",
         "$BUILD_DIR/mongo/db/repl/read_concern_args",
         "hint_parser",
+    ],
+    LIBDEPS_PRIVATE=[
+        "cursor_response_idl",
     ],
 )
 
@@ -275,6 +296,10 @@ env.Library(
         '$BUILD_DIR/mongo/util/elapsed_tracker',
         '$BUILD_DIR/mongo/util/fail_point',
     ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
+        '$BUILD_DIR/mongo/db/storage/recovery_unit_base',
+    ],
     LIBDEPS_TYPEINFO=[
         '$BUILD_DIR/mongo/db/service_context',
     ],
@@ -288,7 +313,6 @@ env.CppUnitTest(
         "classic_stage_builder_test.cpp",
         "count_command_test.cpp",
         "cursor_response_test.cpp",
-        "explain_options_test.cpp",
         "get_executor_test.cpp",
         "getmore_request_test.cpp",
         "hint_parser_test.cpp",
@@ -327,6 +351,8 @@ env.CppUnitTest(
         "query_request_test.cpp",
         "query_settings_test.cpp",
         "query_solution_test.cpp",
+        "sbe_and_hash_test.cpp",
+        "sbe_and_sorted_test.cpp",
         "sbe_stage_builder_test_fixture.cpp",
         "sbe_stage_builder_test.cpp",
         "sbe_shard_filter_test.cpp",

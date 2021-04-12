@@ -81,8 +81,8 @@ public:
             new CollectionScan(_expCtx.get(), collection(), params, ws.get(), nullptr));
 
         // Create a plan executor to hold it
-        auto qr = std::make_unique<QueryRequest>(nss);
-        auto statusWithCQ = CanonicalQuery::canonicalize(&_opCtx, std::move(qr));
+        auto findCommand = std::make_unique<FindCommandRequest>(nss);
+        auto statusWithCQ = CanonicalQuery::canonicalize(&_opCtx, std::move(findCommand));
         ASSERT_OK(statusWithCQ.getStatus());
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -92,7 +92,8 @@ public:
                                         std::move(ws),
                                         std::move(scan),
                                         &collection(),
-                                        PlanYieldPolicy::YieldPolicy::YIELD_MANUAL);
+                                        PlanYieldPolicy::YieldPolicy::YIELD_MANUAL,
+                                        QueryPlannerParams::DEFAULT);
 
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         return std::move(statusWithPlanExecutor.getValue());

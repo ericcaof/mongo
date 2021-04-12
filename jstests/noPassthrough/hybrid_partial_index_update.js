@@ -1,7 +1,9 @@
 /**
  * Tests that building partial indexes using the hybrid method preserves multikey information.
  *
- * @tags: [requires_replication]
+ * @tags: [
+ *   requires_replication,
+ * ]
  */
 (function() {
 'use strict';

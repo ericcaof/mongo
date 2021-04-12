@@ -122,6 +122,10 @@ TEST_F(DistLockCatalogReplSetTest, BasicPing) {
 
         return fromjson(R"({
                 ok: 1,
+                lastErrorObject: {
+                    n: 1,
+                    updatedExisting: true
+                },
                 value: {
                     _id: "abcd",
                     ping: { $date: "2014-03-11T09:17:18.098Z" }
@@ -193,6 +197,10 @@ TEST_F(DistLockCatalogReplSetTest, PingWriteConcernError) {
         return fromjson(R"({
                 ok: 1,
                 value: null,
+                lastErrorObject: {
+                    n: 1,
+                    updatedExisting: true
+                },
                 writeConcernError: {
                     code: 64,
                     errmsg: "waiting for replication timed out"
@@ -215,6 +223,10 @@ TEST_F(DistLockCatalogReplSetTest, PingUnsupportedWriteConcernResponse) {
         return fromjson(R"({
                 ok: 1,
                 value: null,
+                lastErrorObject: {
+                    n: 1,
+                    updatedExisting: true
+                },
                 writeConcernError: {
                     code: "bad format",
                     errmsg: "waiting for replication timed out"
@@ -228,7 +240,7 @@ TEST_F(DistLockCatalogReplSetTest, PingUnsupportedWriteConcernResponse) {
 TEST_F(DistLockCatalogReplSetTest, PingUnsupportedResponseFormat) {
     auto future = launchOnSeparateThread([this](OperationContext* opCtx) {
         auto status = _distLockCatalog.ping(opCtx, "abcd", Date_t::now());
-        ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
+        ASSERT_EQUALS(ErrorCodes::TypeMismatch, status.code());
     });
 
     onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
@@ -282,7 +294,13 @@ TEST_F(DistLockCatalogReplSetTest, GrabLockNoOp) {
 
         ASSERT_BSONOBJ_EQ(expectedCmd, request.cmdObj);
 
-        return fromjson("{ ok: 1, value: null }");
+        return fromjson(R"({
+            ok: 1,
+            value: null,
+            lastErrorObject: {
+                n: 1
+            }
+        })");
     });
 
     future.default_timed_get();
@@ -338,8 +356,8 @@ TEST_F(DistLockCatalogReplSetTest, GrabLockWithNewDoc) {
 
         return fromjson(R"({
                 lastErrorObject: {
-                    updatedExisting: false,
                     n: 1,
+                    updatedExisting: false,
                     upserted: 1
                 },
                 value: {
@@ -374,8 +392,8 @@ TEST_F(DistLockCatalogReplSetTest, GrabLockWithBadLockDoc) {
         // the vital parts of the resulting doc are derived from the update request.
         return fromjson(R"({
                 lastErrorObject: {
-                    updatedExisting: false,
                     n: 1,
+                    updatedExisting: false,
                     upserted: 1
                 },
                 value: {
@@ -565,7 +583,7 @@ TEST_F(DistLockCatalogReplSetTest, GrabLockWriteConcernErrorBadType) {
 
 TEST_F(DistLockCatalogReplSetTest, GrabLockResponseMissingValueField) {
     auto future = launchOnSeparateThread([this](OperationContext* opCtx) {
-        auto status = _distLockCatalog
+        ASSERT_NOT_OK(_distLockCatalog
                           .grabLock(operationContext(),
                                     "",
                                     OID::gen(),
@@ -574,9 +592,7 @@ TEST_F(DistLockCatalogReplSetTest, GrabLockResponseMissingValueField) {
                                     Date_t::now(),
                                     "",
                                     DistLockCatalog::kMajorityWriteConcern)
-                          .getStatus();
-        ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
-        ASSERT_FALSE(status.reason().empty());
+                          .getStatus());
     });
 
     onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
@@ -590,7 +606,7 @@ TEST_F(DistLockCatalogReplSetTest, GrabLockResponseMissingValueField) {
 
 TEST_F(DistLockCatalogReplSetTest, GrabLockUnsupportedWriteConcernResponse) {
     auto future = launchOnSeparateThread([this](OperationContext* opCtx) {
-        auto status = _distLockCatalog
+        ASSERT_NOT_OK(_distLockCatalog
                           .grabLock(operationContext(),
                                     "",
                                     OID::gen(),
@@ -599,9 +615,7 @@ TEST_F(DistLockCatalogReplSetTest, GrabLockUnsupportedWriteConcernResponse) {
                                     Date_t::now(),
                                     "",
                                     DistLockCatalog::kMajorityWriteConcern)
-                          .getStatus();
-        ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
-        ASSERT_FALSE(status.reason().empty());
+                          .getStatus());
     });
 
     onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
@@ -621,7 +635,7 @@ TEST_F(DistLockCatalogReplSetTest, GrabLockUnsupportedWriteConcernResponse) {
 
 TEST_F(DistLockCatalogReplSetTest, GrabLockUnsupportedResponseFormat) {
     auto future = launchOnSeparateThread([this](OperationContext* opCtx) {
-        auto status = _distLockCatalog
+        ASSERT_NOT_OK(_distLockCatalog
                           .grabLock(operationContext(),
                                     "",
                                     OID::gen(),
@@ -630,8 +644,7 @@ TEST_F(DistLockCatalogReplSetTest, GrabLockUnsupportedResponseFormat) {
                                     Date_t::now(),
                                     "",
                                     DistLockCatalog::kMajorityWriteConcern)
-                          .getStatus();
-        ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
+                          .getStatus());
     });
 
     onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
@@ -685,7 +698,13 @@ TEST_F(DistLockCatalogReplSetTest, OvertakeLockNoOp) {
 
         ASSERT_BSONOBJ_EQ(expectedCmd, request.cmdObj);
 
-        return fromjson("{ ok: 1, value: null }");
+        return fromjson(R"({
+            ok: 1,
+            value: null,
+            lastErrorObject: {
+                n: 0
+            }
+        })");
     });
 
     future.default_timed_get();
@@ -740,8 +759,8 @@ TEST_F(DistLockCatalogReplSetTest, OvertakeLockWithNewDoc) {
 
         return fromjson(R"({
                 lastErrorObject: {
-                    updatedExisting: false,
                     n: 1,
+                    updatedExisting: false,
                     upserted: 1
                 },
                 value: {
@@ -774,8 +793,8 @@ TEST_F(DistLockCatalogReplSetTest, OvertakeLockWithBadLockDoc) {
         // the vital parts of the resulting doc are derived from the update request.
         return fromjson(R"({
                 lastErrorObject: {
-                    updatedExisting: false,
                     n: 1,
+                    updatedExisting: false,
                     upserted: 1
                 },
                 value: {
@@ -905,11 +924,10 @@ TEST_F(DistLockCatalogReplSetTest, OvertakeLockUnsupportedWriteConcernResponse) 
 
 TEST_F(DistLockCatalogReplSetTest, OvertakeLockUnsupportedResponseFormat) {
     auto future = launchOnSeparateThread([this](OperationContext* opCtx) {
-        auto status =
+        ASSERT_NOT_OK(
             _distLockCatalog
                 .overtakeLock(operationContext(), "", OID(), OID(), "", "", Date_t::now(), "")
-                .getStatus();
-        ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
+                .getStatus());
     });
 
     onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
@@ -922,7 +940,8 @@ TEST_F(DistLockCatalogReplSetTest, OvertakeLockUnsupportedResponseFormat) {
 
 TEST_F(DistLockCatalogReplSetTest, BasicUnlock) {
     auto future = launchOnSeparateThread([this](OperationContext* opCtx) {
-        auto status = _distLockCatalog.unlock(operationContext(), OID("555f99712c99a78c5b083358"));
+        auto status = _distLockCatalog.unlock(
+            operationContext(), OID("555f99712c99a78c5b083358"), "TestName");
         ASSERT_OK(status);
     });
 
@@ -932,7 +951,7 @@ TEST_F(DistLockCatalogReplSetTest, BasicUnlock) {
 
         BSONObj expectedCmd(fromjson(R"({
                 findAndModify: "locks",
-                query: { ts: ObjectId("555f99712c99a78c5b083358") },
+                query: { ts: ObjectId("555f99712c99a78c5b083358"), _id: "TestName" },
                 update: { $set: { state: 0 }},
                 writeConcern: { w: "majority", wtimeout: 15000 },
                 maxTimeMS: 30000
@@ -942,6 +961,10 @@ TEST_F(DistLockCatalogReplSetTest, BasicUnlock) {
 
         return fromjson(R"({
                 ok: 1,
+                lastErrorObject: {
+                    n: 1,
+                    updatedExisting: true
+                },
                 value: {
                     _id: "",
                     ts: ObjectId("555f99712c99a78c5b083358"),
@@ -955,9 +978,8 @@ TEST_F(DistLockCatalogReplSetTest, BasicUnlock) {
 
 TEST_F(DistLockCatalogReplSetTest, BasicUnlockWithName) {
     auto future = launchOnSeparateThread([this](OperationContext* opCtx) {
-        auto status = _distLockCatalog.unlock(
-            operationContext(), OID("555f99712c99a78c5b083358"), "TestDB.TestColl");
-        ASSERT_OK(status);
+        ASSERT_OK(_distLockCatalog.unlock(
+            operationContext(), OID("555f99712c99a78c5b083358"), "TestDB.TestColl"));
     });
 
     onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
@@ -976,6 +998,10 @@ TEST_F(DistLockCatalogReplSetTest, BasicUnlockWithName) {
 
         return fromjson(R"({
                 ok: 1,
+                lastErrorObject: {
+                    n: 1,
+                    updatedExisting: true
+                },
                 value: {
                     _id: "TestDB.TestColl",
                     ts: ObjectId("555f99712c99a78c5b083358"),
@@ -989,7 +1015,8 @@ TEST_F(DistLockCatalogReplSetTest, BasicUnlockWithName) {
 
 TEST_F(DistLockCatalogReplSetTest, UnlockWithNoNewDoc) {
     auto future = launchOnSeparateThread([this](OperationContext* opCtx) {
-        auto status = _distLockCatalog.unlock(operationContext(), OID("555f99712c99a78c5b083358"));
+        auto status = _distLockCatalog.unlock(
+            operationContext(), OID("555f99712c99a78c5b083358"), "TestName");
         ASSERT_OK(status);
     });
 
@@ -999,7 +1026,7 @@ TEST_F(DistLockCatalogReplSetTest, UnlockWithNoNewDoc) {
 
         BSONObj expectedCmd(fromjson(R"({
                 findAndModify: "locks",
-                query: { ts: ObjectId("555f99712c99a78c5b083358") },
+                query: { ts: ObjectId("555f99712c99a78c5b083358"), _id: "TestName" },
                 update: { $set: { state: 0 }},
                 writeConcern: { w: "majority", wtimeout: 15000 },
                 maxTimeMS: 30000
@@ -1009,6 +1036,9 @@ TEST_F(DistLockCatalogReplSetTest, UnlockWithNoNewDoc) {
 
         return fromjson(R"({
                 ok: 1,
+                lastErrorObject: {
+                    n: 0
+                },
                 value: null
             })");
     });
@@ -1039,6 +1069,9 @@ TEST_F(DistLockCatalogReplSetTest, UnlockWithNameWithNoNewDoc) {
 
         return fromjson(R"({
                 ok: 1,
+                lastErrorObject: {
+                    n: 0
+                },
                 value: null
             })");
     });
@@ -1048,21 +1081,21 @@ TEST_F(DistLockCatalogReplSetTest, UnlockWithNameWithNoNewDoc) {
 
 TEST_F(DistLockCatalogReplSetTest, UnlockTargetError) {
     configTargeter()->setFindHostReturnValue({ErrorCodes::InternalError, "can't target"});
-    auto status = _distLockCatalog.unlock(operationContext(), OID());
+    auto status = _distLockCatalog.unlock(operationContext(), OID(), "TestName");
     ASSERT_NOT_OK(status);
 }
 
 TEST_F(DistLockCatalogReplSetTest, UnlockRunCmdError) {
     shutdownExecutorPool();
 
-    auto status = _distLockCatalog.unlock(operationContext(), OID());
+    auto status = _distLockCatalog.unlock(operationContext(), OID(), "TestName");
     ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, status.code());
     ASSERT_FALSE(status.reason().empty());
 }
 
 TEST_F(DistLockCatalogReplSetTest, UnlockCommandError) {
     auto future = launchOnSeparateThread([this](OperationContext* opCtx) {
-        auto status = _distLockCatalog.unlock(operationContext(), OID());
+        auto status = _distLockCatalog.unlock(operationContext(), OID(), "TestName");
         ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
@@ -1080,7 +1113,7 @@ TEST_F(DistLockCatalogReplSetTest, UnlockCommandError) {
 
 TEST_F(DistLockCatalogReplSetTest, UnlockWriteError) {
     auto future = launchOnSeparateThread([this](OperationContext* opCtx) {
-        auto status = _distLockCatalog.unlock(operationContext(), OID());
+        auto status = _distLockCatalog.unlock(operationContext(), OID(), "TestName");
         ASSERT_EQUALS(ErrorCodes::Unauthorized, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
@@ -1098,7 +1131,7 @@ TEST_F(DistLockCatalogReplSetTest, UnlockWriteError) {
 
 TEST_F(DistLockCatalogReplSetTest, UnlockWriteConcernError) {
     auto future = launchOnSeparateThread([this](OperationContext* opCtx) {
-        auto status = _distLockCatalog.unlock(operationContext(), OID());
+        auto status = _distLockCatalog.unlock(operationContext(), OID(), "TestName");
         ASSERT_EQUALS(ErrorCodes::WriteConcernFailed, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
@@ -1123,7 +1156,7 @@ TEST_F(DistLockCatalogReplSetTest, UnlockWriteConcernError) {
 
 TEST_F(DistLockCatalogReplSetTest, UnlockUnsupportedWriteConcernResponse) {
     auto future = launchOnSeparateThread([this](OperationContext* opCtx) {
-        auto status = _distLockCatalog.unlock(operationContext(), OID());
+        auto status = _distLockCatalog.unlock(operationContext(), OID(), "TestName");
         ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
@@ -1145,8 +1178,7 @@ TEST_F(DistLockCatalogReplSetTest, UnlockUnsupportedWriteConcernResponse) {
 
 TEST_F(DistLockCatalogReplSetTest, UnlockUnsupportedResponseFormat) {
     auto future = launchOnSeparateThread([this](OperationContext* opCtx) {
-        auto status = _distLockCatalog.unlock(operationContext(), OID());
-        ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
+        ASSERT_NOT_OK(_distLockCatalog.unlock(operationContext(), OID(), "TestName"));
     });
 
     onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
@@ -1404,8 +1436,7 @@ TEST_F(DistLockCatalogReplSetTest, GetServerNoElectionIdButMasterShouldFail) {
 
 TEST_F(DistLockCatalogReplSetTest, BasicStopPing) {
     auto future = launchOnSeparateThread([this](OperationContext* opCtx) {
-        auto status = _distLockCatalog.stopPing(operationContext(), "test");
-        ASSERT_OK(status);
+        ASSERT_OK(_distLockCatalog.stopPing(operationContext(), "test"));
     });
 
     onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
@@ -1424,6 +1455,10 @@ TEST_F(DistLockCatalogReplSetTest, BasicStopPing) {
 
         return fromjson(R"({
                 ok: 1,
+                lastErrorObject: {
+                    n: 1,
+                    updatedExisting: true
+                },
                 value: {
                   _id: "test",
                   ping: { $date: "2014-03-11T09:17:18.098Z" }
@@ -1529,8 +1564,7 @@ TEST_F(DistLockCatalogReplSetTest, StopPingUnsupportedWriteConcernResponse) {
 
 TEST_F(DistLockCatalogReplSetTest, StopPingUnsupportedResponseFormat) {
     auto future = launchOnSeparateThread([this](OperationContext* opCtx) {
-        auto status = _distLockCatalog.stopPing(operationContext(), "");
-        ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
+        ASSERT_NOT_OK(_distLockCatalog.stopPing(operationContext(), ""));
     });
 
     onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {

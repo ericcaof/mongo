@@ -65,7 +65,7 @@ OplogEntry createOplogEntryForTransactionTableUpdate(repl::OpTime opTime,
                                     {},    // sessionInfo
                                     true,  // upsert
                                     wallClockTime,
-                                    boost::none,    // statementId
+                                    {},             // statementIds
                                     boost::none,    // prevWriteOpTime
                                     boost::none,    // preImageOpTime
                                     boost::none,    // postImageOpTime
@@ -107,9 +107,40 @@ boost::optional<repl::OplogEntry> createMatchingTransactionTableUpdate(
 }
 
 /**
- * Returns true if the oplog entry represents an operation in a transaction and false otherwise.
+ * A tenant migrations transaction entry will:
+ *
+ * 1) Have the 'fromTenantMigration' field set
+ * 2) Be a no-op entry
+ * 3) Have sessionId and txnNumber
  */
-bool isTransactionEntry(OplogEntry entry) {
+bool isTransactionEntryFromTenantMigrations(const OplogEntry& entry) {
+    if (!entry.getFromTenantMigration()) {
+        return false;
+    }
+
+    if (entry.getFromMigrate()) {
+        // Retryable writes have fromMigrate set.
+        return false;
+    }
+
+    if (entry.getOpType() != repl::OpTypeEnum::kNoop) {
+        return false;
+    }
+
+    if (!entry.getSessionId() || !entry.getTxnNumber()) {
+        return false;
+    }
+
+    return true;
+}
+
+}  // namespace
+
+bool SessionUpdateTracker::isTransactionEntry(const OplogEntry& entry) {
+    if (isTransactionEntryFromTenantMigrations(entry)) {
+        return true;
+    }
+
     auto sessionInfo = entry.getOperationSessionInfo();
     if (!sessionInfo.getTxnNumber()) {
         return false;
@@ -120,8 +151,6 @@ bool isTransactionEntry(OplogEntry entry) {
         entry.getCommandType() == repl::OplogEntry::CommandType::kCommitTransaction ||
         entry.getCommandType() == repl::OplogEntry::CommandType::kApplyOps;
 }
-
-}  // namespace
 
 boost::optional<std::vector<OplogEntry>> SessionUpdateTracker::_updateOrFlush(
     const OplogEntry& entry) {
@@ -168,9 +197,7 @@ void SessionUpdateTracker::_updateSessionInfo(const OplogEntry& entry) {
     const auto& lsid = sessionInfo.getSessionId();
     invariant(lsid);
 
-    // Ignore any no-op oplog entries, except for the ones generated from session migration
-    // of CRUD ops. These entries will have an o2 field that contains the original CRUD
-    // oplog entry.
+    // Ignore pre/post image no-op oplog entries. These entries will not have an o2 field.
     if (entry.getOpType() == OpTypeEnum::kNoop) {
         if (!entry.getFromMigrate() || !*entry.getFromMigrate()) {
             return;
@@ -275,6 +302,13 @@ boost::optional<OplogEntry> SessionUpdateTracker::_createTransactionTableUpdateF
         newTxnRecord.setTxnNum(*sessionInfo.getTxnNumber());
         newTxnRecord.setLastWriteOpTime(entry.getOpTime());
         newTxnRecord.setLastWriteDate(entry.getWallClockTime());
+
+        if (entry.getFromTenantMigration() && entry.getOpType() == OpTypeEnum::kNoop) {
+            // For tenant migration, we don't need to set the lastWriteOpTime.
+            newTxnRecord.setLastWriteOpTime(OpTime());
+            newTxnRecord.setState(DurableTxnStateEnum::kCommitted);
+            return newTxnRecord.toBSON();
+        }
 
         if (entry.isPartialTransaction()) {
             invariant(entry.getPrevWriteOpTimeInTransaction()->isNull());

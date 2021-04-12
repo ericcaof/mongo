@@ -57,6 +57,50 @@ TEST_F(QueryPlannerTest, PlannerAddsFetchToIxscanForCountWhenFetchFilterNonempty
         "{pattern: {x: 1}, bounds: {x: [[5,5,true,true]]}}}}}");
 }
 
+TEST_F(QueryPlannerTest, PlannerUsesCoveredIxscanForCountWhenIndexSatisfiesNullQuery) {
+    params.options = QueryPlannerParams::IS_COUNT;
+    addIndex(BSON("x" << 1));
+    runQuery(fromjson("{x: null}"));
+    ASSERT_EQUALS(getNumSolutions(), 1U);
+    assertSolutionExists(
+        "{ixscan: {pattern: {x: 1}, bounds: "
+        "{x: [[undefined,undefined,true,true],[null,null,true,true]]}}}");
+}
+
+TEST_F(QueryPlannerTest, PlannerAddsFetchForCountWhenMultikeyIndexSatisfiesNullQuery) {
+    params.options = QueryPlannerParams::IS_COUNT;
+    addIndex(BSON("x" << 1), true);
+    runQuery(fromjson("{x: null}"));
+    ASSERT_EQUALS(getNumSolutions(), 1U);
+    assertSolutionExists(
+        "{fetch: {filter: {x: null}, node: {ixscan: "
+        "{pattern: {x: 1}, bounds: "
+        "{x: [[undefined,undefined,true,true],[null,null,true,true]]}}}}}");
+}
+
+TEST_F(QueryPlannerTest, PlannerUsesCoveredIxscanFindWhenIndexSatisfiesNullQuery) {
+    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    addIndex(fromjson("{x: 1, _id: 1}"));
+    runQuerySortProj(fromjson("{x: null}}"), BSONObj(), fromjson("{_id: 1}}"));
+    ASSERT_EQUALS(getNumSolutions(), 1U);
+    assertSolutionExists(
+        "{proj: {spec: {_id: 1}, node:"
+        "{ixscan: {pattern: {x: 1, _id: 1}, bounds: "
+        "{x: [[undefined,undefined,true,true],[null,null,true,true]]}}}}}");
+}
+
+TEST_F(QueryPlannerTest, PlannerAddsFetchForFindWhenMultikeyIndexSatisfiesNullQuery) {
+    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    addIndex(fromjson("{x: 1, _id: 1}"), true);
+    runQuerySortProj(fromjson("{x: null}}"), BSONObj(), fromjson("{_id: 1}}"));
+    ASSERT_EQUALS(getNumSolutions(), 1U);
+    assertSolutionExists(
+        "{proj: {spec: {_id: 1}, node:"
+        "{fetch: {filter: {x: null}, node: {ixscan: "
+        "{pattern: {x: 1, _id: 1}, bounds: "
+        "{x: [[undefined,undefined,true,true],[null,null,true,true]]}}}}}}}");
+}
+
 //
 // Sparse indices, SERVER-8067
 // Each index in this block of tests is sparse.
@@ -188,6 +232,40 @@ TEST_F(QueryPlannerTest, SparseIndexCanSupportGTEOrLTENull) {
     assertSolutionExists(
         "{fetch: {filter: {i: {$lte: null}}, node: {ixscan: {pattern: "
         "{i: 1}, bounds: {i: [[undefined,undefined,true,true], [null,null,true,true]]}}}}}");
+}
+
+TEST_F(QueryPlannerTest, PlannerCanUseIndexesWithSameKeyButDifferentSparseProperty) {
+    // Create two indexes on the same key pattern; one sparse, the other non-sparse. This is
+    // permitted because the 'sparse' property is part of the index signature.
+    addIndex(fromjson("{a: 1}"), /*multikey*/ false, /*sparse*/ false);
+    addIndex(fromjson("{a: 1}"), /*multikey*/ false, /*sparse*/ true, /*unique*/ false, "a_sparse");
+
+    runQuery(fromjson("{a: 1}"));
+
+    // Plan #1: FETCH > IXSCAN with a_1 index.
+    // Plan #2: FETCH > IXSCAN with a_sparse index.
+    // Plan #3: COLLSCAN with filter a == 1.
+    assertNumSolutions(3U);
+
+    // There must be a solution that uses the sparse index "a_sparse".
+    assertSolutionExists("{fetch: {node: {ixscan: {name: \"a_sparse\"}}}}");
+}
+
+TEST_F(QueryPlannerTest, PlannerCanUseIndexesWithSameKeyButDifferentUniqueProperty) {
+    // Create two indexes on the same key pattern; one unique, the other non-unique. This is
+    // permitted because the 'unique' property is part of the index signature.
+    addIndex(fromjson("{a: 1}"), /*multikey*/ false, /*sparse*/ false, /*unique*/ false);
+    addIndex(fromjson("{a: 1}"), /*multikey*/ false, /*sparse*/ false, /*unique*/ true, "a_unique");
+
+    runQuery(fromjson("{a: 1}"));
+
+    // Plan #1: FETCH > IXSCAN with a_1 index.
+    // Plan #2: FETCH > IXSCAN with a_unique index.
+    // Plan #3: COLLSCAN with filter a == 1.
+    assertNumSolutions(3U);
+
+    // There must be a solution that uses the unique index "a_unique".
+    assertSolutionExists("{fetch: {node: {ixscan: {name: \"a_unique\"}}}}");
 }
 
 //

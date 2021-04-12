@@ -39,33 +39,17 @@ class PlanYieldPolicyImpl final : public PlanYieldPolicy {
 public:
     PlanYieldPolicyImpl(PlanExecutorImpl* exec,
                         PlanYieldPolicy::YieldPolicy policy,
-                        const Yieldable* yieldable);
+                        const Yieldable* yieldable,
+                        std::unique_ptr<YieldPolicyCallbacks> callbacks);
 
 private:
-    void setYieldable(const Yieldable* yieldable) override {
-        _yieldable = yieldable;
-    }
-    Status yield(OperationContext* opCtx, std::function<void()> whileYieldingFn = nullptr) override;
+    void saveState(OperationContext* opCtx) override;
 
-    void preCheckInterruptOnly(OperationContext* opCtx) override;
-
-    /**
-     * If not in a nested context, unlocks all locks, suggests to the operating system to switch to
-     * another thread, and then reacquires all locks.
-     *
-     * If in a nested context (eg DBDirectClient), does nothing.
-     *
-     * The whileYieldingFn will be executed after unlocking the locks and before re-acquiring them.
-     */
-    void _yieldAllLocks(OperationContext* opCtx,
-                        const Yieldable* yieldable,
-                        std::function<void()> whileYieldingFn,
-                        const NamespaceString& planExecNS);
+    void restoreState(OperationContext* opCtx, const Yieldable* yieldable) override;
 
     // The plan executor which this yield policy is responsible for yielding. Must not outlive the
     // plan executor.
     PlanExecutorImpl* const _planYielding;
-    const Yieldable* _yieldable;
 };
 
 }  // namespace mongo

@@ -65,6 +65,21 @@ enum class TimeUnit {
 };
 
 /**
+ * Day of a week.
+ */
+enum class DayOfWeek : uint8_t {
+    monday = 1,
+    tuesday,
+    wednesday,
+    thursday,
+    friday,
+    saturday,
+    sunday
+};
+
+static constexpr DayOfWeek kStartOfWeekDefault{DayOfWeek::sunday};
+
+/**
  * A TimeZone object represents one way of formatting/reading dates to compute things like the day
  * of the week or the hour of a given date. Different TimeZone objects may report different answers
  * for the hour, minute, or second of a date, even when given the same date.
@@ -496,14 +511,33 @@ private:
  * TimeUnit. Throws an exception with error code ErrorCodes::FailedToParse when passed an invalid
  * name.
  */
-TimeUnit parseTimeUnit(const std::string_view unitName);
+TimeUnit parseTimeUnit(StringData unitName);
 
 /**
  * Returns true if 'unitName' is a valid time unit, meaning that it can be parsed by the
  * 'parseTimeUnit()' function into one of the units represented by the 'TimeUnit' enum. Otherwise
  * returns 'false'.
  */
-bool isValidTimeUnit(const std::string_view unitName);
+bool isValidTimeUnit(StringData unitName);
+
+/**
+ * Inverse of parseTimeUnit.
+ */
+StringData serializeTimeUnit(TimeUnit unit);
+
+/**
+ * Parses a string 'dayOfWeek' to a DayOfWeek value. Supported day of week representations are
+ * case-insensitive full words or three letter abbreviations - for example, sunday, Sun. Throws an
+ * exception with error code ErrorCodes::FailedToParse when passed an invalid value.
+ */
+DayOfWeek parseDayOfWeek(StringData dayOfWeek);
+
+/**
+ * Returns true if 'dayOfWeek' is a valid representation of a day of a week, meaning that it can be
+ * parsed by the 'parseDayOfWeek()' function into one of the days represented by the 'DayOfWeek'
+ * enum. Otherwise returns 'false'.
+ */
+bool isValidDayOfWeek(StringData dayOfWeek);
 
 /**
  * A custom-deleter which destructs a timelib_rel_time* when it goes out of scope.
@@ -545,8 +579,14 @@ std::unique_ptr<_timelib_rel_time, TimelibRelTimeDeleter> getTimelibRelTime(Time
  * unit - length of time intervals.
  * timezone - determines the timezone used for counting the boundaries as well as Daylight Saving
  * Time rules.
+ * startOfWeek - the first day of a week used, to determine week boundaries when 'unit' is
+ * TimeUnit::week. Otherwise, this parameter is ignored.
  */
-long long dateDiff(Date_t startDate, Date_t endDate, TimeUnit unit, const TimeZone& timezone);
+long long dateDiff(Date_t startDate,
+                   Date_t endDate,
+                   TimeUnit unit,
+                   const TimeZone& timezone,
+                   DayOfWeek startOfWeek = kStartOfWeekDefault);
 
 /**
  * Add time interval to a date. The interval duration is given in 'amount' number of 'units'.
@@ -559,4 +599,36 @@ long long dateDiff(Date_t startDate, Date_t endDate, TimeUnit unit, const TimeZo
  * timezone - the timezone in which the start date is interpreted
  */
 Date_t dateAdd(Date_t date, TimeUnit unit, long long amount, const TimeZone& timezone);
+
+/**
+ * Convert (approximately) a TimeUnit to a number of milliseconds.
+ *
+ * The answer is approximate because TimeUnit represents an amount of calendar time:
+ * for example, some calendar days are 23 or 25 hours long due to daylight savings time.
+ * This function assumes everything is "typical": days are 24 hours, minutes are 60 seconds.
+ *
+ * Large time units, 'month' or longer, are so variable that we don't try to pick a value: we
+ * return a non-OK Status.
+ */
+StatusWith<long long> timeUnitTypicalMilliseconds(TimeUnit unit);
+
+/**
+ * Returns the lower bound of a bin the 'date' falls into in the time axis, or, in other words,
+ * truncates the 'date' value. Bins are (1) uniformly spaced (in time unit sense); (2) do not
+ * overlap; (3) bin size is 'binSize' 'unit''s; (4) defined in a timezone specified by 'timezone';
+ * (5) one bin has a lower bound at 2000-01-01T00:00:00.000 (also called a reference point) in the
+ * specified timezone, except for "week" time unit when the given 'startOfWeek' does not coincide
+ * with the first of January, 2000. For weeks [exception to (5)] the bin is aligned to the earliest
+ * first day of the week after the first of January, 2000.
+ *
+ * binSize - must be larger than 0.
+ * timezone - determines boundaries of the bins as well as Daylight Saving Time rules.
+ * startOfWeek - the first day of a week used to determine week boundaries when 'unit' is
+ * TimeUnit::week. Otherwise, this parameter is ignored.
+ */
+Date_t truncateDate(Date_t date,
+                    TimeUnit unit,
+                    unsigned long long binSize,
+                    const TimeZone& timezone,
+                    DayOfWeek startOfWeek = kStartOfWeekDefault);
 }  // namespace mongo

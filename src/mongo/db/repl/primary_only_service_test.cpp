@@ -30,13 +30,10 @@
 #include <memory>
 
 #include "mongo/db/client.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/op_observer_impl.h"
-#include "mongo/db/op_observer_registry.h"
-#include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/primary_only_service.h"
-#include "mongo/db/repl/primary_only_service_op_observer.h"
-#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/repl/primary_only_service_test_fixture.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/executor/network_interface.h"
@@ -88,8 +85,7 @@ public:
         return ThreadPool::Limits();
     }
 
-    std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(
-        BSONObj initialState) const override {
+    std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(BSONObj initialState) override {
         return std::make_shared<TestService::Instance>(this, std::move(initialState));
     }
 
@@ -104,7 +100,7 @@ public:
               _service(service) {}
 
         SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
-                             const CancelationToken& token) noexcept override {
+                             const CancellationToken& token) noexcept override {
             if (MONGO_unlikely(TestServiceHangDuringInitialization.shouldFail())) {
                 TestServiceHangDuringInitialization.pauseWhileSet();
             }
@@ -166,7 +162,7 @@ public:
         }
 
         void interrupt(Status status) override {
-            // Currently unused. Functionality has been put into cancelation logic.
+            // Currently unused. Functionality has been put into cancellation logic.
         }
 
         // Whether or not an op is reported depends on the "reportOp" field of the state doc the
@@ -236,9 +232,9 @@ public:
                 auto opCtx = cc().makeOperationContext();
 
                 // Hang after creating OpCtx but before doing the document write so that we can test
-                // that the OpCtx gets interrupted at stepdown.
+                // that the OpCtx gets interrupted at stepdown or shutdown.
                 if (MONGO_unlikely(TestServiceHangAfterMakingOpCtx.shouldFail())) {
-                    TestServiceHangAfterMakingOpCtx.pauseWhileSet();
+                    TestServiceHangAfterMakingOpCtx.pauseWhileSet(opCtx.get());
                 }
 
                 DBDirectClient client(opCtx.get());
@@ -266,7 +262,7 @@ public:
 
 private:
     ExecutorFuture<void> _rebuildService(std::shared_ptr<executor::ScopedTaskExecutor> executor,
-                                         const CancelationToken& token) override {
+                                         const CancellationToken& token) override {
         auto nss = getStateDocumentsNS();
 
         AllowOpCtxWhenServiceRebuildingBlock allowOpCtxBlock(Client::getCurrent());
@@ -294,36 +290,14 @@ std::ostream& operator<<(std::ostream& os, const TestService::State& state) {
     return os;
 }
 
-class PrimaryOnlyServiceTest : public ServiceContextMongoDTest {
+class PrimaryOnlyServiceTest : public PrimaryOnlyServiceMongoDTest {
 public:
+    std::unique_ptr<repl::PrimaryOnlyService> makeService(ServiceContext* serviceContext) override {
+        return std::make_unique<TestService>(serviceContext);
+    }
+
     void setUp() override {
-        ServiceContextMongoDTest::setUp();
-        auto serviceContext = getServiceContext();
-
-        WaitForMajorityService::get(getServiceContext()).setUp(getServiceContext());
-
-        {
-            auto opCtx = cc().makeOperationContext();
-            auto replCoord = std::make_unique<ReplicationCoordinatorMock>(serviceContext);
-            ReplicationCoordinator::set(serviceContext, std::move(replCoord));
-
-            repl::createOplog(opCtx.get());
-            // Set up OpObserver so that repl::logOp() will store the oplog entry's optime in
-            // ReplClientInfo.
-            OpObserverRegistry* opObserverRegistry =
-                dynamic_cast<OpObserverRegistry*>(serviceContext->getOpObserver());
-            opObserverRegistry->addObserver(std::make_unique<OpObserverImpl>());
-            opObserverRegistry->addObserver(
-                std::make_unique<PrimaryOnlyServiceOpObserver>(serviceContext));
-
-
-            _registry = PrimaryOnlyServiceRegistry::get(getServiceContext());
-            std::unique_ptr<TestService> service =
-                std::make_unique<TestService>(getServiceContext());
-            _registry->registerService(std::move(service));
-            _registry->onStartup(opCtx.get());
-        }
-        stepUp();
+        PrimaryOnlyServiceMongoDTest::setUp();
 
         _service = _registry->lookupServiceByName("TestService");
         ASSERT(_service);
@@ -350,23 +324,9 @@ public:
         ServiceContextMongoDTest::tearDown();
     }
 
-    void stepDown() {
-        _registry->onStepDown();
-    }
-
     void stepUp() {
         auto opCtx = cc().makeOperationContext();
-        auto replCoord = ReplicationCoordinator::get(getServiceContext());
-
-        // Advance term
-        _term++;
-
-        ASSERT_OK(replCoord->setFollowerMode(MemberState::RS_PRIMARY));
-        ASSERT_OK(replCoord->updateTerm(opCtx.get(), _term));
-        replCoord->setMyLastAppliedOpTimeAndWallTime(
-            OpTimeAndWallTime(OpTime(Timestamp(1, 1), _term), Date_t()));
-
-        _registry->onStepUpComplete(opCtx.get(), _term);
+        PrimaryOnlyServiceMongoDTest::stepUp(opCtx.get());
     }
 
     std::shared_ptr<executor::TaskExecutor> makeTestExecutor() {
@@ -387,9 +347,6 @@ public:
     }
 
 protected:
-    PrimaryOnlyServiceRegistry* _registry;
-    PrimaryOnlyService* _service;
-    long long _term = 0;
     std::shared_ptr<executor::TaskExecutor> _testExecutor;
 };
 
@@ -405,7 +362,7 @@ DEATH_TEST_F(PrimaryOnlyServiceTest,
     registry.registerService(std::move(service2));
 }
 
-TEST_F(PrimaryOnlyServiceTest, CancelationOnStepdown) {
+TEST_F(PrimaryOnlyServiceTest, CancellationOnStepdown) {
     // Used to ensure that _scheduleRun is run before we run the stepdown logic so that we fulfill
     // the _completionPromise.
     auto timesEntered = TestServiceHangDuringInitialization.setMode(FailPoint::alwaysOn);
@@ -422,7 +379,7 @@ TEST_F(PrimaryOnlyServiceTest, CancelationOnStepdown) {
     ASSERT_EQ(instance->getCompletionFuture().getNoThrow().code(), ErrorCodes::Interrupted);
 }
 
-TEST_F(PrimaryOnlyServiceTest, ResetCancelationSourceOnStepupAndCompleteSuccessfully) {
+TEST_F(PrimaryOnlyServiceTest, ResetCancellationSourceOnStepupAndCompleteSuccessfully) {
     {
         // Used to ensure that _scheduleRun is run before we run the stepdown logic so that we
         // fulfill the _completionPromise.
@@ -452,7 +409,7 @@ TEST_F(PrimaryOnlyServiceTest, ResetCancelationSourceOnStepupAndCompleteSuccessf
     }
 }
 
-TEST_F(PrimaryOnlyServiceTest, ResetCancelationSourceOnStepupAndStepDownAgain) {
+TEST_F(PrimaryOnlyServiceTest, ResetCancellationSourceOnStepupAndStepDownAgain) {
     {
         // Used to ensure that _scheduleRun is run before we run the stepdown logic so that we
         // fulfill the _completionPromise.
@@ -959,15 +916,27 @@ TEST_F(PrimaryOnlyServiceTest, OpCtxInterruptedByStepdown) {
     auto opCtx = makeOperationContext();
     auto instance =
         TestService::Instance::getOrCreate(opCtx.get(), _service, BSON("_id" << 0 << "state" << 0));
-    TestServiceHangAfterMakingOpCtx.waitForTimesEntered(++timesEntered);
+    TestServiceHangAfterMakingOpCtx.waitForTimesEntered(timesEntered + 1);
     stepDown();
-    ASSERT(!instance->getDocumentWriteException().isReady());
-    TestServiceHangAfterMakingOpCtx.setMode(FailPoint::off);
 
     ASSERT_EQ(ErrorCodes::Interrupted, instance->getCompletionFuture().getNoThrow());
-    // TODO(SERVER-51118): The error returned here should be InterruptedDueToReplStateChange, but
-    // due to SERVER-51118 it gets converted to NotWritablePrimary.
-    ASSERT_EQ(ErrorCodes::NotWritablePrimary, instance->getDocumentWriteException().getNoThrow());
+    ASSERT_EQ(ErrorCodes::InterruptedDueToReplStateChange,
+              instance->getDocumentWriteException().getNoThrow());
+}
+
+TEST_F(PrimaryOnlyServiceTest, OpCtxInterruptedByShutdown) {
+    // Ensure that OpCtxs for PrimaryOnlyService work get interrupted by shutdown.
+    auto timesEntered = TestServiceHangAfterMakingOpCtx.setMode(FailPoint::alwaysOn);
+
+    auto opCtx = makeOperationContext();
+    auto instance =
+        TestService::Instance::getOrCreate(opCtx.get(), _service, BSON("_id" << 0 << "state" << 0));
+    TestServiceHangAfterMakingOpCtx.waitForTimesEntered(timesEntered + 1);
+    shutdown();
+
+    ASSERT_EQ(ErrorCodes::Interrupted, instance->getCompletionFuture().getNoThrow());
+    ASSERT_EQ(ErrorCodes::InterruptedAtShutdown,
+              instance->getDocumentWriteException().getNoThrow());
 }
 
 TEST_F(PrimaryOnlyServiceTest, ReportCurOpInfo) {

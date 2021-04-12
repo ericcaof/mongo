@@ -83,6 +83,8 @@ DEFAULTS = {
     "replay_file": None,
     "report_failure_status": "fail",
     "report_file": None,
+    "run_all_feature_flag_tests": False,
+    "additional_feature_flags": None,
     "seed": int(time.time() * 256),  # Taken from random.py code in Python 2.7.
     "service_executor": None,
     "shell_conn_string": None,
@@ -92,7 +94,7 @@ DEFAULTS = {
     "shuffle": None,
     "spawn_using": None,
     "stagger_jobs": None,
-    "majority_read_concern": None,  # Default is set on the commandline.
+    "majority_read_concern": "on",
     "storage_engine": None,
     "storage_engine_cache_size_gb": None,
     "suite_files": "with_server",
@@ -104,11 +106,13 @@ DEFAULTS = {
     "linear_chain": None,
     "num_replset_nodes": None,
     "num_shards": None,
+    "export_mongod_config": "off",
 
     # Internal testing options.
     "internal_params": [],
 
     # Evergreen options.
+    "evergreen_url": "evergreen.mongodb.com",
     "build_id": None,
     "distro_id": None,
     "execution_number": 0,
@@ -118,6 +122,7 @@ DEFAULTS = {
     "revision_order_id": None,
     "task_id": None,
     "task_name": None,
+    "task_doc": None,
     "variant_name": None,
     "version_id": None,
 
@@ -271,6 +276,9 @@ DBTEST_EXECUTABLE = None
 # actually running them).
 DRY_RUN = None
 
+# URL to connect to the Evergreen service.
+EVERGREEN_URL = None
+
 # An identifier consisting of the project name, build variant name, commit hash, and the timestamp.
 # For patch builds, it also includes the patch version id.
 EVERGREEN_BUILD_ID = None
@@ -299,6 +307,9 @@ EVERGREEN_TASK_ID = None
 
 # The name of the Evergreen task that resmoke.py is being run for.
 EVERGREEN_TASK_NAME = None
+
+# The documentation that describes what Evergreen task does.
+EVERGREEN_TASK_DOC = None
 
 # The name of the Evergreen build variant that resmoke.py is being run on.
 EVERGREEN_VARIANT_NAME = None
@@ -338,6 +349,9 @@ LOGGER_FILE = None
 
 # Where to find the MONGO*_EXECUTABLE binaries
 INSTALL_DIR = None
+
+# Whether to run tests for feature flags.
+RUN_ALL_FEATURE_FLAG_TESTS = None
 
 # The path to the mongo executable used by resmoke.py.
 MONGO_EXECUTABLE = None
@@ -437,6 +451,9 @@ NUM_REPLSETS = None
 # Specifies the number of shards in a ShardedClusterFixture.
 NUM_SHARDS = None
 
+# Specifies whether to export the history of mongod config options.
+EXPORT_MONGOD_CONFIG = None
+
 # If true, run ReplicaSetFixture with linear chaining.
 LINEAR_CHAIN = None
 
@@ -498,6 +515,10 @@ ARCHIVE_FILE = "archive.json"
 # S3 Bucket to upload archive files.
 ARCHIVE_BUCKET = "mongodatafiles"
 
+# Force archive all files where appropriate. Eventually we want this to be the default option.
+# For now, only the mainline required builders have this option enabled.
+FORCE_ARCHIVE_ALL_DATA_FILES = False
+
 # Benchmark options set internally by resmoke.py
 BENCHMARK_OUT_FORMAT = "json"
 
@@ -523,3 +544,4 @@ LOGGER_DIR = None
 
 # Generated logging config for the current invocation.
 LOGGING_CONFIG: dict = {}
+SHORTEN_LOGGER_NAME_CONFIG: dict = {}

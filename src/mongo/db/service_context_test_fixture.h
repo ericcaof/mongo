@@ -64,7 +64,7 @@ public:
 
 protected:
     ServiceContextTest();
-    virtual ~ServiceContextTest() = default;
+    virtual ~ServiceContextTest();
 
 private:
     ThreadClient _threadClient;

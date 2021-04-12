@@ -37,8 +37,7 @@
 #include "mongo/db/pipeline/change_stream_constants.h"
 #include "mongo/db/pipeline/resume_token.h"
 #include "mongo/db/query/cursor_response.h"
-#include "mongo/db/query/getmore_request.h"
-#include "mongo/db/query/query_request.h"
+#include "mongo/db/query/getmore_command_gen.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
@@ -1094,10 +1093,12 @@ TEST_F(AsyncResultsMergerTest, GetMoreBatchSizes) {
     readyEvent = unittest::assertGet(arm->nextEvent());
 
     BSONObj scheduledCmd = getNthPendingRequest(0).cmdObj;
-    auto request = GetMoreRequest::parseFromBSON("anydbname", scheduledCmd);
-    ASSERT_OK(request.getStatus());
-    ASSERT_EQ(*request.getValue().batchSize, 1LL);
-    ASSERT_EQ(request.getValue().cursorid, 1LL);
+    auto cmd = GetMoreCommandRequest::parse({"getMore"},
+                                            scheduledCmd.addField(BSON("$db"
+                                                                       << "anydbname")
+                                                                      .firstElement()));
+    ASSERT_EQ(*cmd.getBatchSize(), 1LL);
+    ASSERT_EQ(cmd.getCommandParameter(), 1LL);
     scheduleNetworkResponses(std::move(responses));
     executor()->waitForEvent(readyEvent);
 

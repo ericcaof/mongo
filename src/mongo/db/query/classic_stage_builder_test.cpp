@@ -68,9 +68,10 @@ public:
      * Builds a PlanStage using the given WorkingSet and QuerySolution.
      */
     std::unique_ptr<PlanStage> buildPlanStage(std::unique_ptr<QuerySolution> querySolution) {
-        auto qr = std::make_unique<QueryRequest>(kNss);
+        auto findCommand = std::make_unique<FindCommandRequest>(kNss);
         auto expCtx = make_intrusive<ExpressionContext>(opCtx(), nullptr, kNss);
-        auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(qr), expCtx);
+        auto statusWithCQ =
+            CanonicalQuery::canonicalize(opCtx(), std::move(findCommand), false, expCtx);
         ASSERT_OK(statusWithCQ.getStatus());
 
         stage_builder::ClassicStageBuilder builder{
@@ -122,7 +123,8 @@ TEST_F(ClassicStageBuilderTest, VirtualScanTranslation) {
 
     // Construct a QuerySolution consisting of a single VirtualScanNode to test if a stream of
     // documents can be produced.
-    auto virtScan = std::make_unique<VirtualScanNode>(docs, true);
+    auto virtScan =
+        std::make_unique<VirtualScanNode>(docs, VirtualScanNode::ScanType::kCollScan, false);
 
     // Make a QuerySolution from the root virtual scan node.
     auto querySolution = makeQuerySolution(std::move(virtScan));

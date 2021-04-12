@@ -44,20 +44,11 @@
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/reshard_collection_gen.h"
+#include "mongo/s/resharding/resharding_feature_flag_gen.h"
 #include "mongo/s/sharded_collections_ddl_parameters_gen.h"
 
 namespace mongo {
 namespace {
-
-std::vector<TagsType> convertZones(const std::vector<BSONObj>& objs) {
-    std::vector<TagsType> zones;
-
-    for (const BSONObj& obj : objs) {
-        zones.push_back(uassertStatusOK(TagsType::fromBSON(obj)));
-    }
-
-    return zones;
-}
 
 class ConfigsvrReshardCollectionCommand final
     : public TypedCommand<ConfigsvrReshardCollectionCommand> {
@@ -69,6 +60,10 @@ public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
+            uassert(ErrorCodes::CommandNotSupported,
+                    "reshardCollection command not enabled",
+                    resharding::gFeatureFlagResharding.isEnabled(
+                        serverGlobalParams.featureCompatibility));
 
             uassert(ErrorCodes::IllegalOperation,
                     "_configsvrReshardCollection can only be run on config servers",
@@ -98,7 +93,6 @@ public:
                         !collator);
             }
 
-            std::vector<TagsType> newZones;
             const auto& authoritativeTags = uassertStatusOK(
                 Grid::get(opCtx)->catalogClient()->getTagsForCollection(opCtx, nss));
             if (!authoritativeTags.empty()) {
@@ -106,119 +100,54 @@ public:
                         "Must specify value for zones field",
                         request().getZones());
                 validateZones(request().getZones().get(), authoritativeTags);
-                newZones = convertZones(request().getZones().get());
+            }
+
+            if (request().get_presetReshardedChunks()) {
+                uassert(ErrorCodes::BadValue,
+                        "Test commands must be enabled when a value is provided for field: "
+                        "_presetReshardedChunks",
+                        getTestCommandsEnabled());
+
+                uassert(ErrorCodes::BadValue,
+                        "Must specify only one of _presetReshardedChunks or numInitialChunks",
+                        !(bool(request().getNumInitialChunks())));
+
+                validateReshardedChunks(request().get_presetReshardedChunks().get(),
+                                        opCtx,
+                                        ShardKeyPattern(request().getKey()).getKeyPattern());
             }
 
             const auto cm = uassertStatusOK(
                 Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx,
                                                                                              nss));
 
-            bool presetReshardedChunksSpecified = bool(request().get_presetReshardedChunks());
-            uassert(ErrorCodes::BadValue,
-                    "Test commands must be enabled when a value is provided for field: "
-                    "_presetReshardedChunks",
-                    !presetReshardedChunksSpecified || getTestCommandsEnabled());
-
-            uassert(ErrorCodes::BadValue,
-                    "Must specify only one of _presetReshardedChunks or numInitialChunks",
-                    !(presetReshardedChunksSpecified && bool(request().getNumInitialChunks())));
-
-            std::set<ShardId> donorShardIds;
-            cm.getAllShardIds(&donorShardIds);
-
-            int numInitialChunks;
-            std::set<ShardId> recipientShardIds;
-            std::vector<ChunkType> initialChunks;
-
-            boost::optional<Timestamp> timestamp;
-            if (feature_flags::gShardingFullDDLSupport.isEnabled(
-                    serverGlobalParams.featureCompatibility)) {
-                const auto now = VectorClock::get(opCtx)->getTime();
-                timestamp = now.clusterTime().asTimestamp();
-            }
-
-            ChunkVersion version(1, 0, OID::gen(), timestamp);
             auto tempReshardingNss = constructTemporaryReshardingNss(
                 nss.db(), getCollectionUUIDFromChunkManger(nss, cm));
 
-            if (presetReshardedChunksSpecified) {
-                const auto chunks = request().get_presetReshardedChunks().get();
-                validateReshardedChunks(
-                    chunks, opCtx, ShardKeyPattern(request().getKey()).getKeyPattern());
-                numInitialChunks = chunks.size();
-
-                // Use the provided shardIds from presetReshardedChunks to construct the
-                // recipient list.
-                for (const BSONObj& obj : chunks) {
-                    recipientShardIds.emplace(
-                        obj.getStringField(ReshardedChunk::kRecipientShardIdFieldName));
-
-                    auto reshardedChunk =
-                        ReshardedChunk::parse(IDLParserErrorContext("ReshardedChunk"), obj);
-                    initialChunks.emplace_back(
-                        tempReshardingNss,
-                        ChunkRange{reshardedChunk.getMin(), reshardedChunk.getMax()},
-                        version,
-                        reshardedChunk.getRecipientShardId());
-                    version.incMinor();
-                }
-            } else {
-                numInitialChunks = request().getNumInitialChunks().get_value_or(cm.numChunks());
-
-                // No presetReshardedChunks were provided, make the recipients list be the same as
-                // the donors list by default.
-                recipientShardIds = donorShardIds;
-
-                cm.forEachChunk([&](const auto& chunk) {
-                    initialChunks.emplace_back(tempReshardingNss,
-                                               ChunkRange{chunk.getMin(), chunk.getMax()},
-                                               version,
-                                               chunk.getShardId());
-                    version.incMinor();
-                    return true;
-                });
-            }
-
-            // Construct the lists of donor and recipient shard entries, where each ShardEntry is
-            // in state kUnused.
-            std::vector<DonorShardEntry> donorShards;
-            std::transform(donorShardIds.begin(),
-                           donorShardIds.end(),
-                           std::back_inserter(donorShards),
-                           [](const ShardId& shardId) -> DonorShardEntry {
-                               DonorShardEntry entry{shardId};
-                               entry.setState(DonorStateEnum::kUnused);
-                               return entry;
-                           });
-            std::vector<RecipientShardEntry> recipientShards;
-            std::transform(recipientShardIds.begin(),
-                           recipientShardIds.end(),
-                           std::back_inserter(recipientShards),
-                           [](const ShardId& shardId) -> RecipientShardEntry {
-                               RecipientShardEntry entry{shardId};
-                               entry.setState(RecipientStateEnum::kUnused);
-                               return entry;
-                           });
-
             auto coordinatorDoc =
-                ReshardingCoordinatorDocument(std::move(tempReshardingNss),
-                                              std::move(CoordinatorStateEnum::kInitializing),
-                                              std::move(donorShards),
-                                              std::move(recipientShards));
+                ReshardingCoordinatorDocument(std::move(CoordinatorStateEnum::kUnused),
+                                              {},   // donorShards
+                                              {});  // recipientShards
 
             // Generate the resharding metadata for the ReshardingCoordinatorDocument.
             auto reshardingUUID = UUID::gen();
             auto existingUUID = getCollectionUUIDFromChunkManger(ns(), cm);
-            auto commonMetadata = CommonReshardingMetadata(
-                std::move(reshardingUUID), ns(), std::move(existingUUID), request().getKey());
+            auto commonMetadata = CommonReshardingMetadata(std::move(reshardingUUID),
+                                                           ns(),
+                                                           std::move(existingUUID),
+                                                           std::move(tempReshardingNss),
+                                                           request().getKey());
             coordinatorDoc.setCommonReshardingMetadata(std::move(commonMetadata));
+            coordinatorDoc.setZones(request().getZones());
+            coordinatorDoc.setPresetReshardedChunks(request().get_presetReshardedChunks());
+            coordinatorDoc.setNumInitialChunks(request().getNumInitialChunks());
 
             auto registry = repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext());
-            auto service = registry->lookupServiceByName(kReshardingCoordinatorServiceName);
+            auto service =
+                registry->lookupServiceByName(ReshardingCoordinatorService::kServiceName);
             auto instance = ReshardingCoordinatorService::ReshardingCoordinator::getOrCreate(
                 opCtx, service, coordinatorDoc.toBSON());
 
-            instance->setInitialChunksAndZones(std::move(initialChunks), std::move(newZones));
             instance->getCompletionFuture().get(opCtx);
         }
 

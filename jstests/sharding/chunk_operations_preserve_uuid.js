@@ -8,6 +8,8 @@
 (function() {
 'use strict';
 
+load("jstests/sharding/libs/find_chunks_util.js");
+
 let st = new ShardingTest({mongos: 1, shards: 3});
 
 const dbName = "test";
@@ -18,21 +20,22 @@ var collUUID;  // Initialized after shardCollection
 {
     // Skip test if feature flag disabled
     let csrs_config_db = st.configRS.getPrimary().getDB('config');
-    const isShardingFullDDLSupportEnabled =
-        csrs_config_db.adminCommand({getParameter: 1, shardingFullDDLSupport: 1})
-            .shardingFullDDLSupport.value;
+    const isFeatureFlagEnabled =
+        csrs_config_db
+            .adminCommand({getParameter: 1, featureFlagShardingFullDDLSupportTimestampedVersion: 1})
+            .featureFlagShardingFullDDLSupportTimestampedVersion.value;
 
-    if (!isShardingFullDDLSupportEnabled) {
+    if (!isFeatureFlagEnabled) {
         st.stop();
         return;
     }
 }
 
 function allChunksWithUUID() {
-    var cursor = st.config.chunks.find({"ns": ns});
+    var cursor = findChunksUtil.findChunksByNs(st.config, ns);
     do {
         var next = cursor.next().uuid;
-        assert.eq(collUUID, UUID(next));
+        assert.eq(collUUID, next);
     } while (cursor.hasNext());
 }
 

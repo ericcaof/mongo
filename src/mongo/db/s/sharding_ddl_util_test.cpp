@@ -35,7 +35,6 @@
 #include "mongo/db/logical_session_cache_noop.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/config/config_server_test_fixture.h"
-#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/sharding_ddl_util.h"
 #include "mongo/db/s/transaction_coordinator_service.h"
 #include "mongo/logv2/log.h"
@@ -51,8 +50,10 @@ namespace {
 
 class ShardingDDLUtilTest : public ConfigServerTestFixture {
 protected:
+    ShardType shard0;
+
     void setUp() override {
-        ConfigServerTestFixture::setUp();
+        setUpAndInitializeConfigDb();
 
         // Create config.transactions collection
         auto opCtx = operationContext();
@@ -64,6 +65,11 @@ protected:
         LogicalSessionCache::set(getServiceContext(), std::make_unique<LogicalSessionCacheNoop>());
         TransactionCoordinatorService::get(operationContext())
             ->onShardingInitialization(operationContext(), true);
+
+        // Initialize a shard
+        shard0.setName("shard0");
+        shard0.setHost("shard0:12");
+        setupShards({shard0});
     }
 
     void tearDown() override {
@@ -80,25 +86,23 @@ TEST_F(ShardingDDLUtilTest, ShardedRenameMetadata) {
     auto opCtx = operationContext();
     DBDirectClient client(opCtx);
 
-    ShardType shard0;
-    shard0.setName("shard0");
-    shard0.setHost("shard0:12");
-    setupShards({shard0});
-
     const NamespaceString fromNss("test.from");
     const auto fromCollQuery = Query(BSON(CollectionType::kNssFieldName << fromNss.ns()));
 
     const auto toCollQuery = Query(BSON(CollectionType::kNssFieldName << kToNss.ns()));
+
+    const Timestamp collTimestamp(1);
+    const auto collUUID = UUID::gen();
 
     // Initialize FROM collection chunks
     const auto fromEpoch = OID::gen();
     const int nChunks = 10;
     std::vector<ChunkType> chunks;
     for (int i = 0; i < nChunks; i++) {
-        ChunkVersion chunkVersion(1, i, fromEpoch, boost::none);
+        ChunkVersion chunkVersion(1, i, fromEpoch, collTimestamp);
         ChunkType chunk;
         chunk.setName(OID::gen());
-        chunk.setNS(fromNss);
+        chunk.setCollectionUUID(collUUID);
         chunk.setVersion(chunkVersion);
         chunk.setShard(shard0.getName());
         chunk.setHistory({ChunkHistory(Timestamp(1, i), shard0.getName())});
@@ -109,56 +113,44 @@ TEST_F(ShardingDDLUtilTest, ShardedRenameMetadata) {
 
     setupCollection(fromNss, KeyPattern(BSON("x" << 1)), chunks);
 
-    // TODO SERVER-53105 remove all nss chunk references from this test
-    const auto nssChunkFieldName = "ns";
-    const auto epochChunkFieldName = "lastmodEpoch";
-
     // Get FROM collection document and chunks
     auto fromDoc = client.findOne(CollectionType::ConfigNS.ns(), fromCollQuery);
     CollectionType fromCollection(fromDoc);
-    auto fromChunksQuery = Query(BSON(epochChunkFieldName << fromEpoch)).sort(BSON("_id" << 1));
+    auto fromChunksQuery =
+        Query(BSON(ChunkType::collectionUUID << collUUID)).sort(BSON("_id" << 1));
     std::vector<BSONObj> fromChunks;
     client.findN(fromChunks, ChunkType::ConfigNS.ns(), fromChunksQuery, nChunks);
 
-    // Perform the metadata rename and get TO epoch
-    auto toEpoch = sharding_ddl_util::shardedRenameMetadata(opCtx, fromNss, kToNss);
+    auto fromCollType = Grid::get(opCtx)->catalogClient()->getCollection(opCtx, fromNss);
+
+    // Perform the metadata rename
+    sharding_ddl_util::shardedRenameMetadata(opCtx, fromCollType, kToNss);
 
     // Check that the FROM config.collections entry has been deleted
     ASSERT(client.findOne(CollectionType::ConfigNS.ns(), fromCollQuery).isEmpty());
 
-    // Ensure no chunks are referring the FROM collection anymore
-    ASSERT(client.findOne(ChunkType::ConfigNS.ns(), fromChunksQuery).isEmpty());
-
     // Get TO collection document and chunks
-    const auto toChunksQuery = Query(BSON(epochChunkFieldName << toEpoch)).sort(BSON("_id" << 1));
     auto toDoc = client.findOne(CollectionType::ConfigNS.ns(), toCollQuery);
+    const auto toChunksQuery =
+        Query(BSON(ChunkType::collectionUUID << collUUID)).sort(BSON("_id" << 1));
     CollectionType toCollection(toDoc);
     std::vector<BSONObj> toChunks;
     client.findN(toChunks, ChunkType::ConfigNS.ns(), toChunksQuery, nChunks);
 
-    // Check that a new epoch is getting used in the FROM config.collections entry
-    ASSERT(fromCollection.getEpoch() != toCollection.getEpoch());
+    // Check that the original epoch is preserved in config.collections entry
+    ASSERT(fromCollection.getEpoch() == toCollection.getEpoch());
 
     // Check that no other CollectionType field has been changed
-    auto fromUnchangedFields = fromDoc.removeField(CollectionType::kNssFieldName)
-                                   .removeField(CollectionType::kEpochFieldName);
-    auto toUnchangedFields = toDoc.removeField(CollectionType::kNssFieldName)
-                                 .removeField(CollectionType::kEpochFieldName);
+    auto fromUnchangedFields = fromDoc.removeField(CollectionType::kNssFieldName);
+    auto toUnchangedFields = toDoc.removeField(CollectionType::kNssFieldName);
     ASSERT_EQ(fromUnchangedFields.woCompare(toUnchangedFields), 0);
 
-    // Check that epoch and nss have been updated in chunk documents
+    // Check that chunk documents remain unchanged
     for (int i = 0; i < nChunks; i++) {
         auto fromChunkDoc = fromChunks[i];
         auto toChunkDoc = toChunks[i];
 
-        ASSERT(fromChunkDoc[epochChunkFieldName].woCompare(toChunkDoc[epochChunkFieldName]) != 0);
-        ASSERT(fromChunkDoc[epochChunkFieldName].woCompare(toChunkDoc[epochChunkFieldName]) != 0);
-        ASSERT_EQ(
-            fromChunkDoc.removeField(epochChunkFieldName)
-                .removeField(nssChunkFieldName)
-                .woCompare(
-                    toChunkDoc.removeField(epochChunkFieldName).removeField(nssChunkFieldName)),
-            0);
+        ASSERT_EQ(fromChunkDoc.woCompare(toChunkDoc), 0);
     }
 }
 
@@ -168,17 +160,8 @@ TEST_F(ShardingDDLUtilTest, ShardedRenameMetadata) {
 TEST_F(ShardingDDLUtilTest, ShardedRenamePreconditionsAreMet) {
     auto opCtx = operationContext();
 
-    // Initialize the shard
-    ShardType shard0;
-    shard0.setName("shard0");
-    shard0.setHost("shard0:12");
-    setupShards({shard0});
-
-    setupDatabase("test", shard0.getName(), true /* sharded */);
-
     // No exception is thrown if the TO collection does not exist and has no associated tags
-    RenameCollectionOptions options;
-    sharding_ddl_util::checkShardedRenamePreconditions(opCtx, kToNss, options);
+    sharding_ddl_util::checkShardedRenamePreconditions(opCtx, kToNss, false /* dropTarget */);
 
     // Initialize a chunk
     ChunkVersion chunkVersion(1, 1, OID::gen(), boost::none);
@@ -194,19 +177,11 @@ TEST_F(ShardingDDLUtilTest, ShardedRenamePreconditionsAreMet) {
     // Initialize the sharded TO collection
     setupCollection(kToNss, KeyPattern(BSON("x" << 1)), {chunk});
 
-    // When dropTarget is set, no exception is thrown if the TO collection exists with no tags
-    options.dropTarget = true;
-    sharding_ddl_util::checkShardedRenamePreconditions(opCtx, kToNss, options);
+    sharding_ddl_util::checkShardedRenamePreconditions(opCtx, kToNss, true /* dropTarget */);
 }
 
 TEST_F(ShardingDDLUtilTest, ShardedRenamePreconditionsTargetCollectionExists) {
     auto opCtx = operationContext();
-
-    // Initialize the shard
-    ShardType shard0;
-    shard0.setName("shard0");
-    shard0.setHost("shard0:12");
-    setupShards({shard0});
 
     // Initialize a chunk
     ChunkVersion chunkVersion(1, 1, OID::gen(), boost::none);
@@ -220,15 +195,13 @@ TEST_F(ShardingDDLUtilTest, ShardedRenamePreconditionsTargetCollectionExists) {
     chunk.setMax(kMaxBSONKey);
 
     // Initialize the sharded collection
-    setupDatabase("test", shard0.getName(), true /* sharded */);
     setupCollection(kToNss, KeyPattern(BSON("x" << 1)), {chunk});
 
     // Check that an exception is thrown if the target collection exists and dropTarget is not set
-    RenameCollectionOptions options; /* dropTarget is false by default */
-    options.dropTarget = false;
-    ASSERT_THROWS_CODE(sharding_ddl_util::checkShardedRenamePreconditions(opCtx, kToNss, options),
-                       AssertionException,
-                       ErrorCodes::CommandFailed);
+    ASSERT_THROWS_CODE(
+        sharding_ddl_util::checkShardedRenamePreconditions(opCtx, kToNss, false /* dropTarget */),
+        AssertionException,
+        ErrorCodes::CommandFailed);
 }
 
 TEST_F(ShardingDDLUtilTest, ShardedRenamePreconditionTargetCollectionHasTags) {
@@ -243,10 +216,10 @@ TEST_F(ShardingDDLUtilTest, ShardedRenamePreconditionTargetCollectionHasTags) {
     ASSERT_OK(insertToConfigCollection(operationContext(), TagsType::ConfigNS, tagDoc.toBSON()));
 
     // Check that an exception is thrown if some tag is associated to the target collection
-    RenameCollectionOptions options;
-    ASSERT_THROWS_CODE(sharding_ddl_util::checkShardedRenamePreconditions(opCtx, kToNss, options),
-                       AssertionException,
-                       ErrorCodes::CommandFailed);
+    ASSERT_THROWS_CODE(
+        sharding_ddl_util::checkShardedRenamePreconditions(opCtx, kToNss, false /* dropTarget */),
+        AssertionException,
+        ErrorCodes::CommandFailed);
 }
 
 }  // namespace

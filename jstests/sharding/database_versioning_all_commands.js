@@ -236,6 +236,7 @@ let testCases = {
     _isSelf: {skip: "executes locally on mongos (not sent to any remote node)"},
     _killOperations: {skip: "executes locally on mongos (not sent to any remote node)"},
     _mergeAuthzCollections: {skip: "always targets the config server"},
+    abortReshardCollection: {skip: "always targets the config server"},
     abortTransaction: {skip: "unversioned and uses special targetting rules"},
     addShard: {skip: "not on a user database"},
     addShardToZone: {skip: "not on a user database"},
@@ -263,6 +264,7 @@ let testCases = {
     balancerStatus: {skip: "not on a user database"},
     balancerStop: {skip: "not on a user database"},
     buildInfo: {skip: "executes locally on mongos (not sent to any remote node)"},
+    cleanupReshardCollection: {skip: "always targets the config server"},
     clearJumboFlag: {skip: "does not forward command to primary shard"},
     clearLog: {skip: "executes locally on mongos (not sent to any remote node)"},
     collMod: {
@@ -592,7 +594,6 @@ let testCases = {
         }
     },
     replSetGetStatus: {skip: "not supported in mongos"},
-    resetError: {skip: "not on a user database"},
     reshardCollection: {skip: "does not forward command to primary shard"},
     revokePrivilegesFromRole: {skip: "always targets the config server"},
     revokeRolesFromRole: {skip: "always targets the config server"},
@@ -621,7 +622,6 @@ let testCases = {
         {skip: "explicitly fails for mongos, primary mongod only", conditional: true},
     setParameter: {skip: "executes locally on mongos (not sent to any remote node)"},
     shardCollection: {skip: "does not forward command to primary shard"},
-    shardConnPoolStats: {skip: "does not forward command to primary shard"},
     shutdown: {skip: "does not forward command to primary shard"},
     split: {skip: "does not forward command to primary shard"},
     splitVector: {skip: "does not forward command to primary shard"},
@@ -665,6 +665,16 @@ let testCases = {
             explicitlyCreateCollection: true,
             command: function(dbName, collName) {
                 return {validate: collName};
+            },
+        }
+    },
+    validateDBMetadata: {
+        run: {
+            // validateDBMetadata is always broadcast to all shards.
+            sendsDbVersion: false,
+            explicitlyCreateCollection: true,
+            command: function(dbName, collName) {
+                return {validateDBMetadata: 1, apiParameters: {version: "1"}};
             },
         }
     },

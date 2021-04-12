@@ -56,9 +56,14 @@ const NamespaceString kTestNss{"test.collection"};
 
 class CursorManagerTest : public unittest::Test {
 public:
-    CursorManagerTest() : _queryServiceContext(std::make_unique<QueryTestServiceContext>()) {
+    CursorManagerTest()
+        : _queryServiceContext(std::make_unique<QueryTestServiceContext>()),
+          _cursorManager(nullptr) {
         _queryServiceContext->getServiceContext()->setPreciseClockSource(
             std::make_unique<ClockSourceMock>());
+
+        _cursorManager.setPreciseClockSource(
+            _queryServiceContext->getServiceContext()->getPreciseClockSource());
     }
 
     void setUp() override {
@@ -86,6 +91,7 @@ public:
                                         std::move(queuedDataStage),
                                         &CollectionPtr::null,
                                         PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                        QueryPlannerParams::DEFAULT,
                                         kTestNss));
     }
 
@@ -138,7 +144,6 @@ class CursorManagerTestCustomOpCtx : public CursorManagerTest {
  */
 TEST_F(CursorManagerTest, ShouldBeAbleToKillPinnedCursor) {
     CursorManager* cursorManager = useCursorManager();
-    const bool shouldAudit = false;
     OperationContext* const pinningOpCtx = _opCtx.get();
 
     auto cursorPin = cursorManager->registerCursor(
@@ -153,7 +158,7 @@ TEST_F(CursorManagerTest, ShouldBeAbleToKillPinnedCursor) {
          PrivilegeVector()});
 
     auto cursorId = cursorPin.getCursor()->cursorid();
-    ASSERT_OK(cursorManager->killCursor(_opCtx.get(), cursorId, shouldAudit));
+    ASSERT_OK(cursorManager->killCursor(_opCtx.get(), cursorId));
 
     // The original operation should have been interrupted since the cursor was pinned.
     ASSERT_EQ(pinningOpCtx->checkForInterruptNoAssert(), ErrorCodes::CursorKilled);
@@ -164,7 +169,6 @@ TEST_F(CursorManagerTest, ShouldBeAbleToKillPinnedCursor) {
  */
 TEST_F(CursorManagerTest, ShouldBeAbleToKillPinnedCursorMultiClient) {
     CursorManager* cursorManager = useCursorManager();
-    const bool shouldAudit = false;
     OperationContext* const pinningOpCtx = _opCtx.get();
 
     // Pin the cursor from one client.
@@ -193,7 +197,7 @@ TEST_F(CursorManagerTest, ShouldBeAbleToKillPinnedCursorMultiClient) {
 
     auto killCursorOpCtx = killCursorClient->makeOperationContext();
     invariant(killCursorOpCtx);
-    ASSERT_OK(cursorManager->killCursor(killCursorOpCtx.get(), cursorId, shouldAudit));
+    ASSERT_OK(cursorManager->killCursor(killCursorOpCtx.get(), cursorId));
 
     // The original operation should have been interrupted since the cursor was pinned.
     ASSERT_EQ(pinningOpCtx->checkForInterruptNoAssert(), ErrorCodes::CursorKilled);
@@ -505,7 +509,7 @@ TEST_F(CursorManagerTestCustomOpCtx, OneCursorWithASession) {
 
     // Remove the cursor from the manager.
     pinned.release();
-    ASSERT_OK(useCursorManager()->killCursor(opCtx.get(), cursorId, false));
+    ASSERT_OK(useCursorManager()->killCursor(opCtx.get(), cursorId));
 
     // There should be no more cursor entries by session id.
     LogicalSessionIdSet sessions;
@@ -541,7 +545,7 @@ TEST_F(CursorManagerTestCustomOpCtx, MultipleCursorsWithSameSession) {
 
     // Remove one cursor from the manager.
     pinned.release();
-    ASSERT_OK(useCursorManager()->killCursor(opCtx.get(), cursorId1, false));
+    ASSERT_OK(useCursorManager()->killCursor(opCtx.get(), cursorId1));
 
     // Should still be able to retrieve the session.
     lsids.clear();
@@ -643,7 +647,7 @@ TEST_F(CursorManagerTestCustomOpCtx, OneCursorWithAnOperationKey) {
 
     // Remove the cursor from the manager and verify that we can't retrieve it.
     pinned.release();
-    ASSERT_OK(useCursorManager()->killCursor(opCtx.get(), cursorId, false));
+    ASSERT_OK(useCursorManager()->killCursor(opCtx.get(), cursorId));
     ASSERT(useCursorManager()->getCursorsForOpKeys({opKey}).empty());
 }
 

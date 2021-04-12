@@ -5,7 +5,9 @@
  * optimization. Instead we log the time difference between how long the primary and secondary took
  * to complete the index builds. The expectation is that these values are close to each other.
  *
- * @tags: [requires_replication]
+ * @tags: [
+ *   requires_replication,
+ * ]
  *
  */
 (function() {

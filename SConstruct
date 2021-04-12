@@ -1,4 +1,5 @@
 # -*- mode: python; -*-
+
 import atexit
 import copy
 import datetime
@@ -271,6 +272,38 @@ add_option('opt',
     type='choice',
 )
 
+experimental_optimizations = [
+    'O3',
+    'builtin-memcmp',
+    'fnsi',
+    'nofp',
+    'nordyn',
+    'sandybridge',
+    'tbaa',
+    'treevec',
+    'vishidden',
+]
+experimental_optimization_choices = ['*']
+experimental_optimization_choices.extend("+" + opt for opt in experimental_optimizations)
+experimental_optimization_choices.extend("-" + opt for opt in experimental_optimizations)
+
+add_option('experimental-optimization',
+    action="append",
+    choices=experimental_optimization_choices,
+    const=experimental_optimization_choices[0],
+    default=['+sandybridge'],
+    help='Enable experimental optimizations',
+    nargs='?',
+    type='choice'
+)
+
+add_option('debug-compress',
+    action="append",
+    choices=["off", "as", "ld"],
+    default=["auto"],
+    help="Compress debug sections",
+)
+
 add_option('sanitize',
     help='enable selected sanitizers',
     metavar='san1,san2,...sanN',
@@ -385,9 +418,14 @@ add_option('build-fast-and-loose',
     type='choice',
 )
 
-add_option('disable-warnings-as-errors',
-    help="Don't add -Werror to compiler command line",
-    nargs=0,
+add_option("disable-warnings-as-errors",
+    action="append",
+    choices=["configure", "source"],
+    const="source",
+    default=[],
+    help="Don't add a warnings-as-errors flag to compiler command lines in selected contexts; defaults to 'source' if no argument is provided",
+    nargs="?",
+    type="choice",
 )
 
 add_option('detect-odr-violations',
@@ -429,6 +467,12 @@ add_option('cache',
 add_option('cache-dir',
     default='$BUILD_ROOT/scons/cache',
     help='Specify the directory to use for caching objects if --cache is in use',
+)
+
+add_option('cache-signature-mode',
+    choices=['none', 'validate'],
+    default="none",
+    help='Extra check to validate integrity of cache files after pulling from cache',
 )
 
 add_option("cxx-std",
@@ -493,6 +537,25 @@ add_option('runtime-hardening',
     default="on",
     help="Enable runtime hardening features (e.g. stack smash protection)",
     type='choice',
+)
+
+experimental_runtime_hardenings = [
+    'cfex',
+    'controlflow',
+    'stackclash',
+]
+experimental_runtime_hardening_choices = ['*']
+experimental_runtime_hardening_choices.extend("+" + opt for opt in experimental_runtime_hardenings)
+experimental_runtime_hardening_choices.extend("-" + opt for opt in experimental_runtime_hardenings)
+
+add_option('experimental-runtime-hardening',
+    action="append",
+    choices=experimental_runtime_hardening_choices,
+    const=experimental_runtime_hardening_choices[0],
+    default=[],
+    help='Enable experimental runtime hardenings',
+    nargs='?',
+    type='choice'
 )
 
 add_option('use-hardware-crc32',
@@ -757,9 +820,16 @@ env_vars.Add('CXXFLAGS',
     help='Sets flags for the C++ compiler',
     converter=variable_shlex_converter)
 
+default_destdir = '$BUILD_ROOT/install'
+if get_option('ninja') != 'disabled' and get_option('build-tools') == 'next':
+    # Workaround for SERVER-53952 where issues wih different
+    # ninja files building to the same install dir. Different
+    # ninja files need to build to different install dirs.
+    default_destdir = '$BUILD_DIR/install'
+
 env_vars.Add('DESTDIR',
     help='Where builds will install files',
-    default='$BUILD_ROOT/install')
+    default=default_destdir)
 
 env_vars.Add('DSYMUTIL',
     help='Path to the dsymutil utility',
@@ -1136,12 +1206,45 @@ if get_option('build-tools') == 'next':
     SCons.Tool.DefaultToolpath.insert(0, os.path.abspath('site_scons/site_tools/next'))
 
 env = Environment(variables=env_vars, **envDict)
+del envDict
+
+if get_option('cache-signature-mode') == 'validate':
+    validate_cache_dir = Tool('validate_cache_dir')
+    if validate_cache_dir.exists(env):
+        validate_cache_dir(env)
+    else:
+        env.FatalError("Failed to enable validate_cache_dir tool.")
 
 # Only print the spinner if stdout is a tty
 if sys.stdout.isatty():
     Progress(['-\r', '\\\r', '|\r', '/\r'], interval=50)
 
-del envDict
+# We are going to start running conf tests soon, so setup
+# --disable-warnings-as-errors as soon as possible.
+def create_werror_generator(flagname):
+    werror_conftests = 'configure' not in get_option('disable-warnings-as-errors')
+    werror_source = 'source' not in get_option('disable-warnings-as-errors')
+
+    def generator(target, source, env, for_signature):
+        if werror_conftests and "conftest" in str(target[0]):
+            return flagname
+
+        if werror_source:
+            return flagname
+
+        return str()
+
+    return generator
+
+env.Append(
+    CCFLAGS=['$CCFLAGS_GENERATE_WERROR'],
+    CCFLAGS_GENERATE_WERROR=create_werror_generator('$CCFLAGS_WERROR'),
+    CXXFLAGS=['$CXXFLAGS_GENERATE_WERROR'],
+    CXXFLAGS_GENERATE_WERROR=create_werror_generator('$CXXFLAGS_WERROR'),
+    LINKFLAGS=['$LINKFLAGS_GENERATE_WERROR'],
+    LINKFLAGS_GENERATE_WERROR=create_werror_generator('$LINKFLAGS_WERROR'),
+)
+
 
 for var in ['CC', 'CXX']:
     if var not in env:
@@ -1380,6 +1483,8 @@ detectSystem = Configure(detectEnv, help=False, custom_tests = {
 toolchain_search_sequence = [ "GCC", "clang" ]
 if mongo_platform.is_running_os('windows'):
     toolchain_search_sequence = [ 'MSVC', 'clang', 'GCC' ]
+
+detected_toolchain = None
 for candidate_toolchain in toolchain_search_sequence:
     if detectSystem.CheckForToolchain(candidate_toolchain, "C++", "CXX", ".cpp"):
         detected_toolchain = candidate_toolchain
@@ -1422,8 +1527,17 @@ elif not detectSystem.CheckForOS(env['TARGET_OS']):
 
 detectSystem.Finish()
 
-
-
+if env.TargetOSIs('posix'):
+    if env.ToolchainIs('gcc', 'clang'):
+        env.Append(
+            CCFLAGS_WERROR=["-Werror"],
+            CXXFLAGS_WERROR=['-Werror=unused-result'] if env.ToolchainIs('clang') else [],
+            LINKFLAGS_WERROR=['-Wl,-fatal_warnings' if env.TargetOSIs('darwin') else "-Wl,--fatal-warnings"],
+        )
+elif env.TargetOSIs('windows'):
+        env.Append(
+            CCFLAGS_WERROR=["/WX"]
+        )
 
 env['CC_VERSION'] = mongo_toolchain.get_toolchain_ver(env, 'CC')
 env['CXX_VERSION'] = mongo_toolchain.get_toolchain_ver(env, 'CXX')
@@ -1550,13 +1664,6 @@ if link_model.startswith("dynamic"):
             ],
             SHCCFLAGS=[
                 '$MONGO_VISIBILITY_SHCCFLAGS_GENERATOR',
-            ],
-            SHCXXFLAGS=[
-                # TODO: This has broader implications and seems not to
-                # work right now at least on macOS. We should
-                # investigate further in the future.
-                #
-                # '-fvisibility-inlines-hidden' if not env.TargetOSIs('windows') else [],
             ],
         )
 
@@ -1955,39 +2062,51 @@ elif env.TargetOSIs('windows'):
     env['LINK_WHOLE_ARCHIVE_LIB_END'] = ''
     env['LIBDEPS_FLAG_SEPARATORS'] = {env['LINK_WHOLE_ARCHIVE_LIB_START']:{'suffix':':'}}
 
-def init_no_global_add_flags(env, start_flag, end_flag):
+if env.TargetOSIs('darwin') and link_model.startswith('dynamic'):
+
+    def init_no_global_libdeps_tag_expansion(source, target, env, for_signature):
+        """
+        This callable will be expanded by scons and modify the environment by
+        adjusting the prefix and postfix flags to account for linking options
+        related to the use of global static initializers for any given libdep.
+        """
+
+        if "init-no-global-side-effects" in env.get(libdeps.Constants.LibdepsTags, []):
+            # macos as-needed flag is used on the library directly when it is built
+            return env.get('LINK_AS_NEEDED_LIB_START', '')
+
+    env['LIBDEPS_TAG_EXPANSIONS'].append(init_no_global_libdeps_tag_expansion)
+
+def init_no_global_add_flags(target, start_flag, end_flag):
     """ Helper function for init_no_global_libdeps_tag_expand"""
-    env['LIBDEPS_PREFIX_FLAGS']=[start_flag]
-    env['LIBDEPS_POSTFIX_FLAGS']=[end_flag]
+
+    setattr(target[0].attributes, "libdeps_prefix_flags", [start_flag])
+    setattr(target[0].attributes, "libdeps_postfix_flags", [end_flag])
     if env.TargetOSIs('linux', 'freebsd', 'openbsd'):
-        env.AppendUnique(
-            LIBDEPS_SWITCH_FLAGS=[{
+        setattr(target[0].attributes, "libdeps_switch_flags", [{
                 'on':start_flag,
                 'off':end_flag
         }])
 
-def init_no_global_libdeps_tag_expand(source, target, env, for_signature):
+def init_no_global_libdeps_tag_emitter(target, source, env):
     """
-    This callable will be expanded by scons and modify the environment by
-    adjusting the prefix and postfix flags to account for linking options
-    related to the use of global static initializers for any given libdep.
+    This emitter will be attached the correct pre and post fix flags to
+    a given library to cause it to have certain flags before or after on the link
+    line.
     """
 
-    if link_model.startswith("dynamic"):
+    if link_model.startswith('dynamic'):
         start_flag = env.get('LINK_AS_NEEDED_LIB_START', '')
         end_flag = env.get('LINK_AS_NEEDED_LIB_END', '')
 
         # In the dynamic case, any library that is known to not have global static
         # initializers can supply the flag and be wrapped in --as-needed linking,
         # allowing the linker to be smart about linking libraries it may not need.
-        if "init-no-global-side-effects" in env.get(libdeps.Constants.LibdepsTags, []):
-            if env.TargetOSIs('darwin'):
-                # macos as-needed flag is used on the library directly when it is built
-                env.AppendUnique(SHLINKFLAGS=[start_flag])
-            else:
-                init_no_global_add_flags(env, start_flag, end_flag)
+        if ("init-no-global-side-effects" in env.get(libdeps.Constants.LibdepsTags, [])
+            and not env.TargetOSIs('darwin')):
+            init_no_global_add_flags(target, start_flag, end_flag)
         else:
-            init_no_global_add_flags(env, "", "")
+            init_no_global_add_flags(target, "", "")
 
     else:
         start_flag = env.get('LINK_WHOLE_ARCHIVE_LIB_START', '')
@@ -1998,12 +2117,16 @@ def init_no_global_libdeps_tag_expand(source, target, env, for_signature):
         # allowing the linker to bring in all those symbols which may not be directly needed
         # at link time.
         if "init-no-global-side-effects" not in env.get(libdeps.Constants.LibdepsTags, []):
-            init_no_global_add_flags(env, start_flag, end_flag)
+            init_no_global_add_flags(target, start_flag, end_flag)
         else:
-            init_no_global_add_flags(env, "", "")
-    return []
+            init_no_global_add_flags(target, "", "")
+    return target, source
 
-env['LIBDEPS_TAG_EXPANSIONS'].append(init_no_global_libdeps_tag_expand)
+for target_builder in ['SharedLibrary', 'SharedArchive', 'StaticLibrary']:
+    builder = env['BUILDERS'][target_builder]
+    base_emitter = builder.emitter
+    new_emitter = SCons.Builder.ListEmitter([base_emitter, init_no_global_libdeps_tag_emitter])
+    builder.emitter = new_emitter
 
 link_guard_rules = {
     "test" : ["dist"]
@@ -2058,6 +2181,26 @@ if debugBuild:
     env.SetConfigHeaderDefine("MONGO_CONFIG_DEBUG_BUILD")
 else:
     env.AppendUnique( CPPDEFINES=[ 'NDEBUG' ] )
+
+
+# Normalize our experimental optimiation and hardening flags
+selected_experimental_optimizations = set()
+for suboption in get_option('experimental-optimization'):
+    if suboption == "*":
+        selected_experimental_optimizations.update(experimental_optimizations)
+    elif suboption.startswith('-'):
+        selected_experimental_optimizations.discard(suboption[1:])
+    elif suboption.startswith('+'):
+        selected_experimental_optimizations.add(suboption[1:])
+
+selected_experimental_runtime_hardenings = set()
+for suboption in get_option('experimental-runtime-hardening'):
+    if suboption == "*":
+        selected_experimental_runtime_hardenings.update(experimental_runtime_hardenings)
+    elif suboption.startswith('-'):
+        selected_experimental_runtime_hardenings.discard(suboption[1:])
+    elif suboption.startswith('+'):
+        selected_experimental_runtime_hardenings.add(suboption[1:])
 
 if env.TargetOSIs('linux'):
     env.Append( LIBS=["m"] )
@@ -2194,10 +2337,6 @@ elif env.TargetOSIs('windows'):
     #     declaring a function called lock that takes a mutex when one meant to create a guard
     #     object called lock on the stack.
     env.Append( CCFLAGS=["/we4013", "/we4099", "/we4930"] )
-
-    # Warnings as errors
-    if not has_option("disable-warnings-as-errors"):
-        env.Append( CCFLAGS=["/WX"] )
 
     env.Append( CPPDEFINES=["_CONSOLE","_CRT_SECURE_NO_WARNINGS", "_SCL_SECURE_NO_WARNINGS"] )
 
@@ -2364,22 +2503,63 @@ if env.TargetOSIs('posix'):
             )
 
     # -Winvalid-pch Warn if a precompiled header (see Precompiled Headers) is found in the search path but can't be used.
-    env.Append( CCFLAGS=["-fno-omit-frame-pointer",
-                         "-fno-strict-aliasing",
-                         "-fasynchronous-unwind-tables",
+    env.Append( CCFLAGS=["-fasynchronous-unwind-tables",
                          "-ggdb" if not env.TargetOSIs('emscripten') else "-g",
                          "-Wall",
                          "-Wsign-compare",
                          "-Wno-unknown-pragmas",
                          "-Winvalid-pch"] )
-    # env.Append( " -Wconversion" ) TODO: this doesn't really work yet
-    if env.TargetOSIs('linux', 'darwin', 'solaris'):
-        if not has_option("disable-warnings-as-errors"):
-            env.Append( CCFLAGS=["-Werror"] )
 
+    # TODO: At least on x86, glibc as of 2.3.4 will consult the
+    # .eh_frame info via _Unwind_Backtrace to do backtracing without
+    # needing the frame pointer, despite what the backtrace man page
+    # actually says. We should see if we can drop the requirement that
+    # we use libunwind here.
+    can_nofp = (env.TargetOSIs('darwin') or use_libunwind)
+
+    # For debug builds with tcmalloc, we need the frame pointer so it can
+    # record the stack of allocations.
+    can_nofp &= not (debugBuild and (env['MONGO_ALLOCATOR'] == 'tcmalloc'))
+
+    # Only disable frame pointers if requested
+    can_nofp &= ("nofp" in selected_experimental_optimizations)
+
+    if not can_nofp:
+        env.Append(CCFLAGS=["-fno-omit-frame-pointer"])
+
+    if not "tbaa" in selected_experimental_optimizations:
+        env.Append(CCFLAGS=["-fno-strict-aliasing"])
+
+    # Enabling hidden visibility on non-darwin requires that we have
+    # libunwind in play, since glibc backtrace will not work
+    # correctly.
+    if "vishidden" in selected_experimental_optimizations and (env.TargetOSIs('darwin') or use_libunwind):
+        if link_model.startswith('dynamic'):
+            # In dynamic mode, we can't make the default visibility
+            # hidden because not all libraries have export tags. But
+            # we can at least make inlines hidden.
+            #
+            # TODO: Except on macOS, where we observe lots of crashes
+            # when we enable this. We should investigate further but
+            # it isn't relevant for the purpose of exploring these
+            # flags on linux, where they seem to work fine.
+            if not env.TargetOSIs('darwin'):
+                env.Append(CXXFLAGS=["-fvisibility-inlines-hidden"])
+        else:
+            # In static mode, we need an escape hatch for a few
+            # libraries that don't work correctly when built with
+            # hidden visiblity.
+            def conditional_visibility_generator(target, source, env, for_signature):
+                if 'DISALLOW_VISHIDDEN' in env:
+                    return
+                return "-fvisibility=hidden"
+            env.Append(
+                CCFLAGS_VISIBILITY_HIDDEN_GENERATOR=conditional_visibility_generator,
+                CCFLAGS='$CCFLAGS_VISIBILITY_HIDDEN_GENERATOR',
+            )
+
+    # env.Append( " -Wconversion" ) TODO: this doesn't really work yet
     env.Append( CXXFLAGS=["-Woverloaded-virtual"] )
-    if env.ToolchainIs('clang'):
-        env.Append( CXXFLAGS=['-Werror=unused-result'] )
 
     # On OS X, clang doesn't want the pthread flag at link time, or it
     # issues warnings which make it impossible for us to declare link
@@ -2395,14 +2575,47 @@ if env.TargetOSIs('posix'):
 
     # SERVER-9761: Ensure early detection of missing symbols in dependent libraries at program
     # startup.
-    if env.TargetOSIs('darwin'):
-        if env.TargetOSIs('macOS'):
-            env.Append( LINKFLAGS=["-Wl,-bind_at_load"] )
-    else:
-        env.Append( LINKFLAGS=["-Wl,-z,now"] )
-        env.Append( LINKFLAGS=["-rdynamic"] )
+    env.Append(
+        LINKFLAGS=[
+            "-Wl,-bind_at_load" if env.TargetOSIs('macOS') else "-Wl,-z,now",
+        ],
+    )
 
-    env.Append( LIBS=[] )
+    # We need to use rdynamic for backtraces with glibc unless we have libunwind.
+    nordyn = (env.TargetOSIs('darwin') or use_libunwind)
+
+    # And of course only do rdyn if the experimenter asked for it.
+    nordyn &= ("nordyn" in selected_experimental_optimizations)
+
+    if nordyn:
+        def export_symbol_generator(source, target, env, for_signature):
+            symbols = copy.copy(env.get('EXPORT_SYMBOLS', []))
+            for lib in libdeps.get_libdeps(source, target, env, for_signature):
+                if lib.env:
+                    symbols.extend(lib.env.get('EXPORT_SYMBOLS', []))
+            export_expansion = '${EXPORT_SYMBOL_FLAG}'
+            return [f'-Wl,{export_expansion}{symbol}' for symbol in symbols]
+        env['EXPORT_SYMBOL_GEN'] = export_symbol_generator
+
+        # For darwin, we need the leading underscore but for others we
+        # don't. Hacky but it works to jam that distinction into the
+        # flag itself, since it already differs on darwin.
+        if env.TargetOSIs('darwin'):
+            env['EXPORT_SYMBOL_FLAG'] = "-exported_symbol,_"
+        else:
+            env['EXPORT_SYMBOL_FLAG'] = "--export-dynamic-symbol,"
+
+        env.Append(
+            PROGLINKFLAGS=[
+                '$EXPORT_SYMBOL_GEN'
+            ],
+        )
+    elif not env.TargetOSIs('darwin'):
+        env.Append(
+            PROGLINKFLAGS=[
+                "-rdynamic",
+            ],
+        )
 
     #make scons colorgcc friendly
     for key in ('HOME', 'TERM'):
@@ -2420,20 +2633,14 @@ if env.TargetOSIs('posix'):
         env.Append( LINKFLAGS=["-fprofile-arcs", "-ftest-coverage", "-fprofile-update=single"] )
 
     if optBuild and not optBuildForSize:
-        env.Append( CCFLAGS=["-O2"] )
+        env.Append( CCFLAGS=["-O3" if "O3" in selected_experimental_optimizations else "-O2"] )
     elif optBuild and optBuildForSize:
         env.Append( CCFLAGS=["-Os"] )
     else:
         env.Append( CCFLAGS=["-O0"] )
 
-    # Promote linker warnings into errors. We can't yet do this on OS X because its linker considers
-    # noall_load obsolete and warns about it.
-    if not has_option("disable-warnings-as-errors"):
-        env.Append(
-            LINKFLAGS=[
-                '-Wl,-fatal_warnings' if env.TargetOSIs('darwin') else "-Wl,--fatal-warnings",
-            ]
-        )
+    if optBuild and "treevec" in selected_experimental_optimizations:
+        env.Append(CCFLAGS=["-ftree-vectorize"])
 
 wiredtiger = False
 if get_option('wiredtiger') == 'on':
@@ -2453,20 +2660,44 @@ if get_option('ocsp-stapling') == 'on':
     # disable OCSP Stapling on Ubuntu 18.04 machines. See SERVER-51364 for more details.
     env.SetConfigHeaderDefine("MONGO_CONFIG_OCSP_STAPLING_ENABLED")
 
-if env['TARGET_ARCH'] == 'i386':
-    # If we are using GCC or clang to target 32 bit, set the ISA minimum to 'nocona',
-    # and the tuning to 'generic'. The choice of 'nocona' is selected because it
-    #  -- includes MMX extenions which we need for tcmalloc on 32-bit
-    #  -- can target 32 bit
-    #  -- is at the time of this writing a widely-deployed 10 year old microarchitecture
-    #  -- is available as a target architecture from GCC 4.0+
-    # However, we only want to select an ISA, not the nocona specific scheduling, so we
-    # select the generic tuning. For installations where hardware and system compiler rev are
-    # contemporaries, the generic scheduling should be appropriate for a wide range of
-    # deployed hardware.
 
-    if env.ToolchainIs('GCC', 'clang'):
-        env.Append( CCFLAGS=['-march=nocona', '-mtune=generic'] )
+if not env.TargetOSIs('windows') and (env.ToolchainIs('GCC', 'clang')):
+
+    # By default, apply our current microarchitecture minima. If the
+    # user has customized a flag of the same name in any of CCFLAGS,
+    # CFLAGS, or CXXFLAGS, we disable applying our default to
+    # CCFLAGS. We are assuming the user knows what they are doing,
+    # e.g. we don't try to be smart and notice that they applied it to
+    # CXXFLAGS and therefore still apply it to CFLAGS since they
+    # didn't customize that. Basically, don't send those flags in
+    # unless you a) mean it, and b) know what you are doing, and c)
+    # cover all your bases by either setting it via CCFLAGS, or
+    # setting it for both C and C++ by setting both of CFLAGS and
+    # CXXFLAGS.
+
+    default_targeting_flags_for_architecture = {
+        "aarch64"    : { "-march=" : "armv8.2-a",    "-mtune=" : "generic"                        },
+        "i386"       : { "-march=" : "nocona",       "-mtune=" : "generic"                        },
+        "ppc64le"    : { "-mcpu="  : "power8",       "-mtune=" : "power8", "-mcmodel=" : "medium" },
+        "s390x"      : { "-march=" : "z196",         "-mtune=" : "zEC12"                          },
+    }
+
+    # If we are enabling vectorization in sandybridge mode, we'd
+    # rather not hit the 256 wide vector instructions because the
+    # heavy versions can cause clock speed reductions.
+    if "sandybridge" in selected_experimental_optimizations:
+        default_targeting_flags_for_architecture["x86_64"] = {
+            "-march="                : "sandybridge",
+            "-mtune="                : "generic",
+            "-mprefer-vector-width=" : "128",
+        }
+
+    default_targeting_flags = default_targeting_flags_for_architecture.get(env['TARGET_ARCH'])
+    if default_targeting_flags:
+        search_variables = ['CCFLAGS', 'CFLAGS', 'CXXFLAGS']
+        for targeting_flag, targeting_flag_value in default_targeting_flags.items():
+            if not any(flag_value.startswith(targeting_flag) for search_variable in search_variables for flag_value in env[search_variable]):
+                env.Append(CCFLAGS=[f'{targeting_flag}{targeting_flag_value}'])
 
 # Needed for auth tests since key files are stored in git with mode 644.
 if not env.TargetOSIs('windows'):
@@ -2691,13 +2922,27 @@ def doConfigure(myenv):
                     if test_flag.startswith("-Wno-") and not test_flag.startswith("-Wno-error="):
                         test_flags.append(re.sub("^-Wno-", "-W", test_flag))
 
-        cloned = env.Clone()
+        # If the user has selected ``configure` in
+        # `disable-warnings-as-errors`, the usual mechanisms that
+        # would inject Werror or similar are disabled for
+        # conftests. But AddFlagIfSupported requires that those flags
+        # be used. Disable the generators so we have explicit control.
+        cloned = env.Clone(
+            CCFLAGS_GENERATE_WERROR=[],
+            CXXFLAGS_GENERATE_WERROR=[],
+            LINKFLAGS_GENERATE_WERROR=[],
+        )
+
         cloned.Append(**test_mutation)
 
-        # For GCC, we don't need anything since bad flags are already errors, but
-        # adding -Werror won't hurt. For clang, bad flags are only warnings, so we need -Werror
-        # to make them real errors.
-        cloned.Append(CCFLAGS=['-Werror'])
+        # Add these *after* the test mutation, so that the mutation
+        # can't step on the warnings-as-errors state.
+        cloned.Append(
+            CCFLAGS=["$CCFLAGS_WERROR"],
+            CXXFLAGS=["$CXXFLAGS_WERROR"],
+            LINKFLAGS=["$LINKFLAGS_WERROR"],
+        )
+
         conf = Configure(cloned, help=False, custom_tests = {
                 'CheckFlag' : lambda ctx : CheckFlagTest(ctx, tool, extension, flag)
         })
@@ -2832,10 +3077,6 @@ def doConfigure(myenv):
         # Warn about moves of prvalues, which can inhibit copy elision.
         AddToCXXFLAGSIfSupported(myenv, "-Wpessimizing-move")
 
-        # Warn about redundant moves, such as moving a local variable in a return that is different
-        # than the return type.
-        AddToCXXFLAGSIfSupported(myenv, "-Wredundant-move")
-
         # Disable warning about variables that may not be initialized
         # Failures are triggered in the case of boost::optional in GCC 4.8.x
         # TODO: re-evaluate when we move to GCC 5.3
@@ -2895,14 +3136,18 @@ def doConfigure(myenv):
             };
             """
 
-            context.Message('Checking -Wnon-virtual-dtor for false positives... ')
+            context.Message('Checking if -Wnon-virtual-dtor works reasonably... ')
             ret = context.TryCompile(textwrap.dedent(test_body), ".cpp")
             context.Result(ret)
             return ret
 
         myenvClone = myenv.Clone()
-        myenvClone.Append( CCFLAGS=['-Werror'] )
-        myenvClone.Append( CXXFLAGS=["-Wnon-virtual-dtor"] )
+        myenvClone.Append(
+            CCFLAGS=[
+                '$CCFLAGS_WERROR',
+                '-Wnon-virtual-dtor',
+            ]
+        )
         conf = Configure(myenvClone, help=False, custom_tests = {
             'CheckNonVirtualDtor' : CheckNonVirtualDtor,
         })
@@ -2933,6 +3178,17 @@ def doConfigure(myenv):
                         '-fstack-protector-all',
                     ]
                 )
+
+            if 'cfex' in selected_experimental_runtime_hardenings:
+                myenv.Append(
+                    CFLAGS=["-fexceptions"]
+                )
+
+            if 'stackclash' in selected_experimental_runtime_hardenings:
+                AddToCCFLAGSIfSupported(myenv, "-fstack-clash-protection")
+
+            if 'controlflow' in selected_experimental_runtime_hardenings:
+                AddToCCFLAGSIfSupported(myenv, "-fcf-protection=full")
 
         if myenv.ToolchainIs('clang'):
             # TODO: There are several interesting things to try here, but they each have
@@ -2965,9 +3221,9 @@ def doConfigure(myenv):
         To specify a target minimum for Darwin platforms, please explicitly add the appropriate options
         to CCFLAGS and LINKFLAGS on the command line:
 
-        macOS: scons CCFLAGS="-mmacosx-version-min=10.13" LINKFLAGS="-mmacosx-version-min=10.13" ..
+        macOS: scons CCFLAGS="-mmacosx-version-min=10.14" LINKFLAGS="-mmacosx-version-min=10.14" ..
 
-        Note that MongoDB requires macOS 10.13 or later.
+        Note that MongoDB requires macOS 10.14 or later.
         """
         myenv.ConfError(textwrap.dedent(message))
 
@@ -3479,6 +3735,82 @@ def doConfigure(myenv):
         # If possible with the current linker, mark relocations as read-only.
         AddToLINKFLAGSIfSupported(myenv, "-Wl,-z,relro")
 
+        # As far as we know these flags only apply on posix-y systems,
+        # and not on Darwin.
+        if env.TargetOSIs("posix") and not env.TargetOSIs("darwin"):
+
+            # Disable debug compression in both the assembler and linker
+            # by default. If the user requested compression, only allow
+            # the zlib-gabi form.
+            debug_compress = get_option("debug-compress")
+
+            # If a value was provided on the command line for --debug-compress, it should
+            # inhibit the application of auto, so strip it out.
+            if "auto" in debug_compress and len(debug_compress) > 1:
+                debug_compress = debug_compress[1:]
+
+            # Disallow saying --debug-compress=off --debug-compress=ld and similar
+            if "off" in debug_compress and len(debug_compress) > 1:
+                env.FatalError("Cannot combine 'off' for --debug-compress with other values")
+
+            # Transform the 'auto' argument into a real value.
+            if "auto" in debug_compress:
+                debug_compress = []
+
+                # We only automatically enable ld compression for
+                # dynamic builds because it seems to use enormous
+                # amounts of memory in static builds.
+                if link_model.startswith("dynamic"):
+                    debug_compress.append("ld")
+
+            compress_type="zlib-gabi"
+            compress_flag="compress-debug-sections"
+
+            AddToCCFLAGSIfSupported(
+                myenv,
+                f"-Wa,--{compress_flag}={compress_type}" if "as" in debug_compress else f"-Wa,--no{compress_flag}")
+
+            # We shouldn't enable debug compression in the linker
+            # (meaning our final binaries contain compressed debug
+            # info) unless our local elf environment appears to at
+            # least be aware of SHF_COMPRESSED. This seems like a
+            # necessary precondition, but is it sufficient?
+            #
+            # https://gnu.wildebeest.org/blog/mjw/2016/01/13/elf-libelf-compressed-sections-and-elfutils/
+
+            def CheckElfHForSHF_COMPRESSED(context):
+
+                test_body = """
+                #include <elf.h>
+                #if !defined(SHF_COMPRESSED)
+                #error
+                #endif
+                """
+
+                context.Message('Checking elf.h for SHF_COMPRESSED... ')
+                ret = context.TryCompile(textwrap.dedent(test_body), ".c")
+                context.Result(ret)
+                return ret
+
+            conf = Configure(myenv, help=False, custom_tests = {
+                'CheckElfHForSHF_COMPRESSED' : CheckElfHForSHF_COMPRESSED,
+            })
+
+            have_shf_compressed = conf.CheckElfHForSHF_COMPRESSED()
+            conf.Finish()
+
+            if have_shf_compressed and 'ld' in debug_compress:
+                AddToLINKFLAGSIfSupported(
+                    myenv,
+                    f"-Wl,--{compress_flag}={compress_type}")
+            else:
+                AddToLINKFLAGSIfSupported(
+                    myenv,
+                    f"-Wl,--{compress_flag}=none")
+
+        if "fnsi" in selected_experimental_optimizations:
+            AddToCCFLAGSIfSupported(myenv, "-fno-semantic-interposition")
+
     # Avoid deduping symbols on OS X debug builds, as it takes a long time.
     if not optBuild and myenv.ToolchainIs('clang') and env.TargetOSIs('darwin'):
         AddToLINKFLAGSIfSupported(myenv, "-Wl,-no_deduplicate")
@@ -3547,7 +3879,7 @@ def doConfigure(myenv):
         myenv = conf.Finish()
 
     # We set this to work around https://gcc.gnu.org/bugzilla/show_bug.cgi?id=43052
-    if not myenv.ToolchainIs('msvc'):
+    if not myenv.ToolchainIs('msvc') and not 'builtin-memcmp' in selected_experimental_optimizations:
         AddToCCFLAGSIfSupported(myenv, "-fno-builtin-memcmp")
 
     # pthread_setname_np was added in GLIBC 2.12, and Solaris 11.3
@@ -3824,7 +4156,7 @@ def doConfigure(myenv):
         conf.FindSysLibDep("pcre", ["pcre"])
         conf.FindSysLibDep("pcrecpp", ["pcrecpp"])
     else:
-        env.Prepend(CPPDEFINES=['PCRE_STATIC'])
+        conf.env.Prepend(CPPDEFINES=['PCRE_STATIC'])
 
     if use_system_version_of_library("snappy"):
         conf.FindSysLibDep("snappy", ["snappy"])
@@ -4178,6 +4510,9 @@ def doConfigure(myenv):
 
     myenv = conf.Finish()
 
+    if env['TARGET_ARCH'] == "aarch64":
+        AddToCCFLAGSIfSupported(myenv, "-moutline-atomics")
+
     conf = Configure(myenv)
     usdt_enabled = get_option('enable-usdt-probes')
     usdt_provider = None
@@ -4191,7 +4526,10 @@ def doConfigure(myenv):
         elif usdt_provider:
             conf.env.SetConfigHeaderDefine("MONGO_CONFIG_USDT_ENABLED")
             conf.env.SetConfigHeaderDefine("MONGO_CONFIG_USDT_PROVIDER", usdt_provider)
-    return conf.Finish()
+    myenv = conf.Finish()
+
+    return myenv
+
 
 
 env = doConfigure( env )

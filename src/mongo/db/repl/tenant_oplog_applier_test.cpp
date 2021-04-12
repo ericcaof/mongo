@@ -160,7 +160,7 @@ public:
     }
 
     void assertNoOpMatches(const OplogEntry& op, const MutableOplogEntry& noOp) {
-        ASSERT_BSONOBJ_EQ(op.getEntry().toBSON(), noOp.getObject());
+        ASSERT_BSONOBJ_EQ(op.getEntry().toBSON(), *noOp.getObject2());
         ASSERT_EQ(op.getNss(), noOp.getNss());
         ASSERT_EQ(op.getUuid(), noOp.getUuid());
         ASSERT_EQ(_migrationUuid, noOp.getFromTenantMigration());
@@ -212,6 +212,7 @@ TEST_F(TenantOplogApplierTest, NoOpsForSingleBatch) {
     ASSERT_EQ(2, entries.size());
     assertNoOpMatches(srcOps[0], entries[0]);
     assertNoOpMatches(srcOps[1], entries[1]);
+    ASSERT_EQ(srcOps.size(), applier->getNumOpsApplied());
     applier->shutdown();
     applier->join();
 }
@@ -237,6 +238,7 @@ TEST_F(TenantOplogApplierTest, NoOpsForLargeBatch) {
     for (size_t i = 0; i < srcOps.size(); i++) {
         assertNoOpMatches(srcOps[i], entries[i]);
     }
+    ASSERT_EQ(srcOps.size(), applier->getNumOpsApplied());
     applier->shutdown();
     applier->join();
 }
@@ -305,10 +307,6 @@ TEST_F(TenantOplogApplierTest, NoOpsForLargeTransaction) {
     for (size_t i = 0; i < srcOps.size(); i++) {
         assertNoOpMatches(srcOps[i], entries[i]);
     }
-    // Make sure the no-ops got linked properly.
-    ASSERT_EQ(OpTime(), entries[0].getPrevWriteOpTimeInTransaction());
-    ASSERT_EQ(entries[0].getOpTime(), entries[1].getPrevWriteOpTimeInTransaction());
-    ASSERT_EQ(entries[1].getOpTime(), entries[2].getPrevWriteOpTimeInTransaction());
     applier->shutdown();
     applier->join();
 }
@@ -424,7 +422,7 @@ TEST_F(TenantOplogApplierTest, ApplyInserts_Grouped) {
     std::vector<OplogEntry> entries;
     bool onInsertsCalledNss1 = false;
     bool onInsertsCalledNss2 = false;
-    // Despite the odd one in the middle, all the others should be grouped into a single inserrt.
+    // Despite the odd one in the middle, all the others should be grouped into a single insert.
     entries.push_back(makeInsertOplogEntry(1, nss1, uuid1));
     entries.push_back(makeInsertOplogEntry(2, nss1, uuid1));
     entries.push_back(makeInsertOplogEntry(3, nss1, uuid1));
@@ -657,6 +655,69 @@ TEST_F(TenantOplogApplierTest, ApplyCommand_Success) {
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
     ASSERT_TRUE(applyCmdCalled);
+    applier->shutdown();
+    applier->join();
+}
+
+TEST_F(TenantOplogApplierTest, ApplyCreateIndexesCommand_Success) {
+    NamespaceString nss(dbName, "t");
+    auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
+    auto op =
+        BSON("op"
+             << "c"
+             << "ns" << nss.getCommandNS().ns() << "wall" << Date_t() << "o"
+             << BSON("createIndexes" << nss.coll() << "v" << 2 << "key" << BSON("a" << 1) << "name"
+                                     << "a_1")
+             << "ts" << Timestamp(1, 1) << "ui" << uuid);
+    bool applyCmdCalled = false;
+    _opObserver->onCreateIndexFn = [&](OperationContext* opCtx,
+                                       const NamespaceString& collNss,
+                                       CollectionUUID collUuid,
+                                       BSONObj indexDoc,
+                                       bool fromMigrate) {
+        ASSERT_FALSE(applyCmdCalled);
+        applyCmdCalled = true;
+        ASSERT_TRUE(opCtx->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
+        ASSERT_TRUE(opCtx->writesAreReplicated());
+        ASSERT_BSONOBJ_EQ(indexDoc,
+                          BSON("v" << 2 << "key" << BSON("a" << 1) << "name"
+                                   << "a_1"));
+        ASSERT_EQUALS(nss, collNss);
+        ASSERT_EQUALS(uuid, collUuid);
+    };
+    auto entry = OplogEntry(op);
+    pushOps({entry});
+    auto writerPool = makeTenantMigrationWriterPool();
+
+    auto applier = std::make_shared<TenantOplogApplier>(
+        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    ASSERT_OK(applier->startup());
+    auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
+    ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
+    ASSERT_TRUE(applyCmdCalled);
+    applier->shutdown();
+    applier->join();
+}
+
+TEST_F(TenantOplogApplierTest, ApplyStartIndexBuildCommand_Failure) {
+    NamespaceString nss(dbName, "t");
+    auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
+    auto op = BSON("op"
+                   << "c"
+                   << "ns" << nss.getCommandNS().ns() << "wall" << Date_t() << "o"
+                   << BSON("startIndexBuild" << nss.coll() << "v" << 2 << "key" << BSON("a" << 1)
+                                             << "name"
+                                             << "a_1")
+                   << "ts" << Timestamp(1, 1) << "ui" << uuid);
+    auto entry = OplogEntry(op);
+    pushOps({entry});
+    auto writerPool = makeTenantMigrationWriterPool();
+
+    auto applier = std::make_shared<TenantOplogApplier>(
+        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    ASSERT_OK(applier->startup());
+    auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
+    ASSERT_EQUALS(opAppliedFuture.getNoThrow().getStatus().code(), 5434700);
     applier->shutdown();
     applier->join();
 }

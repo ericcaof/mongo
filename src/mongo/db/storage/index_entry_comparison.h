@@ -70,7 +70,7 @@ struct IndexKeyEntry {
 
     void serialize(BSONObjBuilder* builder) const {
         builder->append("key"_sd, key);
-        loc.serialize(builder);
+        loc.serializeToken("RecordId", builder);
     }
 
     BSONObj key;
@@ -92,7 +92,17 @@ inline bool operator!=(const IndexKeyEntry& lhs, const IndexKeyEntry& rhs) {
  */
 struct KeyStringEntry {
     KeyStringEntry(KeyString::Value ks, RecordId loc) : keyString(ks), loc(loc) {
-        invariant(loc == KeyString::decodeRecordIdAtEnd(ks.getBuffer(), ks.getSize()));
+        if (!kDebugBuild) {
+            return;
+        }
+        loc.withFormat(
+            [](RecordId::Null n) { invariant(false); },
+            [&](int64_t rid) {
+                invariant(loc == KeyString::decodeRecordIdLongAtEnd(ks.getBuffer(), ks.getSize()));
+            },
+            [&](const char* str, int size) {
+                invariant(loc == KeyString::decodeRecordIdStrAtEnd(ks.getBuffer(), ks.getSize()));
+            });
     }
 
     KeyString::Value keyString;
@@ -246,6 +256,19 @@ public:
                                                             Ordering ord,
                                                             bool isForward,
                                                             bool inclusive);
+
+    /**
+     * Encodes the BSON Key into a KeyString object to pass in to SortedDataInterface::seek()
+     * or SortedDataInterface::setEndPosition().
+     *
+     * This funcition is similar to IndexEntryComparison::makeKeyStringFromBSONKeyForSeek()
+     * but allows you to pick your own KeyString::Discriminator based on wether or not the
+     * resulting KeyString is for the start key or end key of a seek.
+     */
+    static KeyString::Value makeKeyStringFromBSONKey(const BSONObj& bsonKey,
+                                                     KeyString::Version version,
+                                                     Ordering ord,
+                                                     KeyString::Discriminator discrim);
 
 private:
     // Ordering is used in comparison() to compare BSONElements

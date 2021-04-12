@@ -1,9 +1,6 @@
 /**
  * Tests the tightness of index bounds when attempting to match a regex that contains escaped and
  * non-escaped pipe '|' characters.
- * @tags: [
- *   sbe_incompatible,
- * ]
  */
 (function() {
 'use strict';
@@ -36,7 +33,7 @@ function assertIndexBoundsAndResult(params) {
 
     // Check that the query uses correct index bounds. When run against a sharded cluster, there
     // may be multiple index scan stages, but each should have the same index bounds.
-    const ixscans = getPlanStages(explain.queryPlanner.winningPlan, 'IXSCAN');
+    const ixscans = getPlanStages(getWinningPlan(explain.queryPlanner), 'IXSCAN');
     assert.gt(ixscans.length, 0, 'Plan unexpectedly missing IXSCAN stage: ' + tojson(explain));
     for (let i = 0; i < ixscans.length; i++) {
         const ixscan = ixscans[i];

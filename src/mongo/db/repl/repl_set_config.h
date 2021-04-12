@@ -131,6 +131,20 @@ public:
      */
     void removeNewlyAddedFieldForMember(MemberId memberId);
 
+    /**
+     * Sets the member config's 'secondaryDelaySecs' to the value of 'slaveDelay' and removes the
+     * 'slaveDelay' field entirely. If 'slaveDelay' is not set, then sets 'secondaryDelaySecs' to
+     * the default value.
+     */
+    void useSecondaryDelaySecsFieldName(MemberId memberId);
+
+    /**
+     * Sets the member config's 'slaveDelay' to the value of 'secondaryDelaySecs' and removes the
+     * 'secondaryDelaySecs' field entirely. If 'secondaryDelaySecs' is not set, then sets
+     * 'slaveDelay' to the default value.
+     */
+    void useSlaveDelayFieldName(MemberId memberId);
+
 protected:
     MutableReplSetConfig() = default;
 
@@ -218,6 +232,13 @@ public:
     static ReplSetConfig parseForInitiate(const BSONObj& cfg, OID newReplicaSetId);
 
     /**
+     * Sets the default delay field name for a member config based on feature compatibility version,
+     * but only if the member config has neither 'secondaryDelaySecs' nor 'slaveDelay' already set.
+     * This function is used when constructing 'ReplSetConfigs' for initiate and reconfig.
+     */
+    void setDefaultDelayFieldForMember(MemberConfig mem);
+
+    /**
      * Returns true if this object has been successfully initialized or copied from
      * an initialized object.
      */
@@ -229,6 +250,12 @@ public:
      * Performs basic consistency checks on the replica set configuration.
      */
     Status validate() const;
+
+    /**
+     * Performs basic consistency checks on the replica set configuration, but does not fail on
+     * IP addresses in split horizon configuration
+     */
+    Status validateAllowingSplitHorizonIP() const;
 
     /**
      * Checks if this configuration can satisfy the given write concern.
@@ -527,6 +554,11 @@ private:
      * Sets the required fields of the IDL object.
      */
     void _setRequiredFields();
+
+    /**
+     * Performs basic consistency checks on the replica set configuration.
+     */
+    Status _validate(bool allowSplitHorizonIP) const;
 
     /**
      * Common code used by constructors

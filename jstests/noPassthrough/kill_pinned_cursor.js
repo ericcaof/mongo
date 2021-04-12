@@ -1,4 +1,8 @@
-// @tags: [requires_replication, requires_getmore, does_not_support_stepdowns]
+// @tags: [
+//   does_not_support_stepdowns,
+//   requires_getmore,
+//   requires_replication,
+// ]
 //
 // Uses getMore to pin an open cursor.
 //

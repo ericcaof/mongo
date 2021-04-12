@@ -12,7 +12,6 @@ selector:
 
   # SERVER-17397 Drops of sharded namespaces may not fully succeed
   - jstests/concurrency/fsm_workloads/create_database.js
-  - jstests/concurrency/fsm_workloads/drop_database.js
   - jstests/concurrency/fsm_workloads/map_reduce_drop.js
 
   # Disabled due to SERVER-33753, '.count() without a predicate can be wrong on sharded
@@ -108,11 +107,19 @@ selector:
   # Inserts directly into system.views using applyOps, which is not available on mongos.
   - jstests/concurrency/fsm_workloads/view_catalog_direct_system_writes.js
 
+  # Time-series collections are not supported on mongos.
+  - jstests/concurrency/fsm_workloads/create_timeseries_collection.js
+
+  # TODO SERVER-54905: DDL/CRUD is tested on its own suite for now.
+  - jstests/concurrency/fsm_workloads/random_DDL_CRUD_operations.js
+
   exclude_with_any_tags:
   - requires_replication
   - assumes_balancer_on
   # mongos has no system.profile collection.
   - requires_profiling
+  # mongos does not support inserts on timeseries collections
+  - requires_timeseries
 
 executor:
   archive:
@@ -126,7 +133,6 @@ executor:
       readMode: commands
       global_vars:
         TestData:
-          usingReplicaSetShards: true
           runningWithAutoSplit: false
           runningWithBalancer: false
   hooks:

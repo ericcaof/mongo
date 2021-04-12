@@ -43,13 +43,13 @@ namespace mongo {
  * you would add this line:
  * REGISTER_ACCUMULATOR(foo, AccumulatorFoo::create);
  */
-#define REGISTER_ACCUMULATOR(key, factory)                                            \
-    MONGO_INITIALIZER(addToAccumulatorFactoryMap_##key)(InitializerContext*) {        \
-        AccumulationStatement::registerAccumulator("$" #key, (factory), boost::none); \
-    }
+#define REGISTER_ACCUMULATOR(key, factory) \
+    REGISTER_ACCUMULATOR_WITH_MIN_VERSION(key, factory, boost::none)
 
 #define REGISTER_ACCUMULATOR_WITH_MIN_VERSION(key, factory, minVersion)                \
-    MONGO_INITIALIZER(addToAccumulatorFactoryMap_##key)(InitializerContext*) {         \
+    MONGO_INITIALIZER_GENERAL(                                                         \
+        addToAccumulatorFactoryMap_##key, ("default"), ("accumulatorParserMap"))       \
+    (InitializerContext*) {                                                            \
         AccumulationStatement::registerAccumulator("$" #key, (factory), (minVersion)); \
     }
 
@@ -131,6 +131,20 @@ AccumulationExpression genericParseSingleExpressionAccumulator(ExpressionContext
     auto initializer = ExpressionConstant::create(expCtx, Value(BSONNULL));
     auto argument = Expression::parseOperand(expCtx, elem, vps);
     return {initializer, argument, [expCtx]() { return AccName::create(expCtx); }};
+}
+
+/**
+ * A parser that desugars { $count: {} } to { $sum: 1 }.
+ */
+inline AccumulationExpression parseCountAccumulator(ExpressionContext* const expCtx,
+                                                    BSONElement elem,
+                                                    VariablesParseState vps) {
+    uassert(ErrorCodes::TypeMismatch,
+            "$count takes no arguments, i.e. $count:{}",
+            elem.type() == BSONType::Object && elem.Obj().isEmpty());
+    auto initializer = ExpressionConstant::create(expCtx, Value(BSONNULL));
+    auto argument = ExpressionConstant::create(expCtx, Value(1));
+    return {initializer, argument, [expCtx]() { return AccumulatorSum::create(expCtx); }};
 }
 
 /**

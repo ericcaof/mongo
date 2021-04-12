@@ -251,6 +251,16 @@ public:
                                   const std::string& reason);
 
     /**
+     * Signals all of the index builds belonging to the specified tenant to abort and then waits
+     * until the index builds are no longer running. The provided 'reason' will be used in the
+     * error message that the index builders return to their callers.
+     *
+     * Does not require holding locks.
+     *
+     * Does not stop new index builds from starting. Caller must make that guarantee.
+     */
+    void abortTenantIndexBuilds(OperationContext* opCtx, StringData db, const std::string& reason);
+    /**
      * Signals all of the index builds to abort and then waits until the index builds are no longer
      * running. The provided 'reason' will be used in the error message that the index builders
      * return to their callers.
@@ -435,8 +445,8 @@ public:
      * complete collation spec in cases where the index spec specifies a collation, and will add
      * the collection-default collation, if present, in cases where collation is omitted. If the
      * index spec omits the collation and the collection does not have a default, the collation
-     * field is omitted from the spec. This function also converts 'wildcardProjection' and
-     * 'partialFilterExpression' to canonical form in any cases where they exist.
+     * field is omitted from the spec. This function also converts the 'wildcardProjection' to
+     * canonical form in any cases where it exists.
      *
      * If 'collection' is null, no changes are made to the input specs.
      *

@@ -26,8 +26,8 @@
 # it in the license file.
 #
 
-# This file defines the format of documents stored in config.localReshardingOperations on the
-# recipient shard for a resharding operation.
+# This file defines the format of documents stored in config.localReshardingOperations.recipient on
+# the recipient shard for a resharding operation.
 
 global:
     cpp_namespace: "mongo"
@@ -36,28 +36,26 @@ imports:
     - "mongo/s/resharding/common_types.idl"
 
 structs:
-    DonorShardMirroringEntry:
-        description: "Represents a particular donor shard and whether that shard has reported to
-                      this recipient that the shard is now mirroring writes as distributed
-                      transactions."
-        generate_comparison_operators: false
-        strict: true
-        fields:
-            id: shard_id
-            mirroring: bool
-
     ReshardingRecipientDocument:
         description: "Represents a resharding operation on the recipient shard."
         inline_chained_structs: true
         chained_structs:
             CommonReshardingMetadata: CommonReshardingMetadata
-            FetchTimestamp: FetchTimestampStruct
-            StrictConsistencyTimestamp: StrictConsistencyTimestampStruct
         generate_comparison_operators: false
-        strict: true
+        # Use strict:false to avoid complications around upgrade/downgrade. This isn't technically
+        # required for resharding because durable state from all resharding operations is cleaned up
+        # before the upgrade or downgrade can complete.
+        strict: false
         fields:
-            state: RecipientState
-            donorShardsMirroring:
-                type: array<DonorShardMirroringEntry>
-                description: "The list of donor shards that have reported to this recipient that
-                              the donor shard is now mirroring writes as distributed transactions."
+            cloneTimestamp:
+                type: timestamp
+                optional: true
+                description:  "The timestamp for the snapshot read while cloning from the donors."
+            # We intentionally have the mutable state nested in a subobject to make it easy to
+            # overwrite with a single $set.
+            mutableState: RecipientShardContext
+            donorShards:
+                type: array<DonorShardFetchTimestamp>
+                description: "The list of donor shards that report to this recipient."
+            minimumOperationDurationMillis:
+                type: long

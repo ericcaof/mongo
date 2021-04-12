@@ -1,6 +1,8 @@
-/*
+/**
  * Tests index consistency metrics in the serverStatus output.
- * @tags: [requires_sharding]
+ * @tags: [
+ *   requires_sharding,
+ * ]
  */
 (function() {
 "use strict";
@@ -149,7 +151,7 @@ checkServerStatus(configPrimaryConn, configSecondaryConn, connsWithoutIndexConsi
 
 // Force the secondary that tracks inconsistent indexes to step up to primary and update the
 // appropriate test variables.
-assert.commandWorked(configSecondaryConn.adminCommand({replSetStepUp: 1}));
+st.configRS.stepUp(configSecondaryConn);
 st.configRS.waitForState(configSecondaryConn, ReplSetTest.State.PRIMARY);
 st.configRS.waitForState(configPrimaryConn, ReplSetTest.State.SECONDARY);
 st.configRS.awaitNodesAgreeOnPrimary();

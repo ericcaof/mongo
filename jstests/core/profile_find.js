@@ -1,7 +1,6 @@
 // @tags: [
 //   does_not_support_stepdowns,
 //   requires_profiling,
-//   sbe_incompatible,
 // ]
 
 // Confirms that profiled find execution contains all expected metrics with proper values.
@@ -132,7 +131,7 @@ assert.eq(profileObj.replanned, true, profileObj);
 assert(profileObj.hasOwnProperty('replanReason'), profileObj);
 assert(
     profileObj.replanReason.match(
-        /cached plan was less efficient than expected: expected trial execution to take [0-9]+ works but it took at least [0-9]+ works/),
+        /cached plan was less efficient than expected: expected trial execution to take [0-9]+ (works|reads) but it took at least [0-9]+ (works|reads)/),
     profileObj);
 assert.eq(profileObj.appName, "MongoDB Shell", profileObj);
 

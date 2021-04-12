@@ -48,17 +48,17 @@ class BatchedCommandRequest {
 public:
     enum BatchType { BatchType_Insert, BatchType_Update, BatchType_Delete };
 
-    BatchedCommandRequest(write_ops::Insert insertOp)
+    BatchedCommandRequest(write_ops::InsertCommandRequest insertOp)
         : _batchType(BatchType_Insert),
-          _insertReq(std::make_unique<write_ops::Insert>(std::move(insertOp))) {}
+          _insertReq(std::make_unique<write_ops::InsertCommandRequest>(std::move(insertOp))) {}
 
-    BatchedCommandRequest(write_ops::Update updateOp)
+    BatchedCommandRequest(write_ops::UpdateCommandRequest updateOp)
         : _batchType(BatchType_Update),
-          _updateReq(std::make_unique<write_ops::Update>(std::move(updateOp))) {}
+          _updateReq(std::make_unique<write_ops::UpdateCommandRequest>(std::move(updateOp))) {}
 
-    BatchedCommandRequest(write_ops::Delete deleteOp)
+    BatchedCommandRequest(write_ops::DeleteCommandRequest deleteOp)
         : _batchType(BatchType_Delete),
-          _deleteReq(std::make_unique<write_ops::Delete>(std::move(deleteOp))) {}
+          _deleteReq(std::make_unique<write_ops::DeleteCommandRequest>(std::move(deleteOp))) {}
 
     BatchedCommandRequest(BatchedCommandRequest&&) = default;
 
@@ -71,6 +71,8 @@ public:
     }
 
     const NamespaceString& getNS() const;
+
+    bool getBypassDocumentValidation() const;
 
     const auto& getInsertRequest() const {
         invariant(_insertReq);
@@ -141,25 +143,48 @@ public:
     const boost::optional<LegacyRuntimeConstants>& getLegacyRuntimeConstants() const;
     const boost::optional<BSONObj>& getLet() const;
 
-    const write_ops::WriteCommandBase& getWriteCommandBase() const;
-    void setWriteCommandBase(write_ops::WriteCommandBase writeCommandBase);
+    const write_ops::WriteCommandRequestBase& getWriteCommandRequestBase() const;
+    void setWriteCommandRequestBase(write_ops::WriteCommandRequestBase writeCommandBase);
 
     void serialize(BSONObjBuilder* builder) const;
     BSONObj toBSON() const;
     std::string toString() const;
 
-    void setAllowImplicitCreate(bool doAllow) {
-        _allowImplicitCollectionCreation = doAllow;
-    }
-
-    bool isImplicitCreateAllowed() const {
-        return _allowImplicitCollectionCreation;
-    }
-
     /**
      * Generates a new request, the same as the old, but with insert _ids if required.
      */
     static BatchedCommandRequest cloneInsertWithIds(BatchedCommandRequest origCmdRequest);
+
+    /**
+     * Returns batch of delete operations to be attached to a transaction
+     */
+    static BatchedCommandRequest buildDeleteOp(const NamespaceString& nss,
+                                               const BSONObj& query,
+                                               bool multiDelete);
+
+    /**
+     * Returns batch of insert operations to be attached to a transaction
+     */
+    static BatchedCommandRequest buildInsertOp(const NamespaceString& nss,
+                                               const std::vector<BSONObj> docs);
+
+    /*
+     * Returns batch of update operations to be attached to a transaction
+     */
+    static BatchedCommandRequest buildUpdateOp(const NamespaceString& nss,
+                                               const BSONObj& query,
+                                               const BSONObj& update,
+                                               bool upsert,
+                                               bool multi);
+
+    /**
+     *  Returns batch of pipeline update operations to be attached to a transaction
+     */
+    static BatchedCommandRequest buildPipelineUpdateOp(const NamespaceString& nss,
+                                                       const BSONObj& query,
+                                                       const std::vector<BSONObj>& updates,
+                                                       bool upsert,
+                                                       bool useMultiUpdate);
 
     /** These are used to return empty refs from Insert ops that don't carry runtimeConstants
      * or let parameters in getLet and getLegacyRuntimeConstants.
@@ -191,15 +216,14 @@ private:
 
     BatchType _batchType;
 
-    std::unique_ptr<write_ops::Insert> _insertReq;
-    std::unique_ptr<write_ops::Update> _updateReq;
-    std::unique_ptr<write_ops::Delete> _deleteReq;
+    std::unique_ptr<write_ops::InsertCommandRequest> _insertReq;
+    std::unique_ptr<write_ops::UpdateCommandRequest> _updateReq;
+    std::unique_ptr<write_ops::DeleteCommandRequest> _deleteReq;
 
     boost::optional<ChunkVersion> _shardVersion;
     boost::optional<DatabaseVersion> _dbVersion;
 
     boost::optional<BSONObj> _writeConcern;
-    bool _allowImplicitCollectionCreation = true;
 };
 
 /**

@@ -536,6 +536,11 @@ class TestBinder(testcase.IDLTestcase):
                 serializer: foo
                 deserializer: foo
                 default: foo
+            int:
+                description: foo
+                cpp_type: std::int32_t
+                bson_serialization_type: int
+                deserializer: mongo::BSONElement::_numberInt
         """)
 
         self.assert_bind(test_preamble + textwrap.dedent("""
@@ -545,6 +550,15 @@ class TestBinder(testcase.IDLTestcase):
                     strict: true
                     fields:
                         foo: string
+            """))
+
+        self.assert_bind(test_preamble + textwrap.dedent("""
+            structs:
+                foo:
+                    description: foo
+                    strict: true
+                    fields:
+                        foo: array<int>
             """))
 
     def test_struct_negative(self):
@@ -561,6 +575,11 @@ class TestBinder(testcase.IDLTestcase):
                 serializer: foo
                 deserializer: foo
                 default: foo
+            int:
+                description: foo
+                cpp_type: std::int32_t
+                bson_serialization_type: int
+                deserializer: mongo::BSONElement::_numberInt
         """)
 
         # Test array as name
@@ -574,12 +593,28 @@ class TestBinder(testcase.IDLTestcase):
                         foo: string
             """), idl.errors.ERROR_ID_ARRAY_NOT_VALID_TYPE)
 
+        self.assert_bind(test_preamble + textwrap.dedent("""
+            structs:
+                foo:
+                    description: foo
+                    strict: true
+                    fields:
+                        foo: array<int>
+            """))
+
     def test_variant_negative(self):
         # type: () -> None
         """Negative variant test cases."""
 
         # Setup some common types
         test_preamble = textwrap.dedent("""
+        enums:
+            foo_enum:
+                description: foo
+                type: int
+                values:
+                    v1: 0
+                    v2: 1
         types:
             string:
                 description: foo
@@ -588,6 +623,26 @@ class TestBinder(testcase.IDLTestcase):
                 serializer: foo
                 deserializer: foo
                 default: foo
+            int:
+                description: foo
+                cpp_type: std::int32_t
+                bson_serialization_type: int
+                deserializer: mongo::BSONElement::_numberInt
+            safeInt:
+                bson_serialization_type:
+                - long
+                - int
+                - decimal
+                - double
+                description: foo
+                cpp_type: "std::int32_t"
+                deserializer: "mongo::BSONElement::safeNumberInt"
+            bindata_function:
+                bson_serialization_type: bindata
+                bindata_subtype: function
+                description: "A BSON bindata of function sub type"
+                cpp_type: "std::vector<std::uint8_t>"
+                deserializer: "mongo::BSONElement::_binDataVector"
         """)
 
         self.assert_bind_fail(
@@ -615,6 +670,157 @@ class TestBinder(testcase.IDLTestcase):
                             - int
                             - not_defined
             """), idl.errors.ERROR_ID_UNKNOWN_TYPE)
+
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+        structs:
+            foo:
+                description: foo
+                fields:
+                    my_variant_field:
+                        type:
+                            variant:
+                            - string
+                            - int
+                        default: 1
+            """), idl.errors.ERROR_ID_VARIANT_NO_DEFAULT)
+
+        # Bindata is banned in variants for now.
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+        structs:
+            foo:
+                description: foo
+                fields:
+                    my_variant_field:
+                        type:
+                            variant:
+                            - string
+                            - bindata_function
+            """), idl.errors.ERROR_ID_BAD_BSON_TYPE)
+
+        # Enums are banned in variants for now.
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+        structs:
+            foo:
+                description: foo
+                fields:
+                    my_variant_field:
+                        type:
+                            variant:
+                            - string
+                            - foo_enum
+            """), idl.errors.ERROR_ID_NO_VARIANT_ENUM)
+
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+        structs:
+            foo:
+                description: foo
+                fields:
+                    my_variant_field:
+                        type:
+                            variant:
+                            - string
+                            - string
+            """), idl.errors.ERROR_ID_VARIANT_DUPLICATE_TYPES)
+
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+        structs:
+            foo:
+                description: foo
+                fields:
+                    my_variant_field:
+                        type:
+                            variant:
+                            - array<string>
+                            - array<string>
+            """), idl.errors.ERROR_ID_VARIANT_DUPLICATE_TYPES)
+
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+        structs:
+            struct0:
+                description: foo
+            struct1:
+                description: foo
+            foo:
+                description: foo
+                fields:
+                    my_variant_field:
+                        type:
+                            variant:
+                            - array<struct0>
+                            - array<struct1>
+            """), idl.errors.ERROR_ID_VARIANT_DUPLICATE_TYPES)
+
+        # At most one array can have BSON serialization type NumberInt.
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+        structs:
+            foo:
+                description: foo
+                fields:
+                    my_variant_field:
+                        type:
+                            variant:
+                            - array<int>
+                            - array<safeInt>
+            """), idl.errors.ERROR_ID_VARIANT_DUPLICATE_TYPES)
+
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+        structs:
+            one_string:
+                description: foo
+                fields: {value: string}
+            foo:
+                description: foo
+                fields:
+                    my_variant_field:
+                        type:
+                            variant:
+                            - one_string
+                            - one_string
+                            - int
+            """), idl.errors.ERROR_ID_VARIANT_STRUCTS)
+
+        # At most one type can have BSON serialization type Object.
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+        structs:
+            one_string:
+                description: foo
+                fields: {value: string}
+            one_int:
+                description: foo
+                fields: {value: int}
+            foo:
+                description: foo
+                fields:
+                    my_variant_field:
+                        type:
+                            variant:
+                            - one_string
+                            - one_int
+                            - int
+            """), idl.errors.ERROR_ID_VARIANT_STRUCTS)
+
+        # At most one type can have BSON serialization type NumberInt.
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+        structs:
+            foo:
+                description: foo
+                fields:
+                    my_variant_field:
+                        type:
+                            variant:
+                            - safeInt
+                            - int
+      """), idl.errors.ERROR_ID_VARIANT_DUPLICATE_TYPES)
 
     def test_field_positive(self):
         # type: () -> None
@@ -1443,7 +1649,7 @@ class TestBinder(testcase.IDLTestcase):
                 serializer: foo
                 deserializer: foo
                 default: foo
-        
+
         structs:
             reply:
                 description: foo
@@ -1457,6 +1663,7 @@ class TestBinder(testcase.IDLTestcase):
                     description: foo
                     command_name: foo
                     namespace: ignored
+                    api_version: ""
                     strict: true
                     fields:
                         foo1: string
@@ -1487,6 +1694,7 @@ class TestBinder(testcase.IDLTestcase):
                     description: foo
                     command_name: foo
                     namespace: ignored
+                    api_version: ""
                     fields:
                         foo1: string
 
@@ -1494,6 +1702,7 @@ class TestBinder(testcase.IDLTestcase):
                     description: foo
                     command_name: bar
                     namespace: ignored
+                    api_version: ""
                     fields:
                         foo: foo
             """), idl.errors.ERROR_ID_FIELD_NO_COMMAND)
@@ -1506,6 +1715,7 @@ class TestBinder(testcase.IDLTestcase):
                     description: foo
                     command_name: foo
                     namespace: ignored
+                    api_version: ""
                     fields:
                         foo1: string
 
@@ -1524,6 +1734,7 @@ class TestBinder(testcase.IDLTestcase):
                     description: foo
                     command_name: foo
                     namespace: ignored
+                    api_version: ""
                     fields:
                         foo: string
             """), idl.errors.ERROR_ID_COMMAND_DUPLICATES_FIELD)
@@ -1536,6 +1747,7 @@ class TestBinder(testcase.IDLTestcase):
                     description: foo
                     command_name: foo
                     namespace: ignored
+                    api_version: ""
                     reply_type: not_defined
             """), idl.errors.ERROR_ID_UNKNOWN_TYPE)
 
@@ -1547,6 +1759,7 @@ class TestBinder(testcase.IDLTestcase):
                     description: foo
                     command_name: foo
                     namespace: ignored
+                    api_version: ""
                     reply_type: string
             """), idl.errors.ERROR_ID_INVALID_REPLY_TYPE)
 
@@ -1586,6 +1799,7 @@ class TestBinder(testcase.IDLTestcase):
                     description: foo
                     command_name: foo
                     namespace: ignored
+                    api_version: ""
                     fields:
                         foo1:
                             type: array<object>
@@ -1598,6 +1812,7 @@ class TestBinder(testcase.IDLTestcase):
                     description: foo
                     command_name: foo
                     namespace: ignored
+                    api_version: ""
                     fields:
                         foo1:
                             type: array<foo_struct>
@@ -1663,6 +1878,7 @@ class TestBinder(testcase.IDLTestcase):
                     description: foo
                     command_name: foo
                     namespace: ignored
+                    api_version: ""
                     fields:
                         foo:
                             type: object
@@ -1677,6 +1893,7 @@ class TestBinder(testcase.IDLTestcase):
                     description: foo
                     command_name: foo
                     namespace: ignored
+                    api_version: ""
                     fields:
                         foo1:
                             type: array<string>
@@ -1691,6 +1908,7 @@ class TestBinder(testcase.IDLTestcase):
                     description: foo
                     command_name: foo
                     namespace: ignored
+                    api_version: ""
                     fields:
                         foo1:
                             type: array<string>
@@ -1718,6 +1936,7 @@ class TestBinder(testcase.IDLTestcase):
                 command_name: foo
                 strict: true
                 namespace: type
+                api_version: ""
                 type: string
                 fields:
                     field1: string
@@ -1731,6 +1950,7 @@ class TestBinder(testcase.IDLTestcase):
                 command_name: foo
                 strict: true
                 namespace: type
+                api_version: ""
                 type: array<string>
                 fields:
                     field1: string
@@ -1757,6 +1977,7 @@ class TestBinder(testcase.IDLTestcase):
                 description: foo
                 command_name: foo
                 namespace: type
+                api_version: ""
                 type: int
                 fields:
                     field1: string
@@ -2141,6 +2362,304 @@ class TestBinder(testcase.IDLTestcase):
                     default: false
                     version: 123
             """), idl.errors.ERROR_ID_FEATURE_FLAG_DEFAULT_FALSE_HAS_VERSION)
+
+    def test_access_check(self):
+        # type: () -> None
+        """Test access check."""
+
+        test_preamble = textwrap.dedent("""
+        types:
+            string:
+                description: foo
+                cpp_type: foo
+                bson_serialization_type: string
+                serializer: foo
+                deserializer: foo
+
+        enums:
+            AccessCheck:
+                description: "test"
+                type: string
+                values:
+                    kIsAuthenticated :  "is_authenticated"
+                    kIsCoAuthorized :  "is_coauthorized"
+
+            ActionType:
+                description: "test"
+                type: string
+                values:
+                    addShard :  "addShard"
+                    serverStatus :  "serverStatus"
+
+            MatchType:
+                description: "test"
+                type: string
+                values:
+                    matchClusterResource :  "cluster"
+
+        structs:
+            reply:
+                description: foo
+                fields:
+                    foo: string
+        """)
+
+        # Test none
+        self.assert_bind(test_preamble + textwrap.dedent("""
+        commands:
+            test1:
+                description: foo
+                command_name: foo
+                api_version: ""
+                namespace: ignored
+                access_check:
+                    none: true
+                fields:
+                    foo: string
+                reply_type: reply
+            """))
+
+        # Test simple with access check
+        self.assert_bind(test_preamble + textwrap.dedent("""
+        commands:
+            test1:
+                description: foo
+                command_name: foo
+                api_version: ""
+                namespace: ignored
+                access_check:
+                    simple:
+                        check: is_authenticated
+                fields:
+                    foo: string
+                reply_type: reply
+            """))
+
+        # Test simple with privilege
+        self.assert_bind(test_preamble + textwrap.dedent("""
+        commands:
+            test1:
+                description: foo
+                command_name: foo
+                api_version: ""
+                namespace: ignored
+                access_check:
+                    simple:
+                        privilege:
+                            resource_pattern: cluster
+                            action_type: addShard
+                fields:
+                    foo: string
+                reply_type: reply
+            """))
+
+        self.assert_parse(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                api_version: 1
+                namespace: ignored
+                access_check:
+                    complex:
+                        - privilege:
+                            resource_pattern: cluster
+                            action_type: addShard
+                        - privilege:
+                            resource_pattern: cluster
+                            action_type: serverStatus
+                        - check: is_authenticated
+                fields:
+                    foo: bar
+                reply_type: foo_reply_struct
+            """))
+
+    def test_access_check_negative(self):
+        # type: () -> None
+        """Negative access check tests."""
+
+        test_preamble = textwrap.dedent("""
+        types:
+            string:
+                description: foo
+                cpp_type: foo
+                bson_serialization_type: string
+                serializer: foo
+                deserializer: foo
+
+        enums:
+            AccessCheck:
+                description: "test"
+                type: string
+                values:
+                    kIsAuthenticated :  "is_authenticated"
+                    kIsCoAuthorized :  "is_coauthorized"
+
+            ActionType:
+                description: "test"
+                type: string
+                values:
+                    addShard :  "addShard"
+                    serverStatus :  "serverStatus"
+
+            MatchType:
+                description: "test"
+                type: string
+                values:
+                    matchClusterResource :  "cluster"
+        structs:
+            reply:
+                description: foo
+                fields:
+                    foo: string
+        """)
+
+        # Test simple with bad access check
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+        commands:
+            test1:
+                description: foo
+                command_name: foo
+                api_version: ""
+                namespace: ignored
+                access_check:
+                    simple:
+                        check: unknown
+                fields:
+                    foo: string
+                reply_type: reply
+            """), idl.errors.ERROR_ID_UNKOWN_ENUM_VALUE)
+
+        # Test simple with bad access check with privilege
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+        commands:
+            test1:
+                description: foo
+                command_name: foo
+                api_version: ""
+                namespace: ignored
+                access_check:
+                    simple:
+                        privilege:
+                            resource_pattern: foo
+                            action_type: addShard
+                fields:
+                    foo: string
+                reply_type: reply
+            """), idl.errors.ERROR_ID_UNKOWN_ENUM_VALUE)
+
+        # Test simple with bad access check with privilege
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+        commands:
+            test1:
+                description: foo
+                command_name: foo
+                api_version: ""
+                namespace: ignored
+                access_check:
+                    simple:
+                        privilege:
+                            resource_pattern: cluster
+                            action_type: foo
+                fields:
+                    foo: string
+                reply_type: reply
+            """), idl.errors.ERROR_ID_UNKOWN_ENUM_VALUE)
+
+        # Test simple with access check and privileges
+        self.assert_bind(test_preamble + textwrap.dedent("""
+        commands:
+            test1:
+                description: foo
+                command_name: foo
+                api_version: ""
+                namespace: ignored
+                access_check:
+                    simple:
+                        privilege:
+                            resource_pattern: cluster
+                            action_type: [addShard, serverStatus]
+                fields:
+                    foo: string
+                reply_type: reply
+            """))
+
+        # Test simple with privilege with duplicate action_type
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+        commands:
+            test1:
+                description: foo
+                command_name: foo
+                api_version: ""
+                namespace: ignored
+                access_check:
+                    simple:
+                        privilege:
+                            resource_pattern: cluster
+                            action_type: [addShard, addShard]
+                fields:
+                    foo: string
+                reply_type: reply
+            """), idl.errors.ERROR_ID_DUPLICATE_ACTION_TYPE)
+
+        # complex with duplicate check
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+        commands:
+            test1:
+                description: foo
+                command_name: foo
+                api_version: 1
+                namespace: ignored
+                access_check:
+                    complex:
+                        - check: is_authenticated
+                        - check: is_authenticated
+                fields:
+                    foo: string
+                reply_type: reply
+            """), idl.errors.ERROR_ID_DUPLICATE_ACCESS_CHECK)
+
+        # complex with duplicate priv
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+        commands:
+            test1:
+                description: foo
+                command_name: foo
+                api_version: 1
+                namespace: ignored
+                access_check:
+                    complex:
+                        - privilege:
+                            resource_pattern: cluster
+                            action_type: addShard
+                        - privilege:
+                            resource_pattern: cluster
+                            action_type: [addShard, serverStatus]
+                fields:
+                    foo: string
+                reply_type: reply
+            """), idl.errors.ERROR_ID_DUPLICATE_ACCESS_CHECK)
+
+        # api_version != "" but not access_check
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+        commands:
+            test1:
+                description: foo
+                command_name: foo
+                api_version: 1
+                namespace: ignored
+                fields:
+                    foo: string
+                reply_type: reply
+            """), idl.errors.ERROR_ID_MISSING_ACCESS_CHECK)
 
 
 if __name__ == '__main__':

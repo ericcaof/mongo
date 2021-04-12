@@ -249,19 +249,6 @@ public:
               typename = void>
     Derived& append(StringData fieldName, const T& n) = delete;
 
-    /** appends a number.  if n < max(int)/2 then uses int, otherwise long long */
-    Derived& appendIntOrLL(StringData fieldName, long long n) {
-        // extra () to avoid max macro on windows
-        static const long long maxInt = (std::numeric_limits<int>::max)() / 2;
-        static const long long minInt = -maxInt;
-        if (minInt < n && n < maxInt) {
-            append(fieldName, static_cast<int>(n));
-        } else {
-            append(fieldName, n);
-        }
-        return static_cast<Derived&>(*this);
-    }
-
     /**
      * appendNumber is a series of method for appending the smallest sensible type
      * mostly for JS
@@ -274,29 +261,16 @@ public:
         return append(fieldName, d);
     }
 
-    Derived& appendNumber(StringData fieldName, size_t n) {
-        static const size_t maxInt = (1 << 30);
-        if (n < maxInt)
-            append(fieldName, static_cast<int>(n));
-        else
-            append(fieldName, static_cast<long long>(n));
-        return static_cast<Derived&>(*this);
-    }
-
     Derived& appendNumber(StringData fieldName, Decimal128 decNumber) {
         return append(fieldName, decNumber);
     }
 
     Derived& appendNumber(StringData fieldName, long long llNumber) {
-        static const long long maxInt = (1LL << 30);
-        static const long long minInt = -maxInt;
-        static const long long maxDouble = (1LL << 40);
-        static const long long minDouble = -maxDouble;
+        static const long long maxInt = std::numeric_limits<int>::max();
+        static const long long minInt = std::numeric_limits<int>::min();
 
-        if (minInt < llNumber && llNumber < maxInt) {
+        if (minInt <= llNumber && llNumber <= maxInt) {
             append(fieldName, static_cast<int>(llNumber));
-        } else if (minDouble < llNumber && llNumber < maxDouble) {
-            append(fieldName, static_cast<double>(llNumber));
         } else {
             append(fieldName, llNumber);
         }
@@ -717,6 +691,8 @@ private:
     friend Super;
 
 public:
+    using ArrayBuilder = BSONArrayBuilder;
+
     BSONObjBuilder() : Super(kDefaultSize), _s(this) {}
 
     BSONObjBuilder(int initsize) : Super(initsize), _s(this) {}
@@ -827,6 +803,7 @@ private:
  * This should only be used when you care about having direct ownership over the BSONObj's
  * underlying memory.
  */
+class UniqueBSONArrayBuilder;
 class UniqueBSONObjBuilder : public BSONObjBuilderBase<UniqueBSONObjBuilder, UniqueBufBuilder> {
 private:
     using Super = BSONObjBuilderBase<UniqueBSONObjBuilder, UniqueBufBuilder>;
@@ -834,6 +811,7 @@ private:
 
 public:
     using Super::BSONObjBuilderBase;
+    using ArrayBuilder = UniqueBSONArrayBuilder;
 
     /**
      * Creates a new UniqueBSONObjBuilder prefixed with the fields in 'prefix'.
@@ -1043,6 +1021,8 @@ protected:
  */
 class BSONArrayBuilder : public BSONArrayBuilderBase<BSONArrayBuilder, BSONObjBuilder> {
 public:
+    using ObjBuilder = BSONObjBuilder;
+
     using BSONArrayBuilderBase<BSONArrayBuilder, BSONObjBuilder>::BSONArrayBuilderBase;
     BSONArrayBuilder(BufBuilder& bufBuilder)
         : BSONArrayBuilderBase<BSONArrayBuilder, BSONObjBuilder>(bufBuilder) {}
@@ -1054,7 +1034,11 @@ public:
 class UniqueBSONArrayBuilder
     : public BSONArrayBuilderBase<UniqueBSONArrayBuilder, UniqueBSONObjBuilder> {
 public:
+    using ObjBuilder = UniqueBSONObjBuilder;
+
     using BSONArrayBuilderBase<UniqueBSONArrayBuilder, UniqueBSONObjBuilder>::BSONArrayBuilderBase;
+    UniqueBSONArrayBuilder(UniqueBufBuilder& bufBuilder)
+        : BSONArrayBuilderBase<UniqueBSONArrayBuilder, UniqueBSONObjBuilder>(bufBuilder) {}
 };
 
 template <class Derived, class B>

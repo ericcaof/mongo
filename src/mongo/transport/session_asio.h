@@ -170,29 +170,37 @@ public:
         }
     }
 
-    StatusWith<Message> sourceMessage() override {
+    StatusWith<Message> sourceMessage() noexcept override try {
         ensureSync();
         return sourceMessageImpl().getNoThrow();
+    } catch (const DBException& ex) {
+        return ex.toStatus();
     }
 
-    Future<Message> asyncSourceMessage(const BatonHandle& baton = nullptr) override {
+    Future<Message> asyncSourceMessage(const BatonHandle& baton = nullptr) noexcept override try {
         ensureAsync();
         return sourceMessageImpl(baton);
+    } catch (const DBException& ex) {
+        return ex.toStatus();
     }
 
-    Status waitForData() override {
+    Status waitForData() noexcept override try {
         ensureSync();
         asio::error_code ec;
         getSocket().wait(asio::ip::tcp::socket::wait_read, ec);
         return errorCodeToStatus(ec);
+    } catch (const DBException& ex) {
+        return ex.toStatus();
     }
 
-    Future<void> asyncWaitForData() override {
+    Future<void> asyncWaitForData() noexcept override try {
         ensureAsync();
         return getSocket().async_wait(asio::ip::tcp::socket::wait_read, UseFuture{});
+    } catch (const DBException& ex) {
+        return ex.toStatus();
     }
 
-    Status sinkMessage(Message message) override {
+    Status sinkMessage(Message message) noexcept override try {
         ensureSync();
 
         return write(asio::buffer(message.buf(), message.size()))
@@ -202,9 +210,12 @@ public:
                 }
             })
             .getNoThrow();
+    } catch (const DBException& ex) {
+        return ex.toStatus();
     }
 
-    Future<void> asyncSinkMessage(Message message, const BatonHandle& baton = nullptr) override {
+    Future<void> asyncSinkMessage(Message message,
+                                  const BatonHandle& baton = nullptr) noexcept override try {
         ensureAsync();
         return write(asio::buffer(message.buf(), message.size()), baton)
             .then([this, message /*keep the buffer alive*/]() {
@@ -212,6 +223,8 @@ public:
                     networkCounter.hitPhysicalOut(message.size());
                 }
             });
+    } catch (const DBException& ex) {
+        return ex.toStatus();
     }
 
     void cancelAsyncOperations(const BatonHandle& baton = nullptr) override {
@@ -345,10 +358,14 @@ protected:
             // which also means no timeout.
             auto timeout = _configuredTimeout.value_or(Milliseconds{0});
             getSocket().set_option(ASIOSocketTimeoutOption<SO_SNDTIMEO>(timeout), ec);
-            uassertStatusOK(errorCodeToStatus(ec));
+            if (auto status = errorCodeToStatus(ec); !status.isOK()) {
+                tasserted(5342000, status.reason());
+            }
 
             getSocket().set_option(ASIOSocketTimeoutOption<SO_RCVTIMEO>(timeout), ec);
-            uassertStatusOK(errorCodeToStatus(ec));
+            if (auto status = errorCodeToStatus(ec); !status.isOK()) {
+                tasserted(5342001, status.reason());
+            }
 
             _socketTimeout = _configuredTimeout;
         }
@@ -471,7 +488,7 @@ private:
 
     template <typename MutableBufferSequence>
     Future<void> read(const MutableBufferSequence& buffers, const BatonHandle& baton = nullptr) {
-        // TODO SERVER-47229 Guard active ops for cancelation here.
+        // TODO SERVER-47229 Guard active ops for cancellation here.
 #ifdef MONGO_CONFIG_SSL
         if (_sslSocket) {
             return opportunisticRead(*_sslSocket, buffers, baton);
@@ -497,7 +514,7 @@ private:
 
     template <typename ConstBufferSequence>
     Future<void> write(const ConstBufferSequence& buffers, const BatonHandle& baton = nullptr) {
-        // TODO SERVER-47229 Guard active ops for cancelation here.
+        // TODO SERVER-47229 Guard active ops for cancellation here.
 #ifdef MONGO_CONFIG_SSL
         _ranHandshake = true;
         if (_sslSocket) {
@@ -663,7 +680,7 @@ private:
                 networkingBaton && networkingBaton->canWait()) {
                 return networkingBaton->addSession(*this, NetworkingBaton::Type::Out)
                     .onError([](Status error) {
-                        if (ErrorCodes::isCancelationError(error)) {
+                        if (ErrorCodes::isCancellationError(error)) {
                             // If the baton has detached, it will cancel its polling. We catch that
                             // error here and return Status::OK so that we invoke
                             // opportunisticWrite() again and switch to asio::async_write() below.

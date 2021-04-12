@@ -3,7 +3,6 @@
 //   assumes_balancer_off,
 //   # Uses $where operator
 //   requires_scripting,
-//   sbe_incompatible,
 // ]
 
 t = db.jstests_and3;

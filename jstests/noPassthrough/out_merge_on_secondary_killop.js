@@ -3,7 +3,10 @@
  * original aggregate command is killed as well. Likewise, tests that when killOp is run on the
  * $out/$merge command on the secondary, no further insert/update batches are sent to the primary.
  *
- * @tags: [assumes_unsharded_collection, requires_replication]
+ * @tags: [
+ *   assumes_unsharded_collection,
+ *   requires_replication,
+ * ]
  */
 (function() {
 "use strict";
@@ -52,7 +55,7 @@ function findAndKillOp(conn, comment) {
 }
 
 function testKillOp(pipeline, comment, failpointName) {
-    let fp = configureFailPoint(primary, failpointName);
+    let fp = configureFailPoint(primary, failpointName, {shouldCheckForInterrupt: true});
 
     // Run the aggregate and ensure that it is interrupted.
     const runAggregate = `

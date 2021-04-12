@@ -2,7 +2,8 @@
  * Tests that the donor retries its steps until success, or it gets an error that should lead to
  * an abort decision.
  *
- * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft]
+ * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft,
+ * incompatible_with_windows_tls]
  */
 
 (function() {
@@ -18,23 +19,25 @@ const kGarbageCollectionDelayMS = 5 * 1000;
 const kTenantIdPrefix = "testTenantId";
 let testNum = 0;
 
+const garbageCollectionOpts = {
+    // Set the delay before a donor state doc is garbage collected to be short to speed
+    // up the test.
+    tenantMigrationGarbageCollectionDelayMS: kGarbageCollectionDelayMS,
+    ttlMonitorSleepSecs: 1
+};
+
 const donorRst = new ReplSetTest({
     name: "donorRst",
     nodes: 1,
-    nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().donor, {
-        setParameter: {
-            // Set the delay before a donor state doc is garbage collected to be short to speed
-            // up the test.
-            tenantMigrationGarbageCollectionDelayMS: kGarbageCollectionDelayMS,
-            ttlMonitorSleepSecs: 1,
-        }
-    })
+    nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().donor,
+                               {setParameter: garbageCollectionOpts})
 });
 
 donorRst.startSet();
 donorRst.initiate();
 
-const tenantMigrationTest = new TenantMigrationTest({name: jsTestName(), donorRst: donorRst});
+const tenantMigrationTest = new TenantMigrationTest(
+    {name: jsTestName(), donorRst: donorRst, sharedOptions: {setParameter: garbageCollectionOpts}});
 const donorPrimary = tenantMigrationTest.getDonorPrimary();
 const recipientPrimary = tenantMigrationTest.getRecipientPrimary();
 
@@ -83,7 +86,7 @@ function testDonorRetryRecipientSyncDataCmdOnError(errorCode, failMode) {
 
     const stateRes =
         assert.commandWorked(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
-    assert.eq(stateRes.state, TenantMigrationTest.State.kCommitted);
+    assert.eq(stateRes.state, TenantMigrationTest.DonorState.kCommitted);
     assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 
     return migrationId;
@@ -113,7 +116,7 @@ function testDonorRetryRecipientForgetMigrationCmdOnError(errorCode) {
                                 {times: 1});
 
     const stateRes = assert.commandWorked(tenantMigrationTest.runMigration(migrationOpts));
-    assert.eq(stateRes.state, TenantMigrationTest.State.kCommitted);
+    assert.eq(stateRes.state, TenantMigrationTest.DonorState.kCommitted);
 
     // Verify that the initial recipientForgetMigration command failed.
     assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
@@ -121,8 +124,7 @@ function testDonorRetryRecipientForgetMigrationCmdOnError(errorCode) {
     fp.off();
 
     // Check that forgetMigration properly deletes the stateDoc and mtab from the donor primary.
-    tenantMigrationTest.waitForMigrationGarbageCollection(
-        tenantMigrationTest.getDonorRst().nodes, migrationId, tenantId);
+    tenantMigrationTest.waitForMigrationGarbageCollection(migrationId, tenantId);
 }
 
 (() => {
@@ -133,7 +135,7 @@ function testDonorRetryRecipientForgetMigrationCmdOnError(errorCode) {
         testDonorRetryRecipientSyncDataCmdOnError(ErrorCodes.NotWritablePrimary, {times: 1});
 
     const configDonorsColl = donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS);
-    assert.eq(TenantMigrationTest.State.kCommitted,
+    assert.eq(TenantMigrationTest.DonorState.kCommitted,
               configDonorsColl.findOne({_id: migrationId}).state);
 })();
 
@@ -145,7 +147,7 @@ function testDonorRetryRecipientForgetMigrationCmdOnError(errorCode) {
         testDonorRetryRecipientSyncDataCmdOnError(ErrorCodes.ShutdownInProgress, {times: 1});
 
     const configDonorsColl = donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS);
-    assert.eq(TenantMigrationTest.State.kCommitted,
+    assert.eq(TenantMigrationTest.DonorState.kCommitted,
               configDonorsColl.findOne({_id: migrationId}).state);
 })();
 
@@ -157,7 +159,7 @@ function testDonorRetryRecipientForgetMigrationCmdOnError(errorCode) {
         testDonorRetryRecipientSyncDataCmdOnError(ErrorCodes.NotWritablePrimary, {skip: 1});
 
     const configDonorsColl = donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS);
-    assert.eq(TenantMigrationTest.State.kCommitted,
+    assert.eq(TenantMigrationTest.DonorState.kCommitted,
               configDonorsColl.findOne({_id: migrationId}).state);
 })();
 
@@ -169,7 +171,7 @@ function testDonorRetryRecipientForgetMigrationCmdOnError(errorCode) {
         testDonorRetryRecipientSyncDataCmdOnError(ErrorCodes.ShutdownInProgress, {skip: 1});
 
     const configDonorsColl = donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS);
-    assert.eq(TenantMigrationTest.State.kCommitted,
+    assert.eq(TenantMigrationTest.DonorState.kCommitted,
               configDonorsColl.findOne({_id: migrationId}).state);
 })();
 
@@ -224,7 +226,7 @@ const kWriteErrorTimeMS = 50;
 
     const configDonorsColl = donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS);
     const donorStateDoc = configDonorsColl.findOne({_id: migrationId});
-    assert.eq(TenantMigrationTest.State.kCommitted, donorStateDoc.state);
+    assert.eq(TenantMigrationTest.DonorState.kCommitted, donorStateDoc.state);
     assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 })();
 
@@ -268,7 +270,7 @@ const kWriteErrorTimeMS = 50;
 
     const donorStateDoc =
         donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS).findOne({_id: migrationId});
-    assert.eq(donorStateDoc.state, TenantMigrationTest.State.kCommitted);
+    assert.eq(donorStateDoc.state, TenantMigrationTest.DonorState.kCommitted);
     assert(donorStateDoc.expireAt);
 
     // Check that the recipient state doc is also correctly marked as garbage collectable.

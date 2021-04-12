@@ -19,14 +19,14 @@ reshardingTest.setup();
 const donorShardNames = reshardingTest.donorShardNames;
 const testColl = reshardingTest.createShardedCollection({
     ns: 'test.foo',
-    shardKeyPattern: {x: 1},
+    shardKeyPattern: {x: 1, s: 1},
     chunks: [
-        {min: {x: MinKey}, max: {x: 5}, shard: donorShardNames[0]},
-        {min: {x: 5}, max: {x: MaxKey}, shard: donorShardNames[1]},
+        {min: {x: MinKey, s: MinKey}, max: {x: 5, s: 5}, shard: donorShardNames[0]},
+        {min: {x: 5, s: 5}, max: {x: MaxKey, s: MaxKey}, shard: donorShardNames[1]},
     ],
 });
 
-const docToUpdate = ({_id: 0, x: 2, y: 2});
+const docToUpdate = ({_id: 0, x: 2, s: 2, y: 2});
 assert.commandWorked(testColl.insert(docToUpdate));
 
 let retryableWriteTs;
@@ -36,36 +36,20 @@ const mongos = testColl.getMongo();
 const recipientShardNames = reshardingTest.recipientShardNames;
 reshardingTest.withReshardingInBackground(  //
     {
-        newShardKeyPattern: {y: 1},
+        newShardKeyPattern: {y: 1, s: 1},
         newChunks: [
-            {min: {y: MinKey}, max: {y: 5}, shard: recipientShardNames[0]},
-            {min: {y: 5}, max: {y: MaxKey}, shard: recipientShardNames[1]},
+            {min: {y: MinKey, s: MinKey}, max: {y: 5, s: 5}, shard: recipientShardNames[0]},
+            {min: {y: 5, s: 5}, max: {y: MaxKey, s: MaxKey}, shard: recipientShardNames[1]},
         ],
     },
     (tempNs) => {
-        // Wait for cloning to have finished on both recipient shards to know that the donor shards
-        // have begun including the "destinedRecipient" field in their oplog entries. It would
-        // technically be sufficient to only wait for cloning to have *started*, but querying the
-        // temporary resharding collection through mongos may cause the RecipientStateMachine to
-        // never be constructed on recipientShardNames[0].
-        //
-        // TODO SERVER-53539: Replace the assert.soon() with the following code.
-        //
-        // const tempColl = mongos.getCollection(tempNs);
-        // assert.soon(() => tempColl.findOne(docToUpdate) !== null);
-        assert.soon(() => {
-            const coordinatorDoc = mongos.getCollection("config.reshardingOperations").findOne({
-                nss: testColl.getFullName()
-            });
+        // Wait for cloning to have at least started on the recipient shards to know that the donor
+        // shards have begun including the "destinedRecipient" field in their oplog entries.
+        const tempColl = mongos.getCollection(tempNs);
+        assert.soon(() => tempColl.findOne(docToUpdate) !== null);
 
-            return coordinatorDoc !== null && coordinatorDoc.state === "applying";
-        });
-
-        // TODO SERVER-52683: Change assertion to say the update succeeds. Also capture the
-        // operationTime associated with the write and assert the generated oplog entry is a
-        // delete+insert in an applyOps.
         assert.commandFailedWithCode(
-            testColl.update({_id: 0, x: 2}, {$set: {y: 10}}),
+            testColl.update({_id: 0, x: 2, s: 2}, {$set: {y: 10}}),
             ErrorCodes.IllegalOperation,
             'was able to update value under new shard key as ordinary write');
 
@@ -73,12 +57,21 @@ reshardingTest.withReshardingInBackground(  //
         const sessionColl =
             session.getDatabase(testColl.getDB().getName()).getCollection(testColl.getName());
 
-        // TODO SERVER-52683: Remove the manual retries for the update once mongos is no longer
-        // responsible for converting retryable writes into transactions.
+        assert.commandFailedWithCode(
+            sessionColl.update({_id: 0, x: 2, s: 2}, {$set: {y: 10}}, {multi: true}),
+            ErrorCodes.InvalidOptions,
+            'was able to update value under new shard key when {multi: true} specified');
+
+        assert.commandFailedWithCode(
+            sessionColl.update({_id: 0}, {$set: {y: 10}}),
+            31025,
+            'was able to update value under new shard key without specifying the full shard key ' +
+                'in the query');
+
         let res;
         assert.soon(
             () => {
-                res = sessionColl.update({_id: 0, x: 2}, {$set: {y: 20}});
+                res = sessionColl.update({_id: 0, x: 2, s: 2}, {$set: {y: 20, s: 3}});
 
                 if (res.nModified === 1) {
                     assert.commandWorked(res);
@@ -95,7 +88,7 @@ reshardingTest.withReshardingInBackground(  //
 
         assert.soon(() => {
             session.startTransaction();
-            res = sessionColl.update({_id: 0, x: 2}, {$set: {y: -30}});
+            res = sessionColl.update({_id: 0, x: 2, s: 3}, {$set: {y: -30, s: 1}});
 
             if (res.nModified === 1) {
                 session.commitTransaction();
@@ -109,9 +102,6 @@ reshardingTest.withReshardingInBackground(  //
             // version to be bumped. The StaleConfig error won't be automatically retried by mongos
             // for the second statement in the transaction (the insert) and would lead to a
             // NoSuchTransaction error.
-            //
-            // TODO SERVER-52683: Remove the manual retries for the update once mongos is no longer
-            // responsible for converting the update into a delete + insert.
             assert.commandFailedWithCode(res, ErrorCodes.NoSuchTransaction);
             session.abortTransaction();
             return false;

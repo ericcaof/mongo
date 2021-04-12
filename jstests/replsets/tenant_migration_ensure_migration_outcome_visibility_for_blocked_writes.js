@@ -4,7 +4,8 @@
  *
  * Tenant migrations are not expected to be run on servers with ephemeralForTest.
  *
- * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft]
+ * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft,
+ * incompatible_with_windows_tls]
  */
 (function() {
 'use strict';
@@ -15,23 +16,21 @@ load("jstests/libs/uuid_util.js");
 load("jstests/replsets/libs/tenant_migration_test.js");
 load("jstests/replsets/libs/tenant_migration_util.js");
 
-// Set the delay before a donor state doc is garbage collected to be short to speed up the test.
-const kGarbageCollectionDelayMS = 30 * 1000;
+const kGarbageCollectionParams = {
+    // Set the delay before a donor state doc is garbage collected to be short to speed up the test.
+    tenantMigrationGarbageCollectionDelayMS: 30 * 1000,
+    // Set the TTL monitor to run at a smaller interval to speed up the test.
+    ttlMonitorSleepSecs: 1,
+};
 
-// Set the TTL monitor to run at a smaller interval to speed up the test.
-const kTTLMonitorSleepSecs = 1;
 const kCollName = "testColl";
 const kTenantDefinedDbName = "0";
 
 const donorRst = new ReplSetTest({
     nodes: 1,
     name: 'donor',
-    nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().donor, {
-        setParameter: {
-            tenantMigrationGarbageCollectionDelayMS: kGarbageCollectionDelayMS,
-            ttlMonitorSleepSecs: kTTLMonitorSleepSecs,
-        }
-    })
+    nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().donor,
+                               {setParameter: kGarbageCollectionParams})
 });
 
 function insertDocument(primaryHost, dbName, collName) {
@@ -48,8 +47,12 @@ function insertDocument(primaryHost, dbName, collName) {
     donorRst.startSet();
     donorRst.initiate();
 
-    const tenantMigrationTest =
-        new TenantMigrationTest({name: jsTestName(), donorRst, enableRecipientTesting: false});
+    const tenantMigrationTest = new TenantMigrationTest({
+        name: jsTestName(),
+        donorRst,
+        enableRecipientTesting: false,
+        sharedOptions: {setParameter: kGarbageCollectionParams}
+    });
     if (!tenantMigrationTest.isFeatureFlagEnabled()) {
         jsTestLog("Skipping test because the tenant migrations feature flag is disabled");
         donorRst.stopSet();
@@ -74,7 +77,7 @@ function insertDocument(primaryHost, dbName, collName) {
 
     assert.commandWorked(primaryDB.runCommand({create: kCollName}));
 
-    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationAfterBlockingStarts");
+    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationBeforeLeavingBlockingState");
     const migrationThread =
         new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
 
@@ -89,10 +92,10 @@ function insertDocument(primaryHost, dbName, collName) {
     migrationThread.join();
 
     const migrationRes = assert.commandWorked(migrationThread.returnData());
-    assert.eq(migrationRes.state, TenantMigrationTest.State.kCommitted);
+    assert.eq(migrationRes.state, TenantMigrationTest.DonorState.kCommitted);
 
     assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
-    tenantMigrationTest.waitForMigrationGarbageCollection(donorRst.nodes, migrationId, tenantId);
+    tenantMigrationTest.waitForMigrationGarbageCollection(migrationId, tenantId);
 
     writeFp.off();
     writeThread.join();
@@ -111,9 +114,8 @@ function insertDocument(primaryHost, dbName, collName) {
     donorRst.startSet();
     donorRst.initiate();
 
-    // TODO SERVER-53112: Remove 'enableRecipientTesting: false'.
-    const tenantMigrationTest =
-        new TenantMigrationTest({name: jsTestName(), donorRst, enableRecipientTesting: false});
+    const tenantMigrationTest = new TenantMigrationTest(
+        {name: jsTestName(), donorRst, sharedOptions: {setParameter: kGarbageCollectionParams}});
     if (!tenantMigrationTest.isFeatureFlagEnabled()) {
         jsTestLog("Skipping test because the tenant migrations feature flag is disabled");
         donorRst.stopSet();
@@ -138,8 +140,8 @@ function insertDocument(primaryHost, dbName, collName) {
 
     assert.commandWorked(primaryDB.runCommand({create: kCollName}));
 
-    const abortFp = configureFailPoint(primaryDB, "abortTenantMigrationAfterBlockingStarts");
-    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationAfterBlockingStarts");
+    const abortFp = configureFailPoint(primaryDB, "abortTenantMigrationBeforeLeavingBlockingState");
+    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationBeforeLeavingBlockingState");
     const migrationThread =
         new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
 
@@ -154,11 +156,11 @@ function insertDocument(primaryHost, dbName, collName) {
     migrationThread.join();
 
     const migrationRes = assert.commandWorked(migrationThread.returnData());
-    assert.eq(migrationRes.state, TenantMigrationTest.State.kAborted);
+    assert.eq(migrationRes.state, TenantMigrationTest.DonorState.kAborted);
     abortFp.off();
 
     assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
-    tenantMigrationTest.waitForMigrationGarbageCollection(donorRst.nodes, migrationId, tenantId);
+    tenantMigrationTest.waitForMigrationGarbageCollection(migrationId, tenantId);
 
     writeFp.off();
     writeThread.join();

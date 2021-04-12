@@ -53,6 +53,7 @@
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/database_sharding_state.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/durable_catalog.h"
@@ -644,10 +645,8 @@ Status renameBetweenDBs(OperationContext* opCtx,
             // Cursor is left one past the end of the batch inside writeConflictRetry.
             auto beginBatchId = record->id;
             Status status = writeConflictRetry(opCtx, "renameCollection", tmpName.ns(), [&] {
-                // Need to reset cursor if it gets a WCE midway through.
-                if (!record || (beginBatchId != record->id)) {
-                    record = cursor->seekExact(beginBatchId);
-                }
+                // Always reposition cursor in case it gets a WCE midway through.
+                record = cursor->seekExact(beginBatchId);
                 for (int i = 0; record && (i < internalInsertMaxBatchSize.load()); i++) {
                     WriteUnitOfWork wunit(opCtx);
                     const InsertStatement stmt(record->data.releaseToBson());
@@ -745,6 +744,7 @@ void doLocalRenameIfOptionsAndIndexesHaveNotChanged(OperationContext* opCtx,
 
     validateAndRunRenameCollection(opCtx, sourceNs, targetNs, options);
 }
+
 void validateAndRunRenameCollection(OperationContext* opCtx,
                                     const NamespaceString& source,
                                     const NamespaceString& target,
@@ -770,11 +770,11 @@ void validateAndRunRenameCollection(OperationContext* opCtx,
             "If either the source or target of a rename is an oplog name, both must be",
             source.isOplog() == target.isOplog());
 
-    Status sourceStatus = userAllowedWriteNS(source);
+    Status sourceStatus = userAllowedWriteNS(opCtx, source);
     uassert(ErrorCodes::IllegalOperation,
             "error with source namespace: " + sourceStatus.reason(),
             sourceStatus.isOK());
-    Status targetStatus = userAllowedWriteNS(target);
+    Status targetStatus = userAllowedWriteNS(opCtx, target);
     uassert(ErrorCodes::IllegalOperation,
             "error with target namespace: " + targetStatus.reason(),
             targetStatus.isOK());
@@ -786,6 +786,8 @@ void validateAndRunRenameCollection(OperationContext* opCtx,
                   "allowed");
     }
 
+    OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE unsafeCreateCollection(
+        opCtx);
     uassertStatusOK(renameCollection(opCtx, source, target, options));
 }
 
@@ -862,7 +864,7 @@ Status renameCollectionForApplyOps(OperationContext* opCtx,
     }
 
     // Check that the target namespace is in the correct form, "database.collection".
-    auto targetStatus = userAllowedCreateNS(targetNss);
+    auto targetStatus = userAllowedCreateNS(opCtx, targetNss);
     if (!targetStatus.isOK()) {
         return Status(targetStatus.code(),
                       str::stream() << "error with target namespace: " << targetStatus.reason());

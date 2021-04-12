@@ -1,7 +1,4 @@
 // SERVER-7781 $geoNear pipeline stage
-// @tags: [
-//   sbe_incompatible,
-// ]
 (function() {
 'use strict';
 
@@ -58,7 +55,7 @@ function test(db, indexType) {
     db[coll].drop();
 
     // insert points
-    var numPts = 10 * 1000;
+    var numPts = 5000;
     var bulk = db[coll].initializeUnorderedBulkOp();
     for (var i = 0; i < numPts; i++) {
         bulk.insert({rand: Math.random(), loc: pointMaker.mkPt()});
@@ -77,7 +74,7 @@ function test(db, indexType) {
             includeLocs: kIncludeLocsField,
             spherical: true,
         },
-        limit: 100
+        limit: 50
     });
 
     // Test $geoNear with an initial batchSize of 1.
@@ -88,7 +85,7 @@ function test(db, indexType) {
             includeLocs: kIncludeLocsField,
             spherical: true,
         },
-        limit: 70,
+        limit: 50,
         batchSize: 1
     });
 }

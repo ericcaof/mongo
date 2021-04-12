@@ -2,7 +2,8 @@
  * Tests that the tenant migration donor authenticates as client to recipient using the
  * migration-specific x.509 certificate, and vice versa.
  *
- * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft]
+ * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft,
+ * incompatible_with_windows_tls]
  */
 
 (function() {
@@ -23,9 +24,9 @@ if (!tenantMigrationTest.isFeatureFlagEnabled()) {
 }
 
 const kDonorCertificateAndPrivateKey =
-    TenantMigrationUtil.getCertificateAndPrivateKey("jstests/libs/rs0_tenant_migration.pem");
+    TenantMigrationUtil.getCertificateAndPrivateKey("jstests/libs/tenant_migration_donor.pem");
 const kRecipientCertificateAndPrivateKey =
-    TenantMigrationUtil.getCertificateAndPrivateKey("jstests/libs/rs1_tenant_migration.pem");
+    TenantMigrationUtil.getCertificateAndPrivateKey("jstests/libs/tenant_migration_recipient.pem");
 
 (() => {
     jsTest.log("Test valid donor and recipient certificates");
@@ -41,7 +42,7 @@ const kRecipientCertificateAndPrivateKey =
 
     tenantMigrationTest.insertDonorDB(dbName, collName);
     const stateRes = assert.commandWorked(tenantMigrationTest.runMigration(migrationOpts));
-    assert.eq(stateRes.state, TenantMigrationTest.State.kCommitted);
+    assert.eq(stateRes.state, TenantMigrationTest.DonorState.kCommitted);
     tenantMigrationTest.verifyRecipientDB(
         tenantId, dbName, collName, true /* migrationCommitted */);
 })();
@@ -164,7 +165,7 @@ const kRecipientCertificateAndPrivateKey =
         migrationIdString: extractUUIDFromObject(migrationId),
         tenantId: tenantId,
         donorCertificateForRecipient: TenantMigrationUtil.getCertificateAndPrivateKey(
-            "jstests/libs/rs0_tenant_migration_expired.pem"),
+            "jstests/libs/tenant_migration_donor_expired.pem"),
         recipientCertificateForDonor: kRecipientCertificateAndPrivateKey,
     };
     const {dbName, collName} = makeTestNs(tenantId);
@@ -273,13 +274,13 @@ const kRecipientCertificateAndPrivateKey =
         tenantId: tenantId,
         donorCertificateForRecipient: kDonorCertificateAndPrivateKey,
         recipientCertificateForDonor: TenantMigrationUtil.getCertificateAndPrivateKey(
-            "jstests/libs/rs1_tenant_migration_expired.pem"),
+            "jstests/libs/tenant_migration_recipient_expired.pem"),
     };
     const {dbName, collName} = makeTestNs(tenantId);
 
     tenantMigrationTest.insertDonorDB(dbName, collName);
     const stateRes = assert.commandWorked(tenantMigrationTest.runMigration(migrationOpts));
-    assert.eq(stateRes.state, TenantMigrationTest.State.kAborted);
+    assert.eq(stateRes.state, TenantMigrationTest.DonorState.kAborted);
     assert.eq(stateRes.abortReason.code, ErrorCodes.InvalidSSLConfiguration);
     tenantMigrationTest.verifyRecipientDB(
         tenantId, dbName, collName, false /* migrationCommitted */);
@@ -302,7 +303,7 @@ const kRecipientCertificateAndPrivateKey =
 
     tenantMigrationTest.insertDonorDB(dbName, collName);
     const stateRes = assert.commandWorked(tenantMigrationTest.runMigration(migrationOpts));
-    assert.eq(stateRes.state, TenantMigrationTest.State.kAborted);
+    assert.eq(stateRes.state, TenantMigrationTest.DonorState.kAborted);
     assert.eq(stateRes.abortReason.code, ErrorCodes.InvalidSSLConfiguration);
     tenantMigrationTest.verifyRecipientDB(
         tenantId, dbName, collName, false /* migrationCommitted */);
@@ -315,43 +316,43 @@ if (!TestData.auth) {
 }
 
 (() => {
-    jsTest.log("Test recipient certificate without backup role");
+    jsTest.log("Test donor certificate without the required privileges");
     const migrationId = UUID();
-    const tenantId = "recipientCertificateNoBackupRole";
+    const tenantId = "donorCertificateInsufficientPrivileges";
     const migrationOpts = {
         migrationIdString: extractUUIDFromObject(migrationId),
         tenantId: tenantId,
-        donorCertificateForRecipient: kDonorCertificateAndPrivateKey,
-        recipientCertificateForDonor: TenantMigrationUtil.getCertificateAndPrivateKey(
-            "jstests/libs/rs1_tenant_migration_no_backup_role.pem"),
+        donorCertificateForRecipient: TenantMigrationUtil.getCertificateAndPrivateKey(
+            "jstests/libs/tenant_migration_donor_insufficient_privileges.pem"),
+        recipientCertificateForDonor: kRecipientCertificateAndPrivateKey,
     };
     const {dbName, collName} = makeTestNs(tenantId);
 
     tenantMigrationTest.insertDonorDB(dbName, collName);
     const stateRes = assert.commandWorked(tenantMigrationTest.runMigration(migrationOpts));
-    assert.eq(stateRes.state, TenantMigrationTest.State.kAborted);
+    assert.eq(stateRes.state, TenantMigrationTest.DonorState.kAborted);
     assert.eq(stateRes.abortReason.code, ErrorCodes.Unauthorized);
     tenantMigrationTest.verifyRecipientDB(
         tenantId, dbName, collName, false /* migrationCommitted */);
 })();
 
 (() => {
-    jsTest.log("Test recipient certificate without advanceClusterTime role");
+    jsTest.log("Test recipient certificate without the required privileges");
     const migrationId = UUID();
-    const tenantId = "recipientCertificateNoAdvanceClusterTimeRole";
+    const tenantId = "recipientCertificateInsufficientPrivileges";
     const migrationOpts = {
         migrationIdString: extractUUIDFromObject(migrationId),
         tenantId: tenantId,
         donorCertificateForRecipient: kDonorCertificateAndPrivateKey,
         recipientCertificateForDonor: TenantMigrationUtil.getCertificateAndPrivateKey(
-            "jstests/libs/rs1_tenant_migration_no_advance_cluster_time_role.pem"),
+            "jstests/libs/tenant_migration_recipient_insufficient_privileges.pem"),
     };
     const {dbName, collName} = makeTestNs(tenantId);
 
     tenantMigrationTest.insertDonorDB(dbName, collName);
     const stateRes = assert.commandWorked(tenantMigrationTest.runMigration(migrationOpts));
-    assert.eq(stateRes.state, TenantMigrationTest.State.kAborted);
-    assert.eq(stateRes.abortReason.code, ErrorCodes.KeyNotFound);
+    assert.eq(stateRes.state, TenantMigrationTest.DonorState.kAborted);
+    assert.eq(stateRes.abortReason.code, ErrorCodes.Unauthorized);
     tenantMigrationTest.verifyRecipientDB(
         tenantId, dbName, collName, false /* migrationCommitted */);
 })();

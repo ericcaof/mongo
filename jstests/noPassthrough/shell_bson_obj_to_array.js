@@ -1,4 +1,4 @@
-/*
+/**
  * Tests that bsonObjToArray converts BSON objects to JS arrays.
  */
 

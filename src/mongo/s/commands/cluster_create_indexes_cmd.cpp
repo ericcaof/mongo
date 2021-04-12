@@ -31,48 +31,54 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/create_indexes_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/s/cluster_ddl.h"
 #include "mongo/s/grid.h"
 
 namespace mongo {
 namespace {
 
-class CreateIndexesCmd : public ErrmsgCommandDeprecated {
-public:
-    CreateIndexesCmd() : ErrmsgCommandDeprecated("createIndexes") {}
+constexpr auto kRawFieldName = "raw"_sd;
+constexpr auto kWriteConcernErrorFieldName = "writeConcernError"_sd;
+constexpr auto kTopologyVersionFieldName = "topologyVersion"_sd;
 
-    const std::set<std::string>& apiVersions() const {
+class CreateIndexesCmd : public BasicCommandWithRequestParser<CreateIndexesCmd> {
+public:
+    using Request = CreateIndexesCommand;
+    using Reply = CreateIndexesReply;
+
+    const std::set<std::string>& apiVersions() const final {
         return kApiVersions1;
     }
 
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
         return AllowedOnSecondary::kNever;
     }
 
-    bool adminOnly() const override {
+    bool adminOnly() const final {
         return false;
     }
 
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {
-        ActionSet actions;
-        actions.addAction(ActionType::createIndex);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+                               std::vector<Privilege>* out) const final {
+        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), ActionType::createIndex));
     }
 
-    bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const final {
         return true;
     }
 
-    bool errmsgRun(OperationContext* opCtx,
-                   const std::string& dbName,
-                   const BSONObj& cmdObj,
-                   std::string& errmsg,
-                   BSONObjBuilder& output) override {
+    bool runWithRequestParser(OperationContext* opCtx,
+                              const std::string& dbName,
+                              const BSONObj& cmdObj,
+                              const RequestParser&,
+                              BSONObjBuilder& output) final {
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
         LOGV2_DEBUG(22750,
                     1,
@@ -81,7 +87,7 @@ public:
                     "namespace"_attr = nss,
                     "command"_attr = redact(cmdObj));
 
-        createShardDatabase(opCtx, dbName);
+        cluster::createDatabase(opCtx, dbName);
 
         auto routingInfo =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
@@ -97,9 +103,57 @@ public:
             BSONObj() /* query */,
             BSONObj() /* collation */);
 
-        return appendRawResponses(opCtx, &errmsg, &output, std::move(shardResponses)).responseOK;
+        std::string errmsg;
+        const bool ok =
+            appendRawResponses(opCtx, &errmsg, &output, std::move(shardResponses)).responseOK;
+        if (!errmsg.empty()) {
+            CommandHelpers::appendSimpleCommandStatus(output, ok, errmsg);
+        }
+        return ok;
     }
 
+    /**
+     * Response should either be "ok" and contain just 'raw' which is a dictionary of
+     * CreateIndexesReply (with optional 'ok' and 'writeConcernError' fields).
+     * or it should be "not ok" and contain an 'errmsg' and possibly a 'writeConcernError'.
+     * 'code' & 'codeName' are permitted in either scenario, but non-zero 'code' indicates "not ok".
+     */
+    void validateResult(const BSONObj& result) final {
+        auto ctx = IDLParserErrorContext("createIndexesReply");
+        if (checkIsErrorStatus(result, ctx)) {
+            return;
+        }
+
+        StringDataSet ignorableFields({kWriteConcernErrorFieldName,
+                                       ErrorReply::kOkFieldName,
+                                       kTopologyVersionFieldName,
+                                       kRawFieldName});
+        Reply::parse(ctx, result.removeFields(ignorableFields));
+        if (!result.hasField(kRawFieldName)) {
+            return;
+        }
+
+        const auto& rawData = result[kRawFieldName];
+        if (!ctx.checkAndAssertType(rawData, Object)) {
+            return;
+        }
+
+        auto rawCtx = IDLParserErrorContext(kRawFieldName, &ctx);
+        for (const auto& element : rawData.Obj()) {
+            if (!rawCtx.checkAndAssertType(element, Object)) {
+                return;
+            }
+
+            const auto& shardReply = element.Obj();
+            if (!checkIsErrorStatus(shardReply, ctx)) {
+                Reply::parse(ctx, shardReply.removeFields(ignorableFields));
+            }
+        }
+    }
+
+    const AuthorizationContract* getAuthorizationContract() const final {
+        return &::mongo::CreateIndexesCommand::kAuthorizationContract;
+    }
 } createIndexesCmd;
 
 }  // namespace

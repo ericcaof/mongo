@@ -43,6 +43,81 @@ namespace repl {
 
 namespace {
 
+/**
+ * Returns a document representing an oplog entry with the given fields.
+ */
+BSONObj makeOplogEntryDoc(OpTime opTime,
+                          const boost::optional<int64_t> hash,
+                          OpTypeEnum opType,
+                          const NamespaceString& nss,
+                          const boost::optional<UUID>& uuid,
+                          const boost::optional<bool>& fromMigrate,
+                          int64_t version,
+                          const BSONObj& oField,
+                          const boost::optional<BSONObj>& o2Field,
+                          const OperationSessionInfo& sessionInfo,
+                          const boost::optional<bool>& isUpsert,
+                          const mongo::Date_t& wallClockTime,
+                          const std::vector<StmtId>& statementIds,
+                          const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
+                          const boost::optional<OpTime>& preImageOpTime,
+                          const boost::optional<OpTime>& postImageOpTime,
+                          const boost::optional<ShardId>& destinedRecipient,
+                          const boost::optional<Value>& idField) {
+    BSONObjBuilder builder;
+    if (idField) {
+        idField->addToBsonObj(&builder, OplogEntryBase::k_idFieldName);
+    }
+    sessionInfo.serialize(&builder);
+    builder.append(OplogEntryBase::kTimestampFieldName, opTime.getTimestamp());
+    builder.append(OplogEntryBase::kTermFieldName, opTime.getTerm());
+    builder.append(OplogEntryBase::kVersionFieldName, version);
+    builder.append(OplogEntryBase::kOpTypeFieldName, OpType_serializer(opType));
+    builder.append(OplogEntryBase::kNssFieldName, nss.toString());
+    builder.append(OplogEntryBase::kWallClockTimeFieldName, wallClockTime);
+    if (hash) {
+        builder.append(OplogEntryBase::kHashFieldName, hash.get());
+    }
+    if (uuid) {
+        uuid->appendToBuilder(&builder, OplogEntryBase::kUuidFieldName);
+    }
+    if (fromMigrate) {
+        builder.append(OplogEntryBase::kFromMigrateFieldName, fromMigrate.get());
+    }
+    builder.append(OplogEntryBase::kObjectFieldName, oField);
+    if (o2Field) {
+        builder.append(OplogEntryBase::kObject2FieldName, o2Field.get());
+    }
+    if (isUpsert) {
+        invariant(o2Field);
+        builder.append(OplogEntryBase::kUpsertFieldName, isUpsert.get());
+    }
+    if (statementIds.size() == 1) {
+        builder.append(OplogEntryBase::kStatementIdsFieldName, statementIds.front());
+    } else if (!statementIds.empty()) {
+        builder.append(OplogEntryBase::kStatementIdsFieldName, statementIds);
+    }
+    if (prevWriteOpTimeInTransaction) {
+        const BSONObj localObject = prevWriteOpTimeInTransaction.get().toBSON();
+        builder.append(OplogEntryBase::kPrevWriteOpTimeInTransactionFieldName, localObject);
+    }
+    if (preImageOpTime) {
+        const BSONObj localObject = preImageOpTime.get().toBSON();
+        builder.append(OplogEntryBase::kPreImageOpTimeFieldName, localObject);
+    }
+    if (postImageOpTime) {
+        const BSONObj localObject = postImageOpTime.get().toBSON();
+        builder.append(OplogEntryBase::kPostImageOpTimeFieldName, localObject);
+    }
+    if (destinedRecipient) {
+        builder.append(OplogEntryBase::kDestinedRecipientFieldName,
+                       destinedRecipient.get().toString());
+    }
+    return builder.obj();
+}
+
+}  // namespace
+
 DurableOplogEntry::CommandType parseCommandType(const BSONObj& objectField) {
     StringData commandString(objectField.firstElementFieldName());
     if (commandString == "create") {
@@ -86,79 +161,6 @@ DurableOplogEntry::CommandType parseCommandType(const BSONObj& objectField) {
     }
     MONGO_UNREACHABLE;
 }
-
-/**
- * Returns a document representing an oplog entry with the given fields.
- */
-BSONObj makeOplogEntryDoc(OpTime opTime,
-                          const boost::optional<int64_t> hash,
-                          OpTypeEnum opType,
-                          const NamespaceString& nss,
-                          const boost::optional<UUID>& uuid,
-                          const boost::optional<bool>& fromMigrate,
-                          int64_t version,
-                          const BSONObj& oField,
-                          const boost::optional<BSONObj>& o2Field,
-                          const OperationSessionInfo& sessionInfo,
-                          const boost::optional<bool>& isUpsert,
-                          const mongo::Date_t& wallClockTime,
-                          const boost::optional<StmtId>& statementId,
-                          const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
-                          const boost::optional<OpTime>& preImageOpTime,
-                          const boost::optional<OpTime>& postImageOpTime,
-                          const boost::optional<ShardId>& destinedRecipient,
-                          const boost::optional<Value>& idField) {
-    BSONObjBuilder builder;
-    if (idField) {
-        idField->addToBsonObj(&builder, OplogEntryBase::k_idFieldName);
-    }
-    sessionInfo.serialize(&builder);
-    builder.append(OplogEntryBase::kTimestampFieldName, opTime.getTimestamp());
-    builder.append(OplogEntryBase::kTermFieldName, opTime.getTerm());
-    builder.append(OplogEntryBase::kVersionFieldName, version);
-    builder.append(OplogEntryBase::kOpTypeFieldName, OpType_serializer(opType));
-    builder.append(OplogEntryBase::kNssFieldName, nss.toString());
-    builder.append(OplogEntryBase::kWallClockTimeFieldName, wallClockTime);
-    if (hash) {
-        builder.append(OplogEntryBase::kHashFieldName, hash.get());
-    }
-    if (uuid) {
-        uuid->appendToBuilder(&builder, OplogEntryBase::kUuidFieldName);
-    }
-    if (fromMigrate) {
-        builder.append(OplogEntryBase::kFromMigrateFieldName, fromMigrate.get());
-    }
-    builder.append(OplogEntryBase::kObjectFieldName, oField);
-    if (o2Field) {
-        builder.append(OplogEntryBase::kObject2FieldName, o2Field.get());
-    }
-    if (isUpsert) {
-        invariant(o2Field);
-        builder.append(OplogEntryBase::kUpsertFieldName, isUpsert.get());
-    }
-    if (statementId) {
-        builder.append(OplogEntryBase::kStatementIdFieldName, statementId.get());
-    }
-    if (prevWriteOpTimeInTransaction) {
-        const BSONObj localObject = prevWriteOpTimeInTransaction.get().toBSON();
-        builder.append(OplogEntryBase::kPrevWriteOpTimeInTransactionFieldName, localObject);
-    }
-    if (preImageOpTime) {
-        const BSONObj localObject = preImageOpTime.get().toBSON();
-        builder.append(OplogEntryBase::kPreImageOpTimeFieldName, localObject);
-    }
-    if (postImageOpTime) {
-        const BSONObj localObject = postImageOpTime.get().toBSON();
-        builder.append(OplogEntryBase::kPostImageOpTimeFieldName, localObject);
-    }
-    if (destinedRecipient) {
-        builder.append(OplogEntryBase::kDestinedRecipientFieldName,
-                       destinedRecipient.get().toString());
-    }
-    return builder.obj();
-}
-
-}  // namespace
 
 // Static
 ReplOperation MutableOplogEntry::makeInsertOperation(const NamespaceString& nss,
@@ -312,7 +314,7 @@ DurableOplogEntry::DurableOplogEntry(OpTime opTime,
                                      const OperationSessionInfo& sessionInfo,
                                      const boost::optional<bool>& isUpsert,
                                      const mongo::Date_t& wallClockTime,
-                                     const boost::optional<StmtId>& statementId,
+                                     const std::vector<StmtId>& statementIds,
                                      const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
                                      const boost::optional<OpTime>& preImageOpTime,
                                      const boost::optional<OpTime>& postImageOpTime,
@@ -330,7 +332,7 @@ DurableOplogEntry::DurableOplogEntry(OpTime opTime,
                                           sessionInfo,
                                           isUpsert,
                                           wallClockTime,
-                                          statementId,
+                                          statementIds,
                                           prevWriteOpTimeInTransaction,
                                           preImageOpTime,
                                           postImageOpTime,
@@ -587,8 +589,8 @@ const boost::optional<mongo::Value>& OplogEntry::get_id() const& {
     return _entry.get_id();
 }
 
-const boost::optional<std::int32_t> OplogEntry::getStatementId() const& {
-    return _entry.getStatementId();
+std::vector<StmtId> OplogEntry::getStatementIds() const& {
+    return _entry.getStatementIds();
 }
 
 const OperationSessionInfo& OplogEntry::getOperationSessionInfo() const {

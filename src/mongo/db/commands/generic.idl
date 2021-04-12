@@ -48,6 +48,7 @@ commands:
         description: "Log a message on the server"
         command_name: logMessage
         namespace: type
+        api_version: ""
         type: string
         cpp_name: LogMessageCommand
         strict: true
@@ -73,5 +74,7 @@ commands:
         command_name: ping
         strict: true
         api_version: 1
+        access_check:
+            none: true
         namespace: ignored
         reply_type: OkReply

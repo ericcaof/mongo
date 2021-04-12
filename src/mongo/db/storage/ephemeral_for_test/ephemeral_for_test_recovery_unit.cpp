@@ -34,8 +34,8 @@
 #include <mutex>
 
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/record_id_helpers.h"
 #include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_recovery_unit.h"
-#include "mongo/db/storage/oplog_hack.h"
 
 namespace mongo {
 namespace ephemeral_for_test {
@@ -77,6 +77,7 @@ void RecoveryUnit::doCommitUnitOfWork() {
         }
         _forked = false;
         _dirty = false;
+        _isTimestamped = false;
     } else if (_forked) {
         if (kDebugBuild)
             invariant(*_mergeBase == _workingCopy);
@@ -110,6 +111,7 @@ void RecoveryUnit::doAbandonSnapshot() {
     invariant(!_inUnitOfWork(), toString(_getState()));
     _forked = false;
     _dirty = false;
+    _isTimestamped = false;
     _setMergeNull();
 }
 
@@ -144,11 +146,12 @@ bool RecoveryUnit::forkIfNeeded() {
 }
 
 Status RecoveryUnit::setTimestamp(Timestamp timestamp) {
-    auto key = oploghack::keyForOptime(timestamp);
+    auto key = record_id_helpers::keyForOptime(timestamp);
     if (!key.isOK())
         return key.getStatus();
 
     _KVEngine->visibilityManager()->reserveRecord(this, key.getValue());
+    _isTimestamped = true;
     return Status::OK();
 }
 
@@ -157,6 +160,7 @@ void RecoveryUnit::setOrderedCommit(bool orderedCommit) {}
 void RecoveryUnit::_abort() {
     _forked = false;
     _dirty = false;
+    _isTimestamped = false;
     _setMergeNull();
     _setState(State::kAborting);
     abortRegisteredChanges();

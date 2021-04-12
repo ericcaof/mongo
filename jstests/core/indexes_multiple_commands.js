@@ -2,7 +2,6 @@
 // expected.
 // @tags: [
 //   assumes_no_implicit_collection_creation_after_drop,
-//   sbe_incompatible,
 // ]
 
 // Test that commands behave correctly under the presence of multiple indexes with the same key
@@ -95,8 +94,8 @@ assertIndexesCreated(
         {a: 1}, {name: "fr1_sparse", collation: {locale: "fr", strength: 1}, sparse: true}));
 
 // The requested index already exists, but with different options, so the command fails.
-assert.commandFailed(
-    coll.createIndex({a: 1}, {name: "fr_sparse", collation: {locale: "fr"}, sparse: true}));
+assert.commandFailed(coll.createIndex(
+    {a: 1}, {name: "fr_expire", collation: {locale: "fr"}, expireAfterSeconds: 3600}));
 
 coll.drop();
 assert.commandWorked(db.createCollection(coll.getName()));

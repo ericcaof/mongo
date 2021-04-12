@@ -3,8 +3,8 @@
  * the node in an inconsistent state.
  *
  * @tags: [
- *   requires_replication,
  *   live_record_incompatible,
+ *   requires_replication,
  * ]
  */
 (function() {

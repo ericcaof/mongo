@@ -63,7 +63,10 @@ public:
         return {};
     }
     std::unique_ptr<SortedDataInterface> getSortedDataInterface(
-        OperationContext* opCtx, StringData ident, const IndexDescriptor* desc) override {
+        OperationContext* opCtx,
+        const CollectionOptions& collOptions,
+        StringData ident,
+        const IndexDescriptor* desc) override {
         return nullptr;
     }
     Status createRecordStore(OperationContext* opCtx,
@@ -82,7 +85,7 @@ public:
                                      const IndexDescriptor* desc) override {
         return Status::OK();
     }
-    Status dropGroupedSortedDataInterface(OperationContext* opCtx, StringData ident) override {
+    Status dropSortedDataInterface(OperationContext* opCtx, StringData ident) override {
         return Status::OK();
     }
     int64_t getIdentSize(OperationContext* opCtx, StringData ident) override {

@@ -30,6 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/audit.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/rpc/metadata/client_metadata.h"
@@ -72,12 +73,14 @@ public:
         auto metaElem = cmdObj[kMetadataDocumentName];
         ClientMetadata::setFromMetadata(opCtx->getClient(), metaElem);
         ClientMetadata::tryFinalize(opCtx->getClient());
+        audit::logClientMetadata(opCtx->getClient());
 
         result.appendBool("ismaster", true);
 
         result.appendNumber("maxBsonObjectSize", BSONObjMaxUserSize);
-        result.appendNumber("maxMessageSizeBytes", MaxMessageSizeBytes);
-        result.appendNumber("maxWriteBatchSize", write_ops::kMaxWriteBatchSize);
+        result.appendNumber("maxMessageSizeBytes", static_cast<long long>(MaxMessageSizeBytes));
+        result.appendNumber("maxWriteBatchSize",
+                            static_cast<long long>(write_ops::kMaxWriteBatchSize));
         result.appendDate("localTime", jsTime());
         result.append("logicalSessionTimeoutMinutes", localLogicalSessionTimeoutMinutes);
         result.appendNumber("connectionId", opCtx->getClient()->getConnectionId());

@@ -8,7 +8,7 @@
  * In this file, we test calling "dropIndexes" with a simple index name whose index build is
  * in-progress.
  * @tags: [
- *     requires_replication,
+ *   requires_replication,
  * ]
  */
 (function() {

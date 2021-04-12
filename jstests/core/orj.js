@@ -1,7 +1,4 @@
 // Test nested $or clauses SERVER-2585 SERVER-3192
-// @tags: [
-//   sbe_incompatible,
-// ]
 
 t = db.jstests_orj;
 t.drop();

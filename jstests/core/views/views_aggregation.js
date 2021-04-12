@@ -3,11 +3,10 @@
  *
  * @tags: [
  *   does_not_support_stepdowns,
+ *   does_not_support_transactions,
  *   requires_find_command,
  *   requires_getmore,
  *   requires_non_retryable_commands,
- *   sbe_incompatible,
- *   uses_$out,
  * ]
  */
 (function() {

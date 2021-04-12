@@ -27,9 +27,9 @@ for (let i = 0; i < nDocs; i++) {
 
 // Test that an error is returned if queryExecStats is not an object.
 let pipeline = [{$collStats: {queryExecStats: 1}}];
-assertErrorCode(coll, pipeline, 31141, "queryExecStats spec must be an object");
+assertErrorCode(coll, pipeline, ErrorCodes.TypeMismatch, "queryExecStats spec must be an object");
 pipeline = [{$collStats: {queryExecStats: "1"}}];
-assertErrorCode(coll, pipeline, 31141, "queryExecStats spec must be an object");
+assertErrorCode(coll, pipeline, ErrorCodes.TypeMismatch, "queryExecStats spec must be an object");
 
 // Test the accuracy of the result of queryExecStats as a standalone option.
 pipeline = [{$collStats: {queryExecStats: {}}}];
@@ -69,12 +69,6 @@ pipeline = [{$collStats: {queryExecStats: {}}}];
 assertErrorCode(coll, pipeline, ErrorCodes.NamespaceNotFound);
 
 // Test that we error when the database does not exist.
-// TODO SERVER-53083 When running against a mongos, a non-existent database will cause all
-// aggregations to return an empty result set.
 assert.commandWorked(testDB.dropDatabase());
-if (FixtureHelpers.isMongos(testDB)) {
-    assert.eq([], coll.aggregate(pipeline).toArray());
-} else {
-    assertErrorCode(coll, pipeline, ErrorCodes.NamespaceNotFound);
-}
+assertErrorCode(coll, pipeline, ErrorCodes.NamespaceNotFound);
 }());

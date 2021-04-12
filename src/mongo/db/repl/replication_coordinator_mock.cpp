@@ -38,6 +38,7 @@
 #include "mongo/db/repl/isself.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/sync_source_resolver.h"
+#include "mongo/db/repl/tenant_migration_decoration.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/util/assert_util.h"
 
@@ -170,6 +171,11 @@ void ReplicationCoordinatorMock::setAwaitReplicationReturnValueFunction(
     _awaitReplicationReturnValueFunction = std::move(returnValueFunction);
 }
 
+SharedSemiFuture<void> ReplicationCoordinatorMock::awaitReplicationAsyncNoWTimeout(
+    const OpTime& opTime, const WriteConcernOptions& writeConcern) {
+    MONGO_UNREACHABLE;
+}
+
 void ReplicationCoordinatorMock::stepDown(OperationContext* opCtx,
                                           bool force,
                                           const Milliseconds& waitTime,
@@ -224,7 +230,7 @@ Status ReplicationCoordinatorMock::checkCanServeReadsFor_UNSAFE(OperationContext
 
 bool ReplicationCoordinatorMock::shouldRelaxIndexConstraints(OperationContext* opCtx,
                                                              const NamespaceString& ns) {
-    return !canAcceptWritesFor(opCtx, ns);
+    return (!canAcceptWritesFor(opCtx, ns) || tenantMigrationRecipientInfo(opCtx));
 }
 
 void ReplicationCoordinatorMock::setMyHeartbeatMessage(const std::string& msg) {
@@ -428,6 +434,11 @@ Status ReplicationCoordinatorMock::processReplSetReconfig(OperationContext* opCt
 Status ReplicationCoordinatorMock::doReplSetReconfig(OperationContext* opCtx,
                                                      GetNewConfigFn getNewConfig,
                                                      bool force) {
+    return Status::OK();
+}
+
+Status ReplicationCoordinatorMock::doOptimizedReconfig(OperationContext* opCtx,
+                                                       GetNewConfigFn getNewConfig) {
     return Status::OK();
 }
 

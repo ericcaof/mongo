@@ -111,6 +111,15 @@ DbResponse ClusterCommandTestFixture::runCommand(BSONObj cmd) {
     auto client = getServiceContext()->makeClient("ClusterCmdClient");
     auto opCtx = client->makeOperationContext();
 
+    {
+        // Have the new client use the dedicated threading model. This ensures the synchronous
+        // execution of the command by the client thread.
+        stdx::lock_guard lk(*client.get());
+        auto seCtx = transport::ServiceExecutorContext{};
+        seCtx.setThreadingModel(transport::ServiceExecutor::ThreadingModel::kDedicated);
+        transport::ServiceExecutorContext::set(client.get(), std::move(seCtx));
+    }
+
     const auto opMsgRequest = OpMsgRequest::fromDBAndBody(kNss.db(), cmd);
 
     // Ensure the clusterGLE on the Client has not yet been initialized.
@@ -127,10 +136,10 @@ DbResponse ClusterCommandTestFixture::runCommand(BSONObj cmd) {
     return Strategy::clientCommand(std::move(rec)).get();
 }
 
-void ClusterCommandTestFixture::runCommandSuccessful(BSONObj cmd, bool isTargeted) {
+DbResponse ClusterCommandTestFixture::runCommandSuccessful(BSONObj cmd, bool isTargeted) {
     auto future = launchAsync([&] {
         // Shouldn't throw.
-        runCommand(cmd);
+        return runCommand(cmd);
     });
 
     size_t numMocks = isTargeted ? 1 : numShards;
@@ -138,7 +147,7 @@ void ClusterCommandTestFixture::runCommandSuccessful(BSONObj cmd, bool isTargete
         expectReturnsSuccess(i % numShards);
     }
 
-    future.default_timed_get();
+    return future.default_timed_get();
 }
 
 void ClusterCommandTestFixture::runTxnCommandOneError(BSONObj cmd,

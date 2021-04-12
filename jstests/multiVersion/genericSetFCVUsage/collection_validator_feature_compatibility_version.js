@@ -12,18 +12,30 @@
 const testName = "collection_validator_feature_compatibility_version";
 const dbpath = MongoRunner.dataPath + testName;
 
-// The 'testCases' array should be populated with
+// An array of feature flags that must be enabled to run feature flag tests.
+const featureFlagsToEnable = [];
+
+// These arrays should be populated with
 //
 //      { validator: { ... }, nonMatchingDocument: { ... }, lastStableErrCode }
 //
-// objects that use query features new in the latest version of mongod. Note that this also
+// objects that use query features in new versions of mongod. Note that this also
 // includes new aggregation expressions able to be used with the $expr match expression. This
 // test ensures that a collection validator accepts the new query feature when the feature
 // compatibility version is the latest version, and rejects it when the feature compatibility
 // version is the last version.
 // The 'lastStableErrCode' field indicates what error the last version would throw when
 // parsing the validator.
-const testCases = [
+const testCasesLastContinuous = [
+    //
+    // Populate with any new expressions.
+    //
+];
+const testCasesLastContinuousWithFeatureFlags = [];
+
+const testCasesLastStable = testCasesLastContinuous.concat([
+    // These expressions were introduced in 4.9.
+    // TODO SERVER-53028: Remove these cases when 5.0 becomes lastLTS.
     {
         validator: {
             $expr: {
@@ -72,16 +84,45 @@ const testCases = [
         nonMatchingDocument: {a: 1},
         lastStableErrCode: 168
     },
-];
+    {
+        validator: {
+            $expr: {
+                $eq: [
+                    {$dateTrunc: {date: new Date("2020-02-02T02:02:02"), unit: "hour"}},
+                    new Date("2020-02-02T02:02:02")
+                ]
+            }
+        },
+        nonMatchingDocument: {a: 1},
+        lastStableErrCode: 168
+    },
+]);
+const testCasesLastStableWithFeatureFlags = testCasesLastContinuousWithFeatureFlags.concat([]);
 
 // Tests Feature Compatibility Version behavior of the validator of a collection by executing test
 // cases 'testCases' and using a previous stable version 'lastVersion' of mongod. 'lastVersion' can
 // have values "last-lts" and "last-continuous".
-function testCollectionValidatorFCVBehavior(lastVersion) {
+function testCollectionValidatorFCVBehavior(lastVersion, testCases, featureFlags = []) {
+    if (testCases.length === 0) {
+        jsTestLog("Skipping setup for tests against " + lastVersion + " since there are none");
+        return;
+    }
+
     let conn = MongoRunner.runMongod({dbpath: dbpath, binVersion: "latest"});
     assert.neq(null, conn, "mongod was unable to start up");
 
     let testDB = conn.getDB(testName);
+    for (let i = 0; i < featureFlags.length; i++) {
+        const command = {"getParameter": 1};
+        command[featureFlags[i]] = 1;
+        const featureEnabled =
+            assert.commandWorked(testDB.adminCommand(command))[featureFlags[i]].value;
+        if (!featureEnabled) {
+            jsTestLog("Skipping test because the " + featureFlags[i] + " feature flag is disabled");
+            MongoRunner.stopMongod(conn);
+            return;
+        }
+    }
 
     let adminDB = conn.getDB("admin");
 
@@ -270,7 +311,11 @@ function testCollectionValidatorFCVBehavior(lastVersion) {
 
     MongoRunner.stopMongod(conn);
 }
-for (const version of ["last-lts", "last-continuous"]) {
-    testCollectionValidatorFCVBehavior(version);
-}
+
+testCollectionValidatorFCVBehavior("last-lts", testCasesLastStable);
+testCollectionValidatorFCVBehavior(
+    "last-lts", testCasesLastStableWithFeatureFlags, featureFlagsToEnable);
+testCollectionValidatorFCVBehavior("last-continuous", testCasesLastContinuous);
+testCollectionValidatorFCVBehavior(
+    "last-continuous", testCasesLastContinuousWithFeatureFlags, featureFlagsToEnable);
 }());

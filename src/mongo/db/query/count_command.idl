@@ -58,9 +58,10 @@ commands:
     count:
         description: "Parser for the 'count' command."
         command_name: count
-        cpp_name: CountCommand
+        cpp_name: CountCommandRequest
         strict: true
         namespace: concatenate_with_db_or_uuid
+        api_version: ""
         fields:
             query:
                 description: "A query that selects which documents to count in the collection or

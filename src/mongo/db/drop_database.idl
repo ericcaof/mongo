@@ -30,21 +30,8 @@ global:
     cpp_namespace: "mongo"
 
 imports:
+    - "mongo/db/auth/action_type.idl"
     - "mongo/idl/basic_types.idl"
-
-structs:
-    DropDatabaseReply:
-        description: "The dropDatabase command's reply"
-        strict: false
-        fields:
-            dropped:
-                description: "The database's name, if it existed and was dropped"
-                type: string
-                optional: true
-            info:
-                description: "May provide information on dropDatabase's outcome"
-                type: string
-                optional: true
 
 commands:
     dropDatabase:
@@ -55,4 +42,9 @@ commands:
         cpp_name: DropDatabase
         strict: true
         api_version: "1"
-        reply_type: DropDatabaseReply
+        access_check:
+            simple:
+                privilege:
+                    resource_pattern: exact_namespace
+                    action_type: dropDatabase
+        reply_type: OkReply

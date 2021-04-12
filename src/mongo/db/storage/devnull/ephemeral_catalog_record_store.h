@@ -52,11 +52,13 @@ public:
                                          StringData identName,
                                          std::shared_ptr<void>* dataInOut,
                                          bool isCapped = false,
-                                         int64_t cappedMaxSize = -1,
-                                         int64_t cappedMaxDocs = -1,
                                          CappedCallback* cappedCallback = nullptr);
 
     virtual const char* name() const;
+
+    virtual KeyFormat keyFormat() const {
+        return KeyFormat::Long;
+    }
 
     virtual RecordData dataFor(OperationContext* opCtx, const RecordId& loc) const;
 
@@ -90,7 +92,7 @@ public:
 
     virtual void appendCustomStats(OperationContext* opCtx,
                                    BSONObjBuilder* result,
-                                   double scale) const;
+                                   double scale) const {}
 
     virtual int64_t storageSize(OperationContext* opCtx,
                                 BSONObjBuilder* extraInfo = nullptr,
@@ -103,9 +105,6 @@ public:
     virtual long long numRecords(OperationContext* opCtx) const {
         return _data->records.size();
     }
-
-    virtual boost::optional<RecordId> oplogStartHack(OperationContext* opCtx,
-                                                     const RecordId& startingPosition) const;
 
     void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) const override {}
 
@@ -158,14 +157,9 @@ private:
     StatusWith<RecordId> extractAndCheckLocForOplog(WithLock, const char* data, int len) const;
 
     RecordId allocateLoc(WithLock);
-    bool cappedAndNeedDelete(WithLock, OperationContext* opCtx) const;
-    void cappedDeleteAsNeeded(WithLock lk, OperationContext* opCtx);
     void deleteRecord(WithLock lk, OperationContext* opCtx, const RecordId& dl);
 
-    // TODO figure out a proper solution to metadata
     const bool _isCapped;
-    const int64_t _cappedMaxSize;
-    const int64_t _cappedMaxDocs;
     CappedCallback* _cappedCallback;
 
     // This is the "persistent" data.

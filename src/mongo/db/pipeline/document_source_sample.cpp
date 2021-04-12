@@ -48,7 +48,8 @@ DocumentSourceSample::DocumentSourceSample(const intrusive_ptr<ExpressionContext
 
 REGISTER_DOCUMENT_SOURCE(sample,
                          LiteParsedDocumentSourceDefault::parse,
-                         DocumentSourceSample::createFromBson);
+                         DocumentSourceSample::createFromBson,
+                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
 
 DocumentSource::GetNextResult DocumentSourceSample::doGetNext() {
     if (_size == 0)
@@ -117,7 +118,7 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceSample::create(
 
     intrusive_ptr<DocumentSourceSample> sample(new DocumentSourceSample(expCtx));
     sample->_size = size;
-    sample->_sortStage = DocumentSourceSort::create(expCtx, randSortSpec, sample->_size);
+    sample->_sortStage = DocumentSourceSort::create(expCtx, {randSortSpec, expCtx}, sample->_size);
     return sample;
 }
 

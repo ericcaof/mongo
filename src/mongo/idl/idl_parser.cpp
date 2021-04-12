@@ -110,12 +110,7 @@ bool IDLParserErrorContext::checkAndAssertTypes(const BSONElement& element,
             return false;
         }
 
-        std::string path = getElementPath(element);
-        std::string type_str = toCommaDelimitedList(types);
-        uasserted(ErrorCodes::TypeMismatch,
-                  str::stream() << "BSON field '" << path << "' is the wrong type '"
-                                << typeName(element.type()) << "', expected types '[" << type_str
-                                << "']");
+        throwBadType(element, types);
     }
 
     return true;
@@ -223,6 +218,16 @@ void IDLParserErrorContext::throwBadEnumValue(StringData enumValue) const {
     uasserted(ErrorCodes::BadValue,
               str::stream() << "Enumeration value '" << enumValue << "' for field '" << path
                             << "' is not a valid value.");
+}
+
+void IDLParserErrorContext::throwBadType(const BSONElement& element,
+                                         const std::vector<BSONType>& types) const {
+    std::string path = getElementPath(element);
+    std::string type_str = toCommaDelimitedList(types);
+    uasserted(ErrorCodes::TypeMismatch,
+              str::stream() << "BSON field '" << path << "' is the wrong type '"
+                            << typeName(element.type()) << "', expected types '[" << type_str
+                            << "']");
 }
 
 void IDLParserErrorContext::throwAPIStrictErrorIfApplicable(BSONElement field) const {
@@ -336,14 +341,26 @@ std::vector<std::vector<std::uint8_t>> transformVector(const std::vector<ConstDa
     return output;
 }
 
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
 void noOpSerializer(bool, StringData fieldName, BSONObjBuilder* bob) {}
 
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
 void serializeBSONWhenNotEmpty(BSONObj obj, StringData fieldName, BSONObjBuilder* bob) {
     if (!obj.isEmpty()) {
         bob->append(fieldName, obj);
     }
 }
 
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
 BSONObj parseOwnedBSON(BSONElement element) {
     uassert(ErrorCodes::TypeMismatch,
             str::stream() << "Expected field " << element.fieldNameStringData()
@@ -352,6 +369,10 @@ BSONObj parseOwnedBSON(BSONElement element) {
     return element.Obj().getOwned();
 }
 
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
 bool parseBoolean(BSONElement element) {
     uassert(ErrorCodes::TypeMismatch,
             str::stream() << "Expected field " << element.fieldNameStringData()

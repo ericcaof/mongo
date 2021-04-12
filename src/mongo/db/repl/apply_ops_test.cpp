@@ -130,7 +130,7 @@ Status getStatusFromApplyOpsResult(const BSONObj& result) {
     BSONObjBuilder builder;
     builder.appendElements(result);
     auto code = result.getIntField("code");
-    builder.appendIntOrLL("ok", code == 0);
+    builder.appendNumber("ok", code == 0);
     auto newResult = builder.obj();
     return getStatusFromCommandResult(newResult);
 }
@@ -349,7 +349,7 @@ OplogEntry makeOplogEntry(OpTypeEnum opType, const BSONObj& oField) {
                               {},                          // sessionInfo
                               boost::none,                 // upsert
                               Date_t(),                    // wall clock time
-                              boost::none,                 // statement id
+                              {},                          // statement ids
                               boost::none,    // optime of previous write within same transaction
                               boost::none,    // pre-image optime
                               boost::none,    // post-image optime

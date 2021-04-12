@@ -243,7 +243,7 @@ server_parameters:
             lte:
                 expr: 100 * 1024 * 1024
 
-    # From tenant_oplog_applier.cpp    
+    # From tenant_oplog_applier.cpp
     tenantApplierBatchSizeBytes:
         description: The maximum tenant oplog applier batch size in bytes.
         set_at: [startup, runtime]
@@ -267,7 +267,7 @@ server_parameters:
             gte: 1
             lte:
                 expr: 100 * 1000
-    
+
     minOplogEntriesPerThread:
         description: >-
             The minimum number of operations allotted to a tenant oplog applier worker thread.
@@ -380,7 +380,18 @@ server_parameters:
         cpp_vartype: AtomicWord<int>
         cpp_varname: tenantMigrationGarbageCollectionDelayMS
         default:
-            expr: 48 * 60 * 60 * 1000
+            expr: 15 * 60 * 1000
+
+    tenantMigrationExternalKeysRemovalBufferSecs:
+        description: >-
+            The amount of time in seconds that the donor or recipient should wait before
+            removing the cluster time keys cloned from each other after receiving
+            donorForgetMigration or recipientForgetMigration
+        set_at: [ startup, runtime ]
+        cpp_vartype: AtomicWord<int>
+        cpp_varname: tenantMigrationExternalKeysRemovalBufferSecs
+        default:
+            expr: 60 * 60 * 24   # 24 hours
 
     tenantMigrationOplogBufferPeekCacheSize:
         description: >-
@@ -390,7 +401,7 @@ server_parameters:
         cpp_vartype: int
         cpp_varname: tenantMigrationOplogBufferPeekCacheSize
         default: 10000
-            
+
     tenantMigrationOplogFetcherBatchSize:
         description: >-
             The batchSize to use for the find/getMore queries called by the OplogFetcher for
@@ -402,24 +413,32 @@ server_parameters:
         #     defaultBatchSize to use.
         default:
             expr: (16 * 1024 * 1024) / 12 * 10
-    
+
     maxTenantMigrationRecipientThreadPoolSize:
         description: >-
             The maximum number of threads in the tenant migration recipient's thread pool.
         set_at: startup
         cpp_vartype: int
         cpp_varname: maxTenantMigrationRecipientThreadPoolSize
-        default: 8
+        # Each migration needs at least 2 dedicated threads for oplog fetching and data cloning plus
+        # 1 thread for other async jobs. To support 50 concurrent migrations on the recipient, we
+        # set the thread pool size to 128.
+        default: 128
         validator:
             gte: 1
 
-    maxTenantMigrationDonorThreadPoolSize:
+    maxTenantMigrationDonorServiceThreadPoolSize:
         description: >-
-            The maximum number of threads in the tenant migration donor's thread pool.
+            The maximum number of threads in the tenant migration donor service's thread pool.
         set_at: startup
         cpp_vartype: int
-        cpp_varname: maxTenantMigrationDonorThreadPoolSize
-        default: 8
+        cpp_varname: maxTenantMigrationDonorServiceThreadPoolSize
+        # Currently, the donor service blocks a service thread when loading cluster time keys from
+        # the recipient. The number of keys to copy is small so the blocking should be short, but
+        # to guarantee 50 concurrent migrations are supported, we set the thread pool size to 50.
+        #
+        # TODO SERVER-54208: Lower this value when loading keys is asynchronous.
+        default: 50
         validator:
             gte: 1
 
@@ -434,9 +453,43 @@ server_parameters:
         validator:
             gte: 1
 
+    # TODO (SERVER-54085): Remove server parameter tenantMigrationDisableX509Auth.
+    tenantMigrationDisableX509Auth:
+        description: >-
+            Disable x509 authentication for all ingoing and outgoing tenant migrations.
+        set_at: [ startup ]
+        cpp_vartype: bool
+        cpp_varname: tenantMigrationDisableX509Auth
+        default: false
+
+    tenantMigrationExcludeDonorHostTimeoutMS:
+        description: >-
+            Period of time, in milliseconds, that a donor host should be excluded for.
+        set_at: startup
+        cpp_vartype: int
+        cpp_varname: tenantMigrationExcludeDonorHostTimeoutMS
+        default: 60000
+        validator:
+            gte: 1
+
 feature_flags:
     featureFlagTenantMigrations:
         description: >-
             When enabled, tenant migration commands are supported.
         cpp_varname: feature_flags::gTenantMigrations
+        default: false
+
+    # TODO (SERVER-54730): Remove featureFlagUseSecondaryDelaySecs.
+    featureFlagUseSecondaryDelaySecs:
+        description: >-
+            If enabled, use field secondaryDelaySecs instead of slaveDelay in MemberConfig.
+        cpp_varname: feature_flags::gUseSecondaryDelaySecs
+        default: true
+        version: 4.9
+
+    featureFlagDefaultWriteConcernMajority:
+        description: >-
+            When enabled, default write concern might be set to majority following the default write
+            concern formula if there is no cluster wide write concern (CWWC).
+        cpp_varname: feature_flags::gDefaultWCMajority
         default: false

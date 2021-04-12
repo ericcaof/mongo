@@ -30,19 +30,18 @@
 #pragma once
 
 #include <memory>
-#include <string>
 #include <vector>
 
 #include "mongo/base/status.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_contract.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/authz_session_external_state.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/auth/user_set.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/pipeline/aggregate_command_gen.h"
 
 namespace mongo {
 
@@ -76,9 +75,13 @@ public:
 
     void startRequest(OperationContext* opCtx) override;
 
+    void startContractTracking() override;
+
     Status addAndAuthorizeUser(OperationContext* opCtx, const UserName& userName) override;
 
     User* lookupUser(const UserName& name) override;
+
+    bool shouldIgnoreAuthChecks() override;
 
     bool isAuthenticated() override;
 
@@ -88,69 +91,25 @@ public:
 
     RoleNameIterator getAuthenticatedRoleNames() override;
 
-    void logoutDatabase(OperationContext* opCtx, StringData dbname) override;
+    void logoutAllDatabases(Client* client, StringData reason) override;
+    void logoutDatabase(Client* client, StringData dbname, StringData reason) override;
 
     void grantInternalAuthorization(Client* client) override;
 
     void grantInternalAuthorization(OperationContext* opCtx) override;
 
-    PrivilegeVector getDefaultPrivileges() override;
-
-    Status checkAuthForFind(const NamespaceString& ns, bool hasTerm) override;
-
-    Status checkAuthForGetMore(const NamespaceString& ns,
-                               long long cursorID,
-                               bool hasTerm) override;
-
-    Status checkAuthForUpdate(OperationContext* opCtx,
-                              const NamespaceString& ns,
-                              const BSONObj& query,
-                              const write_ops::UpdateModification& update,
-                              bool upsert) override;
-
-    Status checkAuthForInsert(OperationContext* opCtx, const NamespaceString& ns) override;
-
-    Status checkAuthForDelete(OperationContext* opCtx,
-                              const NamespaceString& ns,
-                              const BSONObj& query) override;
-
-    Status checkAuthForKillCursors(const NamespaceString& cursorNss,
-                                   UserNameIterator cursorOwner) override;
-
-    StatusWith<PrivilegeVector> getPrivilegesForAggregate(const NamespaceString& ns,
-                                                          const AggregateCommand& request,
-                                                          bool isMongos) override;
-
-    Status checkAuthForCreate(const NamespaceString& ns,
-                              const BSONObj& cmdObj,
-                              bool isMongos) override;
-
-    Status checkAuthForCollMod(const NamespaceString& ns,
-                               const BSONObj& cmdObj,
-                               bool isMongos) override;
-
     StatusWith<PrivilegeVector> checkAuthorizedToListCollections(StringData dbname,
                                                                  const BSONObj& cmdObj) override;
-
-    Status checkAuthorizedToGrantPrivilege(const Privilege& privilege) override;
-
-    Status checkAuthorizedToRevokePrivilege(const Privilege& privilege) override;
 
     bool isUsingLocalhostBypass() override;
 
     bool isAuthorizedToParseNamespaceElement(const BSONElement& elem) override;
 
+    bool isAuthorizedToParseNamespaceElement(const NamespaceStringOrUUID& nss) override;
+
     bool isAuthorizedToCreateRole(const RoleName& roleName) override;
 
-    bool isAuthorizedToGrantRole(const RoleName& role) override;
-
-    bool isAuthorizedToRevokeRole(const RoleName& role) override;
-
     bool isAuthorizedToChangeAsUser(const UserName& userName, ActionType actionType) override;
-
-    bool isAuthorizedToChangeOwnPasswordAsUser(const UserName& userName) override;
-
-    bool isAuthorizedToChangeOwnCustomDataAsUser(const UserName& userName) override;
 
     bool isAuthenticatedAsUserWithRole(const RoleName& roleName) override;
 
@@ -173,8 +132,8 @@ public:
 
     bool isAuthorizedForAnyActionOnResource(const ResourcePattern& resource) override;
 
-    void setImpersonatedUserData(std::vector<UserName> usernames,
-                                 std::vector<RoleName> roles) override;
+    void setImpersonatedUserData(const std::vector<UserName>& usernames,
+                                 const std::vector<RoleName>& roles) override;
 
     UserNameIterator getImpersonatedUserNames() override;
 
@@ -190,6 +149,8 @@ public:
 
     Status checkCursorSessionPrivilege(OperationContext* const opCtx,
                                        boost::optional<LogicalSessionId> cursorSessionId) override;
+
+    void verifyContract(const AuthorizationContract* contract) const override;
 
 protected:
     // Builds a vector of all roles held by users who are authenticated on this connection. The
@@ -219,6 +180,15 @@ private:
         return std::make_tuple(&_impersonatedUserNames, &_impersonatedRoleNames);
     }
 
+
+    // Generates a vector of default privileges that are granted to any user,
+    // regardless of which roles that user does or does not possess.
+    // If localhost exception is active, the permissions include the ability to create
+    // the first user and the ability to run the commands needed to bootstrap the system
+    // into a state where the first user can be created.
+    PrivilegeVector _getDefaultPrivileges();
+
+private:
     std::unique_ptr<AuthzSessionExternalState> _externalState;
 
     // A vector of impersonated UserNames and a vector of those users' RoleNames.
@@ -226,5 +196,18 @@ private:
     std::vector<UserName> _impersonatedUserNames;
     std::vector<RoleName> _impersonatedRoleNames;
     bool _impersonationFlag;
+
+    // A record of privilege checks and other authorization like function calls made on
+    // AuthorizationSession. IDL Typed Commands can optionally define a contract declaring the set
+    // of authorization checks they perform. After a command completes running, MongoDB verifies the
+    // set of checks performed is a subset of the checks declared in the contract.
+    AuthorizationContract _contract;
+
+    // Contract checking is feature guarded. As such we may decide at the start of command to not
+    // track it but reach a different decision after the command has been run because the FCV has
+    // changed. We must record our first decision.
+    //
+    // TODO SERVER-55908 - remove this variable after the feature flag is removed.
+    bool _checkContracts;
 };
 }  // namespace mongo

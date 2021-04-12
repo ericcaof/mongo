@@ -52,8 +52,8 @@ TEST_F(DispatchShardPipelineTest, DoesNotSplitPipelineIfTargetingOneShard) {
     };
     auto pipeline = Pipeline::create(
         {parseStage(stages[0]), parseStage(stages[1]), parseStage(stages[2])}, expCtx());
-    const Document serializedCommand =
-        aggregation_request_helper::serializeToCommandDoc(AggregateCommand(expCtx()->ns, stages));
+    const Document serializedCommand = aggregation_request_helper::serializeToCommandDoc(
+        AggregateCommandRequest(expCtx()->ns, stages));
     const bool hasChangeStream = false;
 
     auto future = launchAsync([&] {
@@ -83,8 +83,8 @@ TEST_F(DispatchShardPipelineTest, DoesSplitPipelineIfMatchSpansTwoShards) {
     };
     auto pipeline = Pipeline::create(
         {parseStage(stages[0]), parseStage(stages[1]), parseStage(stages[2])}, expCtx());
-    const Document serializedCommand =
-        aggregation_request_helper::serializeToCommandDoc(AggregateCommand(expCtx()->ns, stages));
+    const Document serializedCommand = aggregation_request_helper::serializeToCommandDoc(
+        AggregateCommandRequest(expCtx()->ns, stages));
     const bool hasChangeStream = false;
 
     auto future = launchAsync([&] {
@@ -117,8 +117,8 @@ TEST_F(DispatchShardPipelineTest, DispatchShardPipelineRetriesOnNetworkError) {
     };
     auto pipeline = Pipeline::create(
         {parseStage(stages[0]), parseStage(stages[1]), parseStage(stages[2])}, expCtx());
-    const Document serializedCommand =
-        aggregation_request_helper::serializeToCommandDoc(AggregateCommand(expCtx()->ns, stages));
+    const Document serializedCommand = aggregation_request_helper::serializeToCommandDoc(
+        AggregateCommandRequest(expCtx()->ns, stages));
     const bool hasChangeStream = false;
     auto future = launchAsync([&] {
         // Shouldn't throw.
@@ -162,8 +162,8 @@ TEST_F(DispatchShardPipelineTest, DispatchShardPipelineDoesNotRetryOnStaleConfig
     };
     auto pipeline = Pipeline::create(
         {parseStage(stages[0]), parseStage(stages[1]), parseStage(stages[2])}, expCtx());
-    const Document serializedCommand =
-        aggregation_request_helper::serializeToCommandDoc(AggregateCommand(expCtx()->ns, stages));
+    const Document serializedCommand = aggregation_request_helper::serializeToCommandDoc(
+        AggregateCommandRequest(expCtx()->ns, stages));
     const bool hasChangeStream = false;
     auto future = launchAsync([&] {
         ASSERT_THROWS_CODE(sharded_agg_helpers::dispatchShardPipeline(
@@ -191,8 +191,8 @@ TEST_F(DispatchShardPipelineTest, WrappedDispatchDoesRetryOnStaleConfigError) {
     };
     auto pipeline = Pipeline::create(
         {parseStage(stages[0]), parseStage(stages[1]), parseStage(stages[2])}, expCtx());
-    const Document serializedCommand =
-        aggregation_request_helper::serializeToCommandDoc(AggregateCommand(expCtx()->ns, stages));
+    const Document serializedCommand = aggregation_request_helper::serializeToCommandDoc(
+        AggregateCommandRequest(expCtx()->ns, stages));
     const bool hasChangeStream = false;
     auto future = launchAsync([&] {
         // Shouldn't throw.
@@ -220,26 +220,24 @@ TEST_F(DispatchShardPipelineTest, WrappedDispatchDoesRetryOnStaleConfigError) {
     const OID epoch = OID::gen();
     const UUID uuid = UUID::gen();
     const ShardKeyPattern shardKeyPattern(BSON("_id" << 1));
-    expectGetCollection(kTestAggregateNss, epoch, uuid, shardKeyPattern);
-    expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
-        ChunkVersion version(1, 0, epoch, boost::none /* timestamp */);
 
-        ChunkType chunk1(kTestAggregateNss,
-                         {shardKeyPattern.getKeyPattern().globalMin(), BSON("_id" << 0)},
-                         version,
-                         {"0"});
-        chunk1.setName(OID::gen());
-        version.incMinor();
+    ChunkVersion version(1, 0, epoch, boost::none /* timestamp */);
 
-        ChunkType chunk2(kTestAggregateNss,
-                         {BSON("_id" << 0), shardKeyPattern.getKeyPattern().globalMax()},
-                         version,
-                         {"1"});
-        chunk2.setName(OID::gen());
-        version.incMinor();
+    ChunkType chunk1(kTestAggregateNss,
+                     {shardKeyPattern.getKeyPattern().globalMin(), BSON("_id" << 0)},
+                     version,
+                     {"0"});
+    chunk1.setName(OID::gen());
+    version.incMinor();
 
-        return std::vector<BSONObj>{chunk1.toConfigBSON(), chunk2.toConfigBSON()};
-    }());
+    ChunkType chunk2(kTestAggregateNss,
+                     {BSON("_id" << 0), shardKeyPattern.getKeyPattern().globalMax()},
+                     version,
+                     {"1"});
+    chunk2.setName(OID::gen());
+    version.incMinor();
+    expectCollectionAndChunksAggregation(
+        kTestAggregateNss, epoch, uuid, shardKeyPattern, {chunk1, chunk2});
 
     // That error should be retried, but only the one on that shard.
     onCommand([&](const executor::RemoteCommandRequest& request) {

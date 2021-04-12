@@ -217,6 +217,13 @@ if (typeof _threadInject != "undefined") {
 
             // Other tests will fail while the requireApiVersion server parameter is set.
             "require_api_version.js",
+
+            // This test updates global memory usage counters in the bucket catalog in a way that
+            // may affect other time-series tests running concurrently.
+            "timeseries/timeseries_idle_buckets.js",
+
+            // Assumes that other tests are not creating API version 1 incompatible data.
+            "validate_db_metadata_command.js",
         ]);
 
         // Get files, including files in subdirectories.

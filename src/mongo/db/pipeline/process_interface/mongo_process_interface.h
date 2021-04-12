@@ -44,9 +44,9 @@
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/write_ops_exec.h"
-#include "mongo/db/ops/write_ops_parsers.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/pipeline/storage_stats_spec_gen.h"
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/resource_yielder.h"
@@ -199,7 +199,7 @@ public:
      */
     virtual Status appendStorageStats(OperationContext* opCtx,
                                       const NamespaceString& nss,
-                                      const BSONObj& param,
+                                      const StorageStatsSpec& spec,
                                       BSONObjBuilder* builder) const = 0;
 
     /**

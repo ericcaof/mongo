@@ -39,6 +39,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/stdx/variant.h"
 
 namespace mongo {
 
@@ -54,30 +55,49 @@ public:
 
     /**
      * Parses a string of the form "db.username" into a UserName object.
+     * Don't change the logic of this function as it will break stable API version 1.
      */
     static StatusWith<UserName> parse(StringData userNameStr);
 
-    /*
+    /**
      * These methods support parsing usernames from IDL
+     * Don't change the logic of this function as it will break stable API version 1.
      */
+    static UserName parseFromVariant(
+        const stdx::variant<std::string, mongo::BSONObj>& helloUserName);
+    static UserName parseFromBSONObj(const BSONObj& obj);
     static UserName parseFromBSON(const BSONElement& elem);
     void serializeToBSON(StringData fieldName, BSONObjBuilder* bob) const;
     void serializeToBSON(BSONArrayBuilder* bob) const;
+
+    /**
+     * Don't change the logic of this function as it will break stable API version 1.
+     */
     void appendToBSON(BSONObjBuilder* bob) const;
+
+    /**
+     * Don't change the logic of this function as it will break stable API version 1.
+     */
     BSONObj toBSON() const;
 
     /**
      * Gets the user part of a UserName.
      */
     StringData getUser() const {
-        return StringData(_fullName).substr(0, _splitPoint);
+        return StringData(_fullName.data(), _splitPoint);
     }
 
     /**
      * Gets the database name part of a UserName.
      */
     StringData getDB() const {
-        return StringData(_fullName).substr(_splitPoint + 1);
+        if (_fullName.empty()) {
+            return _fullName;
+        }
+
+        const auto offset = _splitPoint + 1;
+        invariant(offset <= _fullName.size());
+        return StringData(_fullName.data() + offset, _fullName.size() - offset);
     }
 
     /**

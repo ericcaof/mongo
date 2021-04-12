@@ -1,7 +1,10 @@
 /**
  * Tests that resizing the oplog works as expected and validates input arguments.
  *
- * @tags: [requires_replication, requires_wiredtiger]
+ * @tags: [
+ *   requires_replication,
+ *   requires_wiredtiger,
+ * ]
  */
 (function() {
 "use strict";

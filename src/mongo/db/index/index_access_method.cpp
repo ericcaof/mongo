@@ -69,10 +69,6 @@ MONGO_FAIL_POINT_DEFINE(hangIndexBuildDuringBulkLoadPhase);
 
 namespace {
 
-// Reserved RecordId against which multikey metadata keys are indexed.
-static const RecordId kMultikeyMetadataKeyId =
-    RecordId{RecordId::ReservedId::kWildcardMultikeyMetadataId};
-
 /**
  * Returns true if at least one prefix of any of the indexed fields causes the index to be
  * multikey, and returns false otherwise. This function returns false if the 'multikeyPaths'
@@ -84,11 +80,12 @@ bool isMultikeyFromPaths(const MultikeyPaths& multikeyPaths) {
                        [](const MultikeyComponents& components) { return !components.empty(); });
 }
 
-SortOptions makeSortOptions(size_t maxMemoryUsageBytes) {
+SortOptions makeSortOptions(size_t maxMemoryUsageBytes, StringData dbName) {
     return SortOptions()
         .TempDir(storageGlobalParams.dbpath + "/_tmp")
         .ExtSortAllowed()
-        .MaxMemoryUsageBytes(maxMemoryUsageBytes);
+        .MaxMemoryUsageBytes(maxMemoryUsageBytes)
+        .DBName(dbName.toString());
 }
 
 MultikeyPaths createMultikeyPaths(const std::vector<MultikeyPath>& multikeyPathsVec) {
@@ -479,20 +476,19 @@ Status AbstractIndexAccessMethod::compact(OperationContext* opCtx) {
 
 class AbstractIndexAccessMethod::BulkBuilderImpl : public IndexAccessMethod::BulkBuilder {
 public:
-    BulkBuilderImpl(IndexCatalogEntry* indexCatalogEntry, size_t maxMemoryUsageBytes);
+    BulkBuilderImpl(IndexCatalogEntry* indexCatalogEntry,
+                    size_t maxMemoryUsageBytes,
+                    StringData dbName);
 
     BulkBuilderImpl(IndexCatalogEntry* index,
                     size_t maxMemoryUsageBytes,
-                    const IndexStateInfo& stateInfo);
+                    const IndexStateInfo& stateInfo,
+                    StringData dbName);
 
     Status insert(OperationContext* opCtx,
                   const BSONObj& obj,
                   const RecordId& loc,
                   const InsertDeleteOptions& options) final;
-
-    void addToSorter(const KeyString::Value& keyString) final {
-        _sorter->add(keyString, mongo::NullValue());
-    }
 
     const MultikeyPaths& getMultikeyPaths() const final;
 
@@ -513,6 +509,7 @@ private:
 
     Sorter* _makeSorter(
         size_t maxMemoryUsageBytes,
+        StringData dbName,
         boost::optional<StringData> fileName = boost::none,
         const boost::optional<std::vector<SorterRange>>& ranges = boost::none) const;
 
@@ -536,21 +533,27 @@ private:
 };
 
 std::unique_ptr<IndexAccessMethod::BulkBuilder> AbstractIndexAccessMethod::initiateBulk(
-    size_t maxMemoryUsageBytes, const boost::optional<IndexStateInfo>& stateInfo) {
+    size_t maxMemoryUsageBytes,
+    const boost::optional<IndexStateInfo>& stateInfo,
+    StringData dbName) {
     return stateInfo
-        ? std::make_unique<BulkBuilderImpl>(_indexCatalogEntry, maxMemoryUsageBytes, *stateInfo)
-        : std::make_unique<BulkBuilderImpl>(_indexCatalogEntry, maxMemoryUsageBytes);
+        ? std::make_unique<BulkBuilderImpl>(
+              _indexCatalogEntry, maxMemoryUsageBytes, *stateInfo, dbName)
+        : std::make_unique<BulkBuilderImpl>(_indexCatalogEntry, maxMemoryUsageBytes, dbName);
 }
 
 AbstractIndexAccessMethod::BulkBuilderImpl::BulkBuilderImpl(IndexCatalogEntry* index,
-                                                            size_t maxMemoryUsageBytes)
-    : _indexCatalogEntry(index), _sorter(_makeSorter(maxMemoryUsageBytes)) {}
+                                                            size_t maxMemoryUsageBytes,
+                                                            StringData dbName)
+    : _indexCatalogEntry(index), _sorter(_makeSorter(maxMemoryUsageBytes, dbName)) {}
 
 AbstractIndexAccessMethod::BulkBuilderImpl::BulkBuilderImpl(IndexCatalogEntry* index,
                                                             size_t maxMemoryUsageBytes,
-                                                            const IndexStateInfo& stateInfo)
+                                                            const IndexStateInfo& stateInfo,
+                                                            StringData dbName)
     : _indexCatalogEntry(index),
-      _sorter(_makeSorter(maxMemoryUsageBytes, stateInfo.getFileName(), stateInfo.getRanges())),
+      _sorter(
+          _makeSorter(maxMemoryUsageBytes, dbName, stateInfo.getFileName(), stateInfo.getRanges())),
       _keysInserted(stateInfo.getNumKeys().value_or(0)),
       _isMultiKey(stateInfo.getIsMultikey()),
       _indexMultikeyPaths(createMultikeyPaths(stateInfo.getMultikeyPaths())) {}
@@ -663,14 +666,15 @@ AbstractIndexAccessMethod::BulkBuilderImpl::_makeSorterSettings() const {
 AbstractIndexAccessMethod::BulkBuilderImpl::Sorter*
 AbstractIndexAccessMethod::BulkBuilderImpl::_makeSorter(
     size_t maxMemoryUsageBytes,
+    StringData dbName,
     boost::optional<StringData> fileName,
     const boost::optional<std::vector<SorterRange>>& ranges) const {
     return fileName ? Sorter::makeFromExistingRanges(fileName->toString(),
                                                      *ranges,
-                                                     makeSortOptions(maxMemoryUsageBytes),
+                                                     makeSortOptions(maxMemoryUsageBytes, dbName),
                                                      BtreeExternalSortComparison(),
                                                      _makeSorterSettings())
-                    : Sorter::make(makeSortOptions(maxMemoryUsageBytes),
+                    : Sorter::make(makeSortOptions(maxMemoryUsageBytes, dbName),
                                    BtreeExternalSortComparison(),
                                    _makeSorterSettings());
 }
@@ -724,16 +728,17 @@ Status AbstractIndexAccessMethod::commitBulk(OperationContext* opCtx,
         // Assert that keys are retrieved from the sorter in non-decreasing order, but only in debug
         // builds since this check can be expensive.
         int cmpData;
-        if (kDebugBuild || _descriptor->unique()) {
+        if (_descriptor->unique()) {
             cmpData = data.first.compareWithoutRecordId(previousKey);
-            if (cmpData < 0) {
-                LOGV2_FATAL_NOTRACE(
-                    31171,
-                    "Expected the next key to be greater than or equal to the previous key",
-                    "nextKey"_attr = data.first.toString(),
-                    "previousKey"_attr = previousKey.toString(),
-                    "index"_attr = _descriptor->indexName());
-            }
+        }
+
+        if (kDebugBuild && data.first.compare(previousKey) < 0) {
+            LOGV2_FATAL_NOTRACE(
+                31171,
+                "Expected the next key to be greater than or equal to the previous key",
+                "nextKey"_attr = data.first.toString(),
+                "previousKey"_attr = previousKey.toString(),
+                "index"_attr = _descriptor->indexName());
         }
 
         // Before attempting to insert, perform a duplicate key check.
@@ -844,11 +849,6 @@ bool AbstractIndexAccessMethod::shouldMarkIndexAsMultikey(
     return numberOfKeys > 1 || isMultikeyFromPaths(multikeyPaths);
 }
 
-std::unique_ptr<SortedDataBuilderInterface> AbstractIndexAccessMethod::makeBulkBuilder(
-    OperationContext* opCtx, bool dupsAllowed) {
-    return _newInterface->makeBulkBuilder(opCtx, dupsAllowed);
-}
-
 SortedDataInterface* AbstractIndexAccessMethod::getSortedDataInterface() const {
     return _newInterface.get();
 }
@@ -873,7 +873,7 @@ std::string nextFileName() {
 Status AbstractIndexAccessMethod::_handleDuplicateKey(OperationContext* opCtx,
                                                       const KeyString::Value& dataKey,
                                                       const RecordIdHandlerFn& onDuplicateRecord) {
-    RecordId recordId = KeyString::decodeRecordIdAtEnd(dataKey.getBuffer(), dataKey.getSize());
+    RecordId recordId = KeyString::decodeRecordIdLongAtEnd(dataKey.getBuffer(), dataKey.getSize());
     if (onDuplicateRecord) {
         return onDuplicateRecord(recordId);
     }

@@ -1,9 +1,3 @@
-
-/**
- * @tags: [
- *   sbe_incompatible,
- * ]
- */
 t = db.regex8;
 t.drop();
 

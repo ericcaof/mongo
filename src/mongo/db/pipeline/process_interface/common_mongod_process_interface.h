@@ -36,12 +36,8 @@
 #include "mongo/db/pipeline/javascript_execution.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/process_interface/common_process_interface.h"
-#include "mongo/s/write_ops/batched_command_request.h"
 
 namespace mongo {
-
-using write_ops::Insert;
-using write_ops::Update;
 
 /**
  * Provides the implementations of interfaces that are shared across different types of mongod
@@ -67,7 +63,7 @@ public:
                             BSONObjBuilder* builder) const final;
     Status appendStorageStats(OperationContext* opCtx,
                               const NamespaceString& nss,
-                              const BSONObj& param,
+                              const StorageStatsSpec& spec,
                               BSONObjBuilder* builder) const final;
     Status appendRecordCount(OperationContext* opCtx,
                              const NamespaceString& nss,
@@ -116,18 +112,19 @@ protected:
     /**
      * Builds an ordered insert op on namespace 'nss' and documents to be written 'objs'.
      */
-    Insert buildInsertOp(const NamespaceString& nss,
-                         std::vector<BSONObj>&& objs,
-                         bool bypassDocValidation);
+    write_ops::InsertCommandRequest buildInsertOp(const NamespaceString& nss,
+                                                  std::vector<BSONObj>&& objs,
+                                                  bool bypassDocValidation);
 
     /**
      * Builds an ordered update op on namespace 'nss' with update entries contained in 'batch'.
      */
-    Update buildUpdateOp(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                         const NamespaceString& nss,
-                         BatchedObjects&& batch,
-                         UpsertType upsert,
-                         bool multi);
+    write_ops::UpdateCommandRequest buildUpdateOp(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const NamespaceString& nss,
+        BatchedObjects&& batch,
+        UpsertType upsert,
+        bool multi);
 
     BSONObj _reportCurrentOpForClient(OperationContext* opCtx,
                                       Client* client,

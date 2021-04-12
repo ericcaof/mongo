@@ -1,7 +1,5 @@
 /**
  * Tests that $match works correctly with dotted numeric path.
- *
- * @tags: [sbe_incompatible]
  */
 (function() {
 "use strict";

@@ -1,7 +1,11 @@
 /**
  *  Starts standalone RS with skipShardingConfigurationChecks.
- *  @tags: [requires_persistence, requires_replication, requires_sharding,
- * requires_majority_read_concern]
+ * @tags: [
+ *   requires_majority_read_concern,
+ *   requires_persistence,
+ *   requires_replication,
+ *   requires_sharding,
+ * ]
  */
 (function() {
 'use strict';

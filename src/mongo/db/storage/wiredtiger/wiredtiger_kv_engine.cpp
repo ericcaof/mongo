@@ -65,6 +65,7 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/global_settings.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/mongod_options_storage_gen.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
@@ -532,8 +533,13 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
             // 1) The feature stores the desired pin timestamp in some local collection.
             // 2) This temporary pinning lasts long enough for the catalog to be loaded and
             //    accessed.
-            uassertStatusOK(pinOldestTimestamp(
-                kPinOldestTimestampAtStartupName, Timestamp(_oldestTimestamp.load()), false));
+            {
+                stdx::lock_guard<Latch> lk(_oldestTimestampPinRequestsMutex);
+                uassertStatusOK(_pinOldestTimestamp(lk,
+                                                    kPinOldestTimestampAtStartupName,
+                                                    Timestamp(_oldestTimestamp.load()),
+                                                    false));
+            }
 
             setStableTimestamp(_recoveryTimestamp, false);
 
@@ -1326,17 +1332,15 @@ void WiredTigerKVEngine::setSortedDataInterfaceExtraOptions(const std::string& o
     _indexOptions = options;
 }
 
-Status WiredTigerKVEngine::createGroupedRecordStore(OperationContext* opCtx,
-                                                    StringData ns,
-                                                    StringData ident,
-                                                    const CollectionOptions& options,
-                                                    KVPrefix prefix) {
+Status WiredTigerKVEngine::createRecordStore(OperationContext* opCtx,
+                                             StringData ns,
+                                             StringData ident,
+                                             const CollectionOptions& options) {
     _ensureIdentPath(ident);
     WiredTigerSession session(_conn);
 
-    const bool prefixed = prefix.isPrefixed();
-    StatusWith<std::string> result = WiredTigerRecordStore::generateCreateString(
-        _canonicalName, ns, options, _rsOptions, prefixed);
+    StatusWith<std::string> result =
+        WiredTigerRecordStore::generateCreateString(_canonicalName, ns, options, _rsOptions);
     if (!result.isOK()) {
         return result.getStatus();
     }
@@ -1412,7 +1416,7 @@ Status WiredTigerKVEngine::recoverOrphanedIdent(OperationContext* opCtx,
           "namespace"_attr = nss,
           "uuid"_attr = options.uuid);
 
-    status = createGroupedRecordStore(opCtx, nss.ns(), ident, options, KVPrefix::kNotPrefixed);
+    status = createRecordStore(opCtx, nss.ns(), ident, options);
     if (!status.isOK()) {
         return status;
     }
@@ -1456,42 +1460,33 @@ Status WiredTigerKVEngine::recoverOrphanedIdent(OperationContext* opCtx,
 #endif
 }
 
-std::unique_ptr<RecordStore> WiredTigerKVEngine::getGroupedRecordStore(
-    OperationContext* opCtx,
-    StringData ns,
-    StringData ident,
-    const CollectionOptions& options,
-    KVPrefix prefix) {
+std::unique_ptr<RecordStore> WiredTigerKVEngine::getRecordStore(OperationContext* opCtx,
+                                                                StringData ns,
+                                                                StringData ident,
+                                                                const CollectionOptions& options) {
 
     WiredTigerRecordStore::Params params;
     params.ns = ns;
     params.ident = ident.toString();
     params.engineName = _canonicalName;
     params.isCapped = options.capped;
+    params.keyFormat = (options.clusteredIndex) ? KeyFormat::String : KeyFormat::Long;
+    // Record stores clustered by _id need to guarantee uniqueness by preventing overwrites.
+    params.overwrite = options.clusteredIndex ? false : true;
     params.isEphemeral = _ephemeral;
     params.cappedCallback = nullptr;
     params.sizeStorer = _sizeStorer.get();
     params.isReadOnly = _readOnly;
     params.tracksSizeAdjustments = true;
 
-    params.cappedMaxSize = -1;
-    if (options.capped) {
-        if (options.cappedSize) {
-            params.cappedMaxSize = options.cappedSize;
-        } else {
-            params.cappedMaxSize = kDefaultCappedSizeBytes;
-        }
+    if (NamespaceString::oplog(ns)) {
+        // The oplog collection must have a size provided.
+        invariant(options.cappedSize > 0);
+        params.oplogMaxSize = options.cappedSize;
     }
-    params.cappedMaxDocs = -1;
-    if (options.capped && options.cappedMaxDocs)
-        params.cappedMaxDocs = options.cappedMaxDocs;
 
     std::unique_ptr<WiredTigerRecordStore> ret;
-    if (prefix == KVPrefix::kNotPrefixed) {
-        ret = std::make_unique<StandardWiredTigerRecordStore>(this, opCtx, params);
-    } else {
-        ret = std::make_unique<PrefixedWiredTigerRecordStore>(this, opCtx, params, prefix);
-    }
+    ret = std::make_unique<StandardWiredTigerRecordStore>(this, opCtx, params);
     ret->postConstructorInit(opCtx);
 
     // Sizes should always be checked when creating a collection during rollback or replication
@@ -1512,11 +1507,10 @@ string WiredTigerKVEngine::_uri(StringData ident) const {
     return kTableUriPrefix + ident.toString();
 }
 
-Status WiredTigerKVEngine::createGroupedSortedDataInterface(OperationContext* opCtx,
-                                                            const CollectionOptions& collOptions,
-                                                            StringData ident,
-                                                            const IndexDescriptor* desc,
-                                                            KVPrefix prefix) {
+Status WiredTigerKVEngine::createSortedDataInterface(OperationContext* opCtx,
+                                                     const CollectionOptions& collOptions,
+                                                     StringData ident,
+                                                     const IndexDescriptor* desc) {
     _ensureIdentPath(ident);
 
     std::string collIndexOptions;
@@ -1532,7 +1526,7 @@ Status WiredTigerKVEngine::createGroupedSortedDataInterface(OperationContext* op
         : NamespaceString();
 
     StatusWith<std::string> result = WiredTigerIndex::generateCreateString(
-        _canonicalName, _indexOptions, collIndexOptions, ns, *desc, prefix.isPrefixed());
+        _canonicalName, _indexOptions, collIndexOptions, ns, *desc);
     if (!result.isOK()) {
         return result.getStatus();
     }
@@ -1566,36 +1560,39 @@ Status WiredTigerKVEngine::importSortedDataInterface(OperationContext* opCtx,
     return wtRCToStatus(WiredTigerIndex::Create(opCtx, _uri(ident), config));
 }
 
-Status WiredTigerKVEngine::dropGroupedSortedDataInterface(OperationContext* opCtx,
-                                                          StringData ident) {
+Status WiredTigerKVEngine::dropSortedDataInterface(OperationContext* opCtx, StringData ident) {
     return wtRCToStatus(WiredTigerIndex::Drop(opCtx, _uri(ident)));
 }
 
-std::unique_ptr<SortedDataInterface> WiredTigerKVEngine::getGroupedSortedDataInterface(
-    OperationContext* opCtx, StringData ident, const IndexDescriptor* desc, KVPrefix prefix) {
+std::unique_ptr<SortedDataInterface> WiredTigerKVEngine::getSortedDataInterface(
+    OperationContext* opCtx,
+    const CollectionOptions& collOptions,
+    StringData ident,
+    const IndexDescriptor* desc) {
     if (desc->isIdIndex()) {
-        return std::make_unique<WiredTigerIdIndex>(
-            opCtx, _uri(ident), ident, desc, prefix, _readOnly);
+        invariant(!collOptions.clusteredIndex);
+        return std::make_unique<WiredTigerIdIndex>(opCtx, _uri(ident), ident, desc, _readOnly);
     }
     if (desc->unique()) {
-        return std::make_unique<WiredTigerIndexUnique>(
-            opCtx, _uri(ident), ident, desc, prefix, _readOnly);
+        invariant(!collOptions.clusteredIndex);
+        return std::make_unique<WiredTigerIndexUnique>(opCtx, _uri(ident), ident, desc, _readOnly);
     }
 
+    auto keyFormat = (collOptions.clusteredIndex) ? KeyFormat::String : KeyFormat::Long;
     return std::make_unique<WiredTigerIndexStandard>(
-        opCtx, _uri(ident), ident, desc, prefix, _readOnly);
+        opCtx, _uri(ident), ident, keyFormat, desc, _readOnly);
 }
 
 std::unique_ptr<RecordStore> WiredTigerKVEngine::makeTemporaryRecordStore(OperationContext* opCtx,
                                                                           StringData ident) {
-    invariant(!_readOnly);
+    invariant(!_readOnly || !recoverToOplogTimestamp.empty());
 
     _ensureIdentPath(ident);
     WiredTigerSession wtSession(_conn);
 
     CollectionOptions noOptions;
     StatusWith<std::string> swConfig = WiredTigerRecordStore::generateCreateString(
-        _canonicalName, "" /* internal table */, noOptions, _rsOptions, false /* prefixed */);
+        _canonicalName, "" /* internal table */, noOptions, _rsOptions);
     uassertStatusOK(swConfig.getStatus());
 
     std::string config = swConfig.getValue();
@@ -1614,6 +1611,8 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::makeTemporaryRecordStore(Operat
     params.ident = ident.toString();
     params.engineName = _canonicalName;
     params.isCapped = false;
+    params.keyFormat = KeyFormat::Long;
+    params.overwrite = true;
     params.isEphemeral = _ephemeral;
     params.cappedCallback = nullptr;
     // Temporary collections do not need to persist size information to the size storer.
@@ -1621,9 +1620,6 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::makeTemporaryRecordStore(Operat
     // Temporary collections do not need to reconcile collection size/counts.
     params.tracksSizeAdjustments = false;
     params.isReadOnly = false;
-
-    params.cappedMaxSize = -1;
-    params.cappedMaxDocs = -1;
 
     std::unique_ptr<WiredTigerRecordStore> rs;
     rs = std::make_unique<StandardWiredTigerRecordStore>(this, opCtx, params);
@@ -2353,7 +2349,10 @@ Timestamp WiredTigerKVEngine::getPinnedOplog() const {
 }
 
 StatusWith<Timestamp> WiredTigerKVEngine::pinOldestTimestamp(
-    const std::string& requestingServiceName, Timestamp requestedTimestamp, bool roundUpIfTooOld) {
+    OperationContext* opCtx,
+    const std::string& requestingServiceName,
+    Timestamp requestedTimestamp,
+    bool roundUpIfTooOld) {
     stdx::lock_guard<Latch> lock(_oldestTimestampPinRequestsMutex);
     Timestamp oldest = getOldestTimestamp();
     LOGV2(5380104,
@@ -2363,6 +2362,44 @@ StatusWith<Timestamp> WiredTigerKVEngine::pinOldestTimestamp(
           "roundUpIfTooOld"_attr = roundUpIfTooOld,
           "currOldestTs"_attr = oldest);
 
+    const Timestamp previousTimestamp = [&]() -> Timestamp {
+        auto tsIt = _oldestTimestampPinRequests.find(requestingServiceName);
+        return tsIt != _oldestTimestampPinRequests.end() ? tsIt->second : Timestamp::min();
+    }();
+
+    auto swPinnedTimestamp =
+        _pinOldestTimestamp(lock, requestingServiceName, requestedTimestamp, roundUpIfTooOld);
+    if (!swPinnedTimestamp.isOK()) {
+        return swPinnedTimestamp;
+    }
+
+    if (opCtx->lockState()->inAWriteUnitOfWork()) {
+        // If we've moved the pin and are in a `WriteUnitOfWork`, assume the caller has a write that
+        // should be atomic with this pin request. If the `WriteUnitOfWork` is rolled back, either
+        // unpin the oldest timestamp or repin the previous value.
+        opCtx->recoveryUnit()->onRollback(
+            [this, svcName = requestingServiceName, previousTimestamp]() {
+                if (previousTimestamp.isNull()) {
+                    unpinOldestTimestamp(svcName);
+                } else {
+                    stdx::lock_guard<Latch> lock(_oldestTimestampPinRequestsMutex);
+                    // When a write is updating the value from an earlier pin to a later one, use
+                    // rounding to make a best effort to repin the earlier value.
+                    invariant(_pinOldestTimestamp(lock, svcName, previousTimestamp, true).isOK());
+                }
+            });
+    }
+
+    return swPinnedTimestamp;
+}
+
+StatusWith<Timestamp> WiredTigerKVEngine::_pinOldestTimestamp(
+    WithLock,
+    const std::string& requestingServiceName,
+    Timestamp requestedTimestamp,
+    bool roundUpIfTooOld) {
+
+    Timestamp oldest = getOldestTimestamp();
     if (requestedTimestamp < oldest) {
         if (roundUpIfTooOld) {
             requestedTimestamp = oldest;
@@ -2374,7 +2411,6 @@ StatusWith<Timestamp> WiredTigerKVEngine::pinOldestTimestamp(
     }
 
     _oldestTimestampPinRequests[requestingServiceName] = requestedTimestamp;
-
     return {requestedTimestamp};
 }
 
@@ -2382,9 +2418,10 @@ void WiredTigerKVEngine::unpinOldestTimestamp(const std::string& requestingServi
     stdx::lock_guard<Latch> lock(_oldestTimestampPinRequestsMutex);
     auto it = _oldestTimestampPinRequests.find(requestingServiceName);
     if (it == _oldestTimestampPinRequests.end()) {
-        LOGV2_WARNING(5380105,
-                      "The requested service had nothing to unpin",
-                      "service"_attr = requestingServiceName);
+        LOGV2_DEBUG(2,
+                    5380105,
+                    "The requested service had nothing to unpin",
+                    "service"_attr = requestingServiceName);
         return;
     }
     LOGV2(5380103,

@@ -33,7 +33,7 @@
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/query/query_request.h"
+#include "mongo/db/query/query_request_helper.h"
 
 namespace mongo {
 namespace count_request {
@@ -61,7 +61,7 @@ long long countParseSkip(const BSONElement& element) {
 }
 
 long long countParseMaxTime(const BSONElement& element) {
-    auto maxTimeVal = uassertStatusOK(QueryRequest::parseMaxTimeMS(element));
+    auto maxTimeVal = uassertStatusOK(parseMaxTimeMS(element));
     return static_cast<long long>(maxTimeVal);
 }
 }  // namespace count_request

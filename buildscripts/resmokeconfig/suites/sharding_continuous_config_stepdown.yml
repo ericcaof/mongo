@@ -24,7 +24,6 @@ selector:
   - jstests/sharding/addshard2.js
   - jstests/sharding/autosplit.js
   - jstests/sharding/auto_rebalance_parallel.js
-  - jstests/sharding/basic_drop_coll.js
   - jstests/sharding/basic_merge.js
   - jstests/sharding/count1.js
   - jstests/sharding/count2.js
@@ -32,7 +31,6 @@ selector:
   - jstests/sharding/cursor1.js
   - jstests/sharding/diffservers1.js
   - jstests/sharding/disable_autosplit.js
-  - jstests/sharding/drop_sharded_db.js
   - jstests/sharding/findandmodify1.js
   - jstests/sharding/findandmodify_autosplit.js
   - jstests/sharding/query/geo_near_sharded.js
@@ -76,7 +74,6 @@ selector:
   - jstests/sharding/zone_changes_hashed.js
   - jstests/sharding/zone_changes_range.js
   # No retries on direct writes to the config/admin databases on the config servers
-  - jstests/sharding/database_versioning_safe_secondary_reads.js
   - jstests/sharding/listDatabases.js
   - jstests/sharding/bulk_insert.js
   - jstests/sharding/printShardingStatus.js
@@ -139,7 +136,6 @@ selector:
   - jstests/sharding/mongos_no_replica_set_refresh.js
   - jstests/sharding/movechunk_interrupt_at_primary_stepdown.js
   - jstests/sharding/primary_config_server_blackholed_from_mongos.js
-  - jstests/sharding/refine_collection_shard_key_abort_on_stepup.js
   # Nothing is affected by config server step down
   - jstests/sharding/basic_sharding_params.js
   # ShardingTest is never used, so continuous step down thread never starts
@@ -160,7 +156,7 @@ selector:
   # listCollections is not retryable
   - jstests/sharding/sessions_collection_auto_healing.js
   # shardCollection is not retryable
-  - jstests/sharding/shard_config_db_collections.js
+  - jstests/sharding/shard_collection_config_db.js
   # creates collection, does movePrimary, then shards the collection and moves a chunk to the old
   # primary (SERVER-31909)
   - jstests/sharding/mongos_validate_writes.js
@@ -235,6 +231,9 @@ selector:
 
   # SERVER-51805 splitChunk op is not idempotent
   - jstests/sharding/mongos_get_shard_version.js
+
+  exclude_with_any_tags:
+  - does_not_support_config_stepdowns
 
 executor:
   config:

@@ -9,7 +9,9 @@
  * This test should also work when the primary builds the index single-phased. The secondary should
  * be able to optimize for the empty collection case and build the index inlined.
  *
- * @tags: [requires_replication]
+ * @tags: [
+ *   requires_replication,
+ * ]
  */
 (function() {
 "use strict";

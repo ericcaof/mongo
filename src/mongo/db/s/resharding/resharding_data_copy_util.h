@@ -30,17 +30,31 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <vector>
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/logical_session_id.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/util/functional.h"
 
 namespace mongo {
 
 class NamespaceString;
 class OperationContext;
+class Pipeline;
 
 namespace resharding::data_copy {
 
-void ensureCollectionExists(OperationContext* opCtx, const NamespaceString& nss);
+/**
+ * Creates the specified collection with the given options if the collection does not already exist.
+ * If the collection already exists, we do not compare the options because the resharding process
+ * will always use the same options for the same namespace.
+ */
+void ensureCollectionExists(OperationContext* opCtx,
+                            const NamespaceString& nss,
+                            const CollectionOptions& options);
 
 /**
  * Drops the specified collection or returns without error if the collection has already been
@@ -52,6 +66,66 @@ void ensureCollectionExists(OperationContext* opCtx, const NamespaceString& nss)
 void ensureCollectionDropped(OperationContext* opCtx,
                              const NamespaceString& nss,
                              const boost::optional<CollectionUUID>& uuid = boost::none);
+
+/**
+ * Returns the largest _id value in the collection.
+ */
+Value findHighestInsertedId(OperationContext* opCtx, const CollectionPtr& collection);
+
+/**
+ * Returns a batch of documents suitable for being inserted with insertBatch().
+ *
+ * The batch of documents is returned once its size exceeds batchSizeLimitBytes or the pipeline has
+ * been exhausted.
+ */
+std::vector<InsertStatement> fillBatchForInsert(Pipeline& pipeline, int batchSizeLimitBytes);
+
+/**
+ * Atomically inserts a batch of documents in a single storage transaction. Returns the number of
+ * bytes inserted.
+ *
+ * Throws NamespaceNotFound if the collection doesn't already exist.
+ */
+int insertBatch(OperationContext* opCtx,
+                const NamespaceString& nss,
+                std::vector<InsertStatement>& batch);
+
+/**
+ * Checks out the logical session and acts in one of the following ways depending on the state of
+ * this shard's config.transactions table:
+ *
+ *   (a) When this shard already knows about a higher transaction than txnNumber,
+ *       withSessionCheckedOut() skips calling the supplied lambda function and returns boost::none.
+ *
+ *   (b) When this shard already knows about the retryable write statement (txnNumber, *stmtId),
+ *       withSessionCheckedOut() skips calling the supplied lambda function and returns boost::none.
+ *
+ *   (c) When this shard has an earlier prepared transaction still active, withSessionCheckedOut()
+ *       skips calling the supplied lambda function and returns a future that becomes ready once the
+ *       active prepared transaction on this shard commits or aborts. After waiting for the returned
+ *       future to become ready, the caller should then invoke withSessionCheckedOut() with the same
+ *       arguments a second time.
+ *
+ *   (d) Otherwise, withSessionCheckedOut() calls the lambda function and returns boost::none.
+ */
+boost::optional<SharedSemiFuture<void>> withSessionCheckedOut(OperationContext* opCtx,
+                                                              LogicalSessionId lsid,
+                                                              TxnNumber txnNumber,
+                                                              boost::optional<StmtId> stmtId,
+                                                              unique_function<void()> callable);
+
+/**
+ * Updates this shard's config.transactions table based on a retryable write or multi-statement
+ * transaction that already executed on some donor shard.
+ *
+ * This function assumes it is being called while the corresponding logical session is checked out
+ * by the supplied OperationContext.
+ */
+void updateSessionRecord(OperationContext* opCtx,
+                         BSONObj o2Field,
+                         std::vector<StmtId> stmtIds,
+                         boost::optional<repl::OpTime> preImageOpTime,
+                         boost::optional<repl::OpTime> postImageOpTime);
 
 }  // namespace resharding::data_copy
 }  // namespace mongo

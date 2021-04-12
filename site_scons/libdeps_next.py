@@ -51,7 +51,7 @@ automatically added when missing.
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-from collections import OrderedDict
+from collections import defaultdict
 from functools import partial
 import enum
 import copy
@@ -137,8 +137,8 @@ class FlaggedLibdep:
 
         # We need to maintain our own copy so as not to disrupt the env's original list.
         try:
-            self.prefix_flags = copy.copy(libnode.get_env().get('LIBDEPS_PREFIX_FLAGS', []))
-            self.postfix_flags = copy.copy(libnode.get_env().get('LIBDEPS_POSTFIX_FLAGS', []))
+            self.prefix_flags = copy.copy(getattr(libnode.attributes, 'libdeps_prefix_flags', []))
+            self.postfix_flags = copy.copy(getattr(libnode.attributes, 'libdeps_postfix_flags', []))
         except AttributeError:
             self.prefix_flags = []
             self.postfix_flags = []
@@ -550,7 +550,7 @@ class LibdepLinter:
         if self._check_for_lint_tags('lint-allow-nonprivate-on-deps-dependents'):
             return
 
-        if (libdep.dependency_type != deptype.Private
+        if (libdep.dependency_type != deptype.Private and libdep.dependency_type != deptype.Global
             and len(self._get_deps_dependents()) > 0):
 
             target_type = self.target[0].builder.get_name(self.env)
@@ -642,13 +642,59 @@ def _get_sorted_direct_libdeps(node):
     return direct_sorted
 
 
-def _libdeps_visit(n, tsorted, marked, walking=None, debug=False):
-    if walking is None:
-        walking = set()
+class LibdepsVisitationMark(enum.IntEnum):
+    UNMARKED = 0
+    MARKED_PRIVATE = 1
+    MARKED_PUBLIC = 2
 
-    if n.target_node in marked:
-        return marked, tsorted
 
+def _libdeps_visit_private(n, marked, walking, debug=False):
+    if marked[n.target_node] >= LibdepsVisitationMark.MARKED_PRIVATE:
+        return
+
+    if n.target_node in walking:
+        raise DependencyCycleError(n.target_node)
+
+    walking.add(n.target_node)
+
+    try:
+        for child in _get_sorted_direct_libdeps(n.target_node):
+            _libdeps_visit_private(child, marked, walking)
+
+        marked[n.target_node] = LibdepsVisitationMark.MARKED_PRIVATE
+
+    except DependencyCycleError as e:
+        if len(e.cycle_nodes) == 1 or e.cycle_nodes[0] != e.cycle_nodes[-1]:
+            e.cycle_nodes.insert(0, n.target_node)
+        raise
+
+    finally:
+        walking.remove(n.target_node)
+
+
+def _libdeps_visit(n, tsorted, marked, walking, debug=False):
+    # The marked dictionary tracks which sorts of visitation a node
+    # has received. Values for a given node can be UNMARKED/absent,
+    # MARKED_PRIVATE, or MARKED_PUBLIC. These are to be interpreted as
+    # follows:
+    #
+    # 0/UNMARKED: Node is not not marked.
+    #
+    # MARKED_PRIVATE: Node has only been explored as part of looking
+    # for cycles under a LIBDEPS_PRIVATE edge.
+    #
+    # MARKED_PUBLIC: Node has been explored and any of its transiive
+    # dependencies have been incorporated into `tsorted`.
+    #
+    # The __libdeps_visit_private function above will only mark things
+    # at with MARKED_PRIVATE, while __libdeps_visit will mark things
+    # MARKED_PUBLIC.
+    if marked[n.target_node] == LibdepsVisitationMark.MARKED_PUBLIC:
+        return
+
+    # The walking set is used for cycle detection. We record all our
+    # predecessors in our depth-first search, and if we observe one of
+    # our predecessors as a child, we know we have a cycle.
     if n.target_node in walking:
         raise DependencyCycleError(n.target_node)
 
@@ -658,11 +704,32 @@ def _libdeps_visit(n, tsorted, marked, walking=None, debug=False):
         print(f"    * {n.dependency_type} => {n.listed_name}")
 
     try:
-        for child in _get_sorted_direct_libdeps(n.target_node):
-            if child.dependency_type != deptype.Private:
-                marked, tsorted = _libdeps_visit(child, tsorted, marked, walking=walking)
+        children = _get_sorted_direct_libdeps(n.target_node)
 
-        marked.add(n.target_node)
+        # We first walk all of our public dependencies so that we can
+        # put full marks on anything that is in our public transitive
+        # graph. We then do a second walk into any private nodes to
+        # look for cycles. While we could do just one walk over the
+        # children, it is slightly faster to do two passes, since if
+        # the algorithm walks into a private edge early, it would do a
+        # lot of non-productive (except for cycle checking) walking
+        # and marking, but if another public path gets into that same
+        # subtree, then it must walk and mark it again to raise it to
+        # the public mark level. Whereas, if the algorithm first walks
+        # the whole public tree, then those are all productive marks
+        # and add to tsorted, and then the private walk will only need
+        # to examine those things that are only reachable via private
+        # edges.
+
+        for child in children:
+            if child.dependency_type != deptype.Private:
+                _libdeps_visit(child, tsorted, marked, walking, debug)
+
+        for child in children:
+            if child.dependency_type == deptype.Private:
+                _libdeps_visit_private(child, marked, walking, debug)
+
+        marked[n.target_node] = LibdepsVisitationMark.MARKED_PUBLIC
 
         if getattr(n.target_node.attributes, "needs_link", True):
             tsorted.append(n.target_node)
@@ -672,7 +739,8 @@ def _libdeps_visit(n, tsorted, marked, walking=None, debug=False):
             e.cycle_nodes.insert(0, n.target_node)
         raise
 
-    return marked, tsorted
+    finally:
+        walking.remove(n.target_node)
 
 
 def _get_libdeps(node, debug=False):
@@ -680,9 +748,6 @@ def _get_libdeps(node, debug=False):
 
     Computes the dependencies if they're not already cached.
     """
-
-    tsorted = []
-    marked = set()
 
     cache = getattr(node.attributes, Constants.LibdepsCached, None)
     if cache is not None:
@@ -695,17 +760,17 @@ def _get_libdeps(node, debug=False):
     if debug:
         print(f"  Edges:")
 
+    tsorted = []
+
+    marked = defaultdict(lambda: LibdepsVisitationMark.UNMARKED)
+    walking = set()
+
     for child in _get_sorted_direct_libdeps(node):
-        if child.dependency_type == deptype.Interface:
-            tsorted.append(child.target_node)
-            if debug:
-                print(f"    * {child.dependency_type} => {child.target_node}")
-        else:
-            _, tsorted = _libdeps_visit(child, tsorted, marked, debug=debug)
-
+        if child.dependency_type != deptype.Interface:
+            _libdeps_visit(child, tsorted, marked, walking, debug=debug)
     tsorted.reverse()
-    setattr(node.attributes, Constants.LibdepsCached, tsorted)
 
+    setattr(node.attributes, Constants.LibdepsCached, tsorted)
     return tsorted
 
 
@@ -883,7 +948,7 @@ def _get_node_with_ixes(env, node, node_builder_type):
 _get_node_with_ixes.node_type_ixes = dict()
 
 def add_node_from(env, node):
-    from buildscripts.libdeps.libdeps_graph_enums import NodeProps
+    from buildscripts.libdeps.libdeps.graph import NodeProps
 
     env.GetLibdepsGraph().add_nodes_from([(
         str(node.abspath),
@@ -893,7 +958,7 @@ def add_node_from(env, node):
         })])
 
 def add_edge_from(env, depender_node, dependent_node, visibility, direct):
-    from buildscripts.libdeps.libdeps_graph_enums import EdgeProps
+    from buildscripts.libdeps.libdeps.graph import EdgeProps
 
     env.GetLibdepsGraph().add_edges_from([(
         dependent_node,
@@ -1093,7 +1158,7 @@ def expand_libdeps_with_flags(source, target, env, for_signature):
         #   -Wl--on-flag libA.a -Wl--off-flag -Wl--on-flag libA.a -Wl--off-flag
         # This loop below will spot the cases were the flag was turned off and then
         # immediately turned back on
-        for switch_flag in env.get('LIBDEPS_SWITCH_FLAGS', []):
+        for switch_flag in getattr(flagged_libdep.libnode.attributes, 'libdeps_switch_flags', []):
             if (prev_libdep and switch_flag['on'] in flagged_libdep.prefix_flags
                 and switch_flag['off'] in prev_libdep.postfix_flags):
 
@@ -1150,14 +1215,17 @@ def generate_libdeps_graph(env):
                         str(libdep.abspath),
                         visibility=int(deptype.Public),
                         direct=False)
-
-            ld_path = ":".join([os.path.dirname(str(libdep)) for libdep in _get_libdeps(source)])
+            if env['PLATFORM'] == 'darwin':
+                sep = ' '
+            else:
+                sep = ':'
+            ld_path = sep.join([os.path.dirname(str(libdep)) for libdep in _get_libdeps(source)])
             symbol_deps.append(env.Command(
                 target=target,
                 source=source,
                 action=SCons.Action.Action(
                     f'{find_symbols} $SOURCE "{ld_path}" $TARGET',
-                    "Generating $SOURCE symbol dependencies")))
+                    "Generating $SOURCE symbol dependencies" if not env['VERBOSE'] else "")))
 
         def write_graph_hash(env, target, source):
             import networkx
@@ -1244,18 +1312,21 @@ def generate_graph(env, target, source):
     import fileinput
     import networkx
     import json
-    from buildscripts.libdeps.libdeps_graph_enums import EdgeProps, NodeProps
+    from buildscripts.libdeps.libdeps.graph import EdgeProps, NodeProps
 
     for symbol_deps_file in source:
         with open(str(symbol_deps_file)) as f:
             symbols = {}
-            for symbol, lib in json.load(f).items():
-                # ignore symbols from external libraries,
-                # they will just clutter the graph
-                if lib.startswith(env.Dir("$BUILD_DIR").path):
-                    if lib not in symbols:
-                        symbols[lib] = []
-                    symbols[lib].append(symbol)
+            try:
+                for symbol, lib in json.load(f).items():
+                    # ignore symbols from external libraries,
+                    # they will just clutter the graph
+                    if lib.startswith(env.Dir("$BUILD_DIR").path):
+                        if lib not in symbols:
+                            symbols[lib] = []
+                        symbols[lib].append(symbol)
+            except json.JSONDecodeError:
+                env.FatalError(f"Failed processing json file: {str(symbol_deps_file)}")
 
             for lib in symbols:
 
@@ -1335,7 +1406,12 @@ def setup_environment(env, emitting_shared=False, debug='off', linting='on', san
             env.FatalError("Libdeps graph generation is not supported with ninja builds.")
         if not emitting_shared:
             env.FatalError("Libdeps graph generation currently only supports dynamic builds.")
-        for bin in ['awk', 'grep', 'ldd', 'nm']:
+
+        if env['PLATFORM'] == 'darwin':
+            required_bins = ['awk', 'sed', 'otool', 'nm']
+        else:
+            required_bins = ['awk', 'grep', 'ldd', 'nm']
+        for bin in required_bins:
             if not env.WhereIs(bin):
                 env.FatalError(f"'{bin}' not found, Libdeps graph generation requires {bin}.")
 
@@ -1421,7 +1497,6 @@ def setup_environment(env, emitting_shared=False, debug='off', linting='on', san
     )
 
     env.Prepend(_LIBFLAGS="$_LIBDEPS_TAGS $_LIBDEPS $_SYSLIBDEPS ")
-    env.Prepend(ARFLAGS="$_LIBDEPS_TAGS")
     for builder_name in ("Program", "SharedLibrary", "LoadableModule", "SharedArchive"):
         try:
             update_scanner(env, builder_name, debug=debug)

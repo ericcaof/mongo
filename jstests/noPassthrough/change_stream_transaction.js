@@ -1,10 +1,10 @@
-/*
+/**
  * Confirms that change streams only see committed operations for prepared transactions.
  * @tags: [
- *   uses_transactions,
- *   uses_change_streams,
  *   requires_majority_read_concern,
+ *   uses_change_streams,
  *   uses_prepare_transaction,
+ *   uses_transactions,
  * ]
  */
 (function() {

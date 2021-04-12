@@ -1,6 +1,9 @@
 /**
  * Fills WiredTiger cache during steady state oplog application.
- * @tags: [requires_replication, requires_wiredtiger]
+ * @tags: [
+ *   requires_replication,
+ *   requires_wiredtiger,
+ * ]
  */
 (function() {
 'use strict';

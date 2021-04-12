@@ -97,7 +97,8 @@ StatusWith<Shard::QueryResponse> RSLocalClient::queryOnce(
     const NamespaceString& nss,
     const BSONObj& query,
     const BSONObj& sort,
-    boost::optional<long long> limit) {
+    boost::optional<long long> limit,
+    const boost::optional<BSONObj>& hint) {
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
 
     if (readConcernLevel == repl::ReadConcernLevel::kMajorityReadConcern) {
@@ -127,6 +128,9 @@ StatusWith<Shard::QueryResponse> RSLocalClient::queryOnce(
     if (!sort.isEmpty()) {
         fullQuery.sort(sort);
     }
+    if (hint) {
+        fullQuery.hint(*hint);
+    }
     fullQuery.readPref(readPref.pref, BSONArray());
 
     try {
@@ -150,6 +154,37 @@ StatusWith<Shard::QueryResponse> RSLocalClient::queryOnce(
     } catch (const DBException& ex) {
         return ex.toStatus();
     }
+}
+
+Status RSLocalClient::runAggregation(
+    OperationContext* opCtx,
+    const AggregateCommandRequest& aggRequest,
+    std::function<bool(const std::vector<BSONObj>& batch)> callback) {
+    DBDirectClient client(opCtx);
+    auto cursor = uassertStatusOKWithContext(
+        DBClientCursor::fromAggregationRequest(
+            &client, aggRequest, true /* secondaryOk */, true /* useExhaust */),
+        "Failed to establish a cursor for aggregation");
+
+    while (cursor->more()) {
+        std::vector<BSONObj> batchDocs;
+        batchDocs.reserve(cursor->objsLeftInBatch());
+        while (cursor->moreInCurrentBatch()) {
+            batchDocs.emplace_back(cursor->nextSafe().getOwned());
+        }
+
+        try {
+            if (!callback(batchDocs)) {
+                break;
+            }
+        } catch (const DBException& ex) {
+            return ex
+                .toStatus(str::stream()
+                          << "Exception while running aggregation retrieval of results callback");
+        }
+    }
+
+    return Status::OK();
 }
 
 }  // namespace mongo

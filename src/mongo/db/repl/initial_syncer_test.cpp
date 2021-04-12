@@ -635,7 +635,7 @@ OplogEntry makeOplogEntry(int t,
                               {},                          // sessionInfo
                               boost::none,                 // upsert
                               Date_t() + Seconds(t),       // wall clock time
-                              boost::none,                 // statement id
+                              {},                          // statement ids
                               boost::none,    // optime of previous write within same transaction
                               boost::none,    // pre-image optime
                               boost::none,    // post-image optime
@@ -2858,7 +2858,7 @@ TEST_F(
         // Oplog entry associated with the stopTimestamp.
         processSuccessfulLastOplogEntryFetcherResponse({BSON("ts"
                                                              << "not a timestamp"
-                                                             << "t" << 1)});
+                                                             << "t" << 1LL)});
 
         // _lastOplogEntryFetcherCallbackAfterCloningData() will shut down the OplogFetcher after
         // setting the completion status.

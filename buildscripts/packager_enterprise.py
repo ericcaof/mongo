@@ -52,7 +52,10 @@ class EnterpriseSpec(packager.Spec):
 
     def suffix(self):
         """Suffix."""
-        return "-enterprise" if int(self.ver.split(".")[1]) % 2 == 0 else "-enterprise-unstable"
+        if int(self.ver.split(".")[0]) >= 5:
+            return "-enterprise" if int(self.ver.split(".")[1]) == 0 else "-enterprise-unstable"
+        else:
+            return "-enterprise" if int(self.ver.split(".")[1]) % 2 == 0 else "-enterprise-unstable"
 
 
 class EnterpriseDistro(packager.Distro):
@@ -136,10 +139,12 @@ class EnterpriseDistro(packager.Distro):
             return []
         if arch == "arm64":
             if self.dname == 'ubuntu':
-                return ["ubuntu1604", "ubuntu1804", "ubuntu2004"]
+                return ["ubuntu1804", "ubuntu2004"]
         if arch == "aarch64":
             if self.dname == 'redhat':
                 return ["rhel82"]
+            if self.dname == 'amazon2':
+                return ["amazon2"]
             return []
 
         if re.search("(redhat|fedora|centos)", self.dname):

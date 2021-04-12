@@ -3,7 +3,6 @@
 // key.
 // @tags: [
 //   assumes_unsharded_collection,
-//   sbe_incompatible,
 // ]
 
 // Checking for positional array updates with either .$ or .0 at the end

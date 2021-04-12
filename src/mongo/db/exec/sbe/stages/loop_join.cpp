@@ -88,6 +88,8 @@ value::SlotAccessor* LoopJoinStage::getAccessor(CompileCtx& ctx, value::SlotId s
 }
 
 void LoopJoinStage::open(bool reOpen) {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.opens++;
     _children[0]->open(reOpen);
     _outerGetNext = true;
@@ -103,6 +105,8 @@ void LoopJoinStage::openInner() {
 }
 
 PlanState LoopJoinStage::getNext() {
+    auto optTimer(getOptTimer(_opCtx));
+
     if (_outerGetNext) {
         auto state = _children[0]->getNext();
         if (state != PlanState::ADVANCED) {
@@ -143,6 +147,8 @@ PlanState LoopJoinStage::getNext() {
 }
 
 void LoopJoinStage::close() {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.closes++;
 
     if (_reOpenInner) {
@@ -160,8 +166,8 @@ std::unique_ptr<PlanStageStats> LoopJoinStage::getStats(bool includeDebugInfo) c
 
     if (includeDebugInfo) {
         BSONObjBuilder bob;
-        bob.appendNumber("innerOpens", _specificStats.innerOpens);
-        bob.appendNumber("innerCloses", _specificStats.innerCloses);
+        bob.appendNumber("innerOpens", static_cast<long long>(_specificStats.innerOpens));
+        bob.appendNumber("innerCloses", static_cast<long long>(_specificStats.innerCloses));
         bob.append("outerProjects", _outerProjects);
         bob.append("outerCorrelated", _outerCorrelated);
         if (_predicate) {

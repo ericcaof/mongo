@@ -1,8 +1,5 @@
-
 /**
- * @tags: [
- *   sbe_incompatible,
- * ]
+ * Basic test for querying on documents containing arrays.
  */
 t = db.array4;
 t.drop();

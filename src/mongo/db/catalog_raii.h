@@ -37,7 +37,6 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/local_oplog_info.h"
 #include "mongo/db/views/view.h"
-#include "mongo/db/yieldable.h"
 
 namespace mongo {
 
@@ -277,7 +276,7 @@ private:
     // Indicate that we are lock-free on code paths that can run either lock-free or locked for
     // different kinds of operations. Note: this class member is currently declared first so that it
     // destructs last, as a safety measure, but not because it is currently depended upon behavior.
-    boost::optional<LockFreeReadsBlock> _lockFreeReadsBlock;
+    LockFreeReadsBlock _lockFreeReadsBlock;
 
     Lock::GlobalLock _globalLock;
 

@@ -20,6 +20,9 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/fts/base_fts',
+        '$BUILD_DIR/mongo/db/index/key_generator',
+        '$BUILD_DIR/mongo/db/query/collation/collator_interface',
         '$BUILD_DIR/mongo/db/query/datetime/date_time_support',
         '$BUILD_DIR/mongo/db/storage/key_string',
         '$BUILD_DIR/mongo/util/regex_util',
@@ -42,11 +45,11 @@ sbeEnv.Library(
         'stages/limit_skip.cpp',
         'stages/loop_join.cpp',
         'stages/makeobj.cpp',
+        'stages/merge_join.cpp',
         'stages/project.cpp',
         'stages/sort.cpp',
         'stages/sorted_merge.cpp',
         'stages/spool.cpp',
-        'stages/text_match.cpp',
         'stages/traverse.cpp',
         'stages/union.cpp',
         'stages/unique.cpp',
@@ -79,6 +82,7 @@ sbeEnv.Library(
 env.Library(
     target='query_sbe_storage',
     source=[
+        'stages/collection_helpers.cpp',
         'stages/ix_scan.cpp',
         'stages/scan.cpp',
         ],
@@ -103,13 +107,16 @@ env.Library(
     target='sbe_plan_stage_test',
     source=[
         'sbe_plan_stage_test.cpp',
-        ],
+    ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/query/sbe_stage_builder_helpers',
         '$BUILD_DIR/mongo/unittest/unittest',
         'query_sbe',
-        ]
-    )
+    ],
+    LIBDEPS_TYPEINFO=[
+        '$BUILD_DIR/mongo/db/service_context_test_fixture'
+    ],
+)
 
 env.CppUnitTest(
     target='db_sbe_test',
@@ -117,6 +124,7 @@ env.CppUnitTest(
         'expressions/sbe_bson_size_test.cpp',
         'expressions/sbe_coerce_to_string_test.cpp',
         'expressions/sbe_concat_test.cpp',
+        'expressions/sbe_date_add_test.cpp',
         'expressions/sbe_date_diff_test.cpp',
         'expressions/sbe_date_to_parts_test.cpp',
         'expressions/sbe_day_of_expressions_test.cpp',
@@ -129,6 +137,7 @@ env.CppUnitTest(
         'expressions/sbe_mod_expression_test.cpp',
         'expressions/sbe_regex_test.cpp',
         'expressions/sbe_replace_one_expression_test.cpp',
+        'expressions/sbe_reverse_array_builtin_test.cpp',
         'expressions/sbe_set_expressions_test.cpp',
         'expressions/sbe_shard_filter_builtin_test.cpp',
         'expressions/sbe_to_upper_to_lower_test.cpp',
@@ -136,18 +145,24 @@ env.CppUnitTest(
         'expressions/sbe_trunc_builtin_test.cpp',
         'parser/sbe_parser_test.cpp',
         'sbe_filter_test.cpp',
+        'sbe_hash_agg_test.cpp',
+        'sbe_hash_join_test.cpp',
         'sbe_key_string_test.cpp',
         'sbe_limit_skip_test.cpp',
         'sbe_math_builtins_test.cpp',
+        'sbe_mkobj_test.cpp',
+        'sbe_merge_join_test.cpp',
         'sbe_numeric_convert_test.cpp',
         'sbe_sort_test.cpp',
         'sbe_sorted_merge_test.cpp',
         'sbe_test.cpp',
         'sbe_unique_test.cpp',
+        'values/value_serialize_for_sorter_test.cpp',
         'values/write_value_to_stream_test.cpp'
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
+        '$BUILD_DIR/mongo/db/query/collation/collator_interface_mock',
         '$BUILD_DIR/mongo/db/service_context_test_fixture',
         'query_sbe_parser',
         'sbe_plan_stage_test',

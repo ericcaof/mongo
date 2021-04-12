@@ -1,7 +1,9 @@
 /**
  * Ensures that the 'buildUUID' is present for in-progress indexes when using the 'listIndexes()'
  * command.
- * @tags: [requires_replication]
+ * @tags: [
+ *   requires_replication,
+ * ]
  */
 (function() {
 'use strict';

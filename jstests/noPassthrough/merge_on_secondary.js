@@ -1,7 +1,10 @@
 /**
  * Tests the behavior of $merge being run on a secondary.
  *
- * @tags: [assumes_unsharded_collection, requires_replication]
+ * @tags: [
+ *   assumes_unsharded_collection,
+ *   requires_replication,
+ * ]
  */
 (function() {
 "use strict";

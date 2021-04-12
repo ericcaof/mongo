@@ -42,6 +42,7 @@
 #include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/pipeline/document_path_support.h"
 #include "mongo/db/pipeline/document_source_merge_gen.h"
+#include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/variable_validation.h"
@@ -89,12 +90,15 @@ bool foreignShardedLookupAllowed() {
     return getTestCommandsEnabled() && internalQueryAllowShardedLookup.load();
 }
 
-// Parses $lookup 'from' field. The 'from' field must be a string or
+// Parses $lookup 'from' field. The 'from' field must be a string or one of the following
+// exceptions:
 // {from: {db: "config", coll: "cache.chunks.*"}, ...} or
-// {from: {db: "local", coll: "oplog.rs"}, ...} .
+// {from: {db: "local", coll: "oplog.rs"}, ...} or
+// {from: {db: "local", coll: "tenantMigration.oplogView"}, ...} .
 NamespaceString parseLookupFromAndResolveNamespace(const BSONElement& elem, StringData defaultDb) {
-    // The object syntax only works for cache.chunks.* and local.oplog.rs which are not user
-    // namespaces so object type is omitted from the error message below.
+    // The object syntax only works for 'cache.chunks.*', 'local.oplog.rs', and
+    // 'local.tenantMigration.oplogViewwhich' which are not user namespaces so object type is
+    // omitted from the error message below.
     uassert(ErrorCodes::FailedToParse,
             str::stream() << "$lookup 'from' field must be a string, but found "
                           << typeName(elem.type()),
@@ -111,8 +115,36 @@ NamespaceString parseLookupFromAndResolveNamespace(const BSONElement& elem, Stri
         ErrorCodes::FailedToParse,
         str::stream() << "$lookup with syntax {from: {db:<>, coll:<>},..} is not supported for db: "
                       << nss.db() << " and coll: " << nss.coll(),
-        nss.isConfigDotCacheDotChunks() || nss == NamespaceString::kRsOplogNamespace);
+        nss.isConfigDotCacheDotChunks() || nss == NamespaceString::kRsOplogNamespace ||
+            nss == NamespaceString::kTenantMigrationOplogView);
     return nss;
+}
+
+/**
+ * Checks if a sort stage's pattern is suitable to push the stage before $lookup. The sort stage
+ * must not share the same prefix with any field created or modified by the lookup stage.
+ */
+bool checkModifiedPathsSortReorder(const SortPattern& sortPattern,
+                                   const DocumentSource::GetModPathsReturn& modPaths) {
+    for (const auto& sortKey : sortPattern) {
+        if (!sortKey.fieldPath.has_value()) {
+            return false;
+        }
+        if (sortKey.fieldPath->getPathLength() < 1) {
+            return false;
+        }
+        auto sortField = sortKey.fieldPath->getFieldName(0);
+        auto it = std::find_if(
+            modPaths.paths.begin(), modPaths.paths.end(), [&sortField](const auto& modPath) {
+                // Finds if the shorter path is a prefix field of or the same as the longer one.
+                return sortField == modPath || expression::isPathPrefixOf(sortField, modPath) ||
+                    expression::isPathPrefixOf(modPath, sortField);
+            });
+        if (it != modPaths.paths.end()) {
+            return false;
+        }
+    }
+    return true;
 }
 
 }  // namespace
@@ -249,7 +281,8 @@ PrivilegeVector DocumentSourceLookUp::LiteParsed::requiredPrivileges(
 
 REGISTER_DOCUMENT_SOURCE(lookup,
                          DocumentSourceLookUp::LiteParsed::parse,
-                         DocumentSourceLookUp::createFromBson);
+                         DocumentSourceLookUp::createFromBson,
+                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
 
 const char* DocumentSourceLookUp::getSourceName() const {
     return kStageName.rawData();
@@ -435,6 +468,19 @@ Pipeline::SourceContainer::iterator DocumentSourceLookUp::doOptimizeAt(
 
     if (std::next(itr) == container->end()) {
         return container->end();
+    }
+
+    // If the following stage is $sort, consider pushing it ahead of $lookup.
+    if (auto sortPtr = dynamic_cast<DocumentSourceSort*>(std::next(itr)->get())) {
+        // TODO (SERVER-55417): Conditionally reorder $sort and $lookup depending on whether the
+        // query planner allows for an index-provided sort.
+        if (!_unwindSrc &&
+            checkModifiedPathsSortReorder(sortPtr->getSortKeyPattern(), getModifiedPaths())) {
+            // We have a sort not on as field following this stage. Reorder sort and current doc.
+            std::swap(*itr, *std::next(itr));
+
+            return itr == container->begin() ? itr : std::prev(itr);
+        }
     }
 
     auto nextUnwind = dynamic_cast<DocumentSourceUnwind*>((*std::next(itr)).get());
@@ -744,6 +790,19 @@ void DocumentSourceLookUp::recordPlanSummaryStats(const Pipeline& pipeline) {
     }
 }
 
+void DocumentSourceLookUp::appendSpecificExecStats(MutableDocument& doc) const {
+    const PlanSummaryStats& stats = _stats.planSummaryStats;
+    doc["totalDocsExamined"] = Value(static_cast<long long>(stats.totalDocsExamined));
+    doc["totalKeysExamined"] = Value(static_cast<long long>(stats.totalKeysExamined));
+    doc["collectionScans"] = Value(stats.collectionScans);
+    std::vector<Value> indexesUsedVec;
+    std::transform(stats.indexesUsed.begin(),
+                   stats.indexesUsed.end(),
+                   std::back_inserter(indexesUsedVec),
+                   [](std::string idx) -> Value { return Value(idx); });
+    doc["indexesUsed"] = Value{std::move(indexesUsedVec)};
+}
+
 void DocumentSourceLookUp::serializeToArrayWithBothSyntaxes(
     std::vector<Value>& array, boost::optional<ExplainOptions::Verbosity> explain) const {
 
@@ -785,6 +844,11 @@ void DocumentSourceLookUp::serializeToArrayWithBothSyntaxes(
                           << _unwindSrc->preserveNullAndEmptyArrays() << "includeArrayIndex"
                           << (indexPath ? Value(indexPath->fullPath()) : Value())));
         }
+
+        if (explain.get() >= ExplainOptions::Verbosity::kExecStats) {
+            appendSpecificExecStats(output);
+        }
+
         array.push_back(output.freezeToValue());
     } else {
         array.push_back(output.freezeToValue());

@@ -40,6 +40,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/api_parameters.h"
+#include "mongo/db/audit.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/namespace_string.h"
@@ -204,22 +205,11 @@ Status ViewCatalog::_reload(OperationContext* opCtx, ViewCatalogLookupBehavior l
             }
         }
 
-        boost::optional<TimeseriesOptions> timeseries;
-        if (view.hasField("timeseries")) {
-            try {
-                timeseries =
-                    TimeseriesOptions::parse({"ViewCatalog::_reload"}, view["timeseries"].Obj());
-            } catch (const DBException& ex) {
-                return ex.toStatus();
-            }
-        }
-
         _viewMap[viewName.ns()] = std::make_shared<ViewDefinition>(viewName.db(),
                                                                    viewName.coll(),
                                                                    view["viewOn"].str(),
                                                                    pipeline,
-                                                                   std::move(collator.getValue()),
-                                                                   timeseries);
+                                                                   std::move(collator.getValue()));
         return Status::OK();
     };
 
@@ -244,8 +234,18 @@ Status ViewCatalog::_reload(OperationContext* opCtx, ViewCatalogLookupBehavior l
     return Status::OK();
 }
 
-void ViewCatalog::clear(const Database* db) {
+void ViewCatalog::clear(OperationContext* opCtx, const Database* db) {
     auto catalog = getViewCatalog(db).writer();
+
+    // First, iterate through the views on this database and audit them before they are dropped.
+    for (auto&& view : catalog->_viewMap) {
+        audit::logDropView(opCtx->getClient(),
+                           (*view.second).name(),
+                           (*view.second).viewOn().ns(),
+                           (*view.second).pipeline(),
+                           ErrorCodes::OK);
+    }
+
     catalog.writable()->_viewMap.clear();
     catalog.writable()->_viewGraph.clear();
     catalog.writable()->_valid = true;
@@ -266,10 +266,12 @@ void ViewCatalog::_requireValidCatalog() const {
             _valid);
 }
 
-void ViewCatalog::iterate(OperationContext* opCtx, ViewIteratorCallback callback) const {
+void ViewCatalog::iterate(ViewIteratorCallback callback) const {
     _requireValidCatalog();
     for (auto&& view : _viewMap) {
-        callback(*view.second);
+        if (!callback(*view.second)) {
+            break;
+        }
     }
 }
 
@@ -277,8 +279,7 @@ Status ViewCatalog::_createOrUpdateView(OperationContext* opCtx,
                                         const NamespaceString& viewName,
                                         const NamespaceString& viewOn,
                                         const BSONArray& pipeline,
-                                        std::unique_ptr<CollatorInterface> collator,
-                                        const boost::optional<TimeseriesOptions>& timeseries) {
+                                        std::unique_ptr<CollatorInterface> collator) {
     invariant(opCtx->lockState()->isDbLockedForMode(viewName.db(), MODE_IX));
     invariant(opCtx->lockState()->isCollectionLockedForMode(viewName, MODE_IX));
     invariant(opCtx->lockState()->isCollectionLockedForMode(
@@ -295,17 +296,10 @@ Status ViewCatalog::_createOrUpdateView(OperationContext* opCtx,
     if (collator) {
         viewDefBuilder.append("collation", collator->getSpec().toBSON());
     }
-    if (timeseries) {
-        viewDefBuilder.append("timeseries", timeseries->toBSON());
-    }
 
     BSONObj ownedPipeline = pipeline.getOwned();
-    auto view = std::make_shared<ViewDefinition>(viewName.db(),
-                                                 viewName.coll(),
-                                                 viewOn.coll(),
-                                                 ownedPipeline,
-                                                 std::move(collator),
-                                                 timeseries);
+    auto view = std::make_shared<ViewDefinition>(
+        viewName.db(), viewName.coll(), viewOn.coll(), ownedPipeline, std::move(collator));
 
     // Check that the resulting dependency graph is acyclic and within the maximum depth.
     Status graphStatus = _upsertIntoGraph(opCtx, *(view.get()));
@@ -338,7 +332,7 @@ Status ViewCatalog::_upsertIntoGraph(OperationContext* opCtx, const ViewDefiniti
     auto doInsert = [this, &opCtx](const ViewDefinition& viewDef, bool needsValidation) -> Status {
         // Validate that the pipeline is eligible to serve as a view definition. If it is, this
         // will also return the set of involved namespaces.
-        auto pipelineStatus = _validatePipeline(opCtx, viewDef);
+        auto pipelineStatus = validatePipeline(opCtx, viewDef);
         if (!pipelineStatus.isOK()) {
             if (needsValidation) {
                 uassertStatusOKWithContext(pipelineStatus.getStatus(),
@@ -390,19 +384,19 @@ Status ViewCatalog::_upsertIntoGraph(OperationContext* opCtx, const ViewDefiniti
     return doInsert(viewDef, true);
 }
 
-StatusWith<stdx::unordered_set<NamespaceString>> ViewCatalog::_validatePipeline(
-    OperationContext* opCtx, const ViewDefinition& viewDef) const {
+StatusWith<stdx::unordered_set<NamespaceString>> ViewCatalog::validatePipeline(
+    OperationContext* opCtx, const ViewDefinition& viewDef) {
     const LiteParsedPipeline liteParsedPipeline(viewDef.viewOn(), viewDef.pipeline());
     const auto involvedNamespaces = liteParsedPipeline.getInvolvedNamespaces();
 
-    // If 'apiStrict: true', validates that the pipeline does not contain stages which are not in
-    // this API version.
-    auto apiParameters = APIParameters::get(opCtx);
-    if (apiParameters.getAPIStrict().value_or(false)) {
-        auto apiVersion = apiParameters.getAPIVersion();
-        invariant(apiVersion);
-        liteParsedPipeline.validatePipelineStagesIfAPIStrict(*apiVersion);
-    }
+    // The API version pipeline validation should be skipped for time-series view because of
+    // following reasons:
+    //     - the view pipeline is not created by (or visible to) the end-user and should be skipped.
+    //     - the view pipeline can have stages that are not allowed in stable API version '1' eg.
+    //       '$_internalUnpackBucket'.
+    bool performApiVersionChecks = !viewDef.timeseries();
+
+    liteParsedPipeline.validate(opCtx, performApiVersionChecks);
 
     // Verify that this is a legitimate pipeline specification by making sure it parses
     // correctly. In order to parse a pipeline we need to resolve any namespaces involved to a
@@ -414,7 +408,7 @@ StatusWith<stdx::unordered_set<NamespaceString>> ViewCatalog::_validatePipeline(
     }
     boost::intrusive_ptr<ExpressionContext> expCtx =
         new ExpressionContext(opCtx,
-                              AggregateCommand(viewDef.viewOn(), viewDef.pipeline()),
+                              AggregateCommandRequest(viewDef.viewOn(), viewDef.pipeline()),
                               CollatorInterface::cloneCollator(viewDef.defaultCollator()),
                               // We can use a stub MongoProcessInterface because we are only parsing
                               // the Pipeline for validation here. We won't do anything with the
@@ -498,8 +492,7 @@ Status ViewCatalog::createView(OperationContext* opCtx,
                                const NamespaceString& viewName,
                                const NamespaceString& viewOn,
                                const BSONArray& pipeline,
-                               const BSONObj& collation,
-                               const boost::optional<TimeseriesOptions>& timeseries) {
+                               const BSONObj& collation) {
     invariant(opCtx->lockState()->isDbLockedForMode(viewName.db(), MODE_IX));
     invariant(opCtx->lockState()->isCollectionLockedForMode(viewName, MODE_IX));
     invariant(opCtx->lockState()->isCollectionLockedForMode(
@@ -530,7 +523,7 @@ Status ViewCatalog::createView(OperationContext* opCtx,
         catalogStorage.setIgnoreExternalChange(true);
 
         result = catalog.writable()->_createOrUpdateView(
-            opCtx, viewName, viewOn, pipeline, std::move(collator.getValue()), timeseries);
+            opCtx, viewName, viewOn, pipeline, std::move(collator.getValue()));
     }
     if (result.isOK()) {
         catalog.commit();

@@ -33,6 +33,7 @@
 
 #include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/trial_run_tracker.h"
+#include "mongo/db/stats/resource_consumption_metrics.h"
 #include "mongo/util/str.h"
 
 namespace {
@@ -156,6 +157,9 @@ void SortStage::doAttachToTrialRunTracker(TrialRunTracker* tracker) {
 }
 
 void SortStage::open(bool reOpen) {
+    auto optTimer(getOptTimer(_opCtx));
+
+    invariant(_opCtx);
     _commonStats.opens++;
     _children[0]->open(reOpen);
 
@@ -166,18 +170,17 @@ void SortStage::open(bool reOpen) {
         value::MaterializedRow vals{_inValueAccessors.size()};
 
         size_t idx = 0;
-        for (auto accesor : _inKeyAccessors) {
-            auto [tag, val] = accesor->copyOrMoveValue();
+        for (auto accessor : _inKeyAccessors) {
+            auto [tag, val] = accessor->copyOrMoveValue();
             keys.reset(idx++, true, tag, val);
         }
 
         idx = 0;
-        for (auto accesor : _inValueAccessors) {
-            auto [tag, val] = accesor->copyOrMoveValue();
+        for (auto accessor : _inValueAccessors) {
+            auto [tag, val] = accessor->copyOrMoveValue();
             vals.reset(idx++, true, tag, val);
         }
 
-        // TODO SERVER-51815: count total mem usage for specificStats.
         _sorter->emplace(std::move(keys), std::move(vals));
 
         if (_tracker && _tracker->trackProgress<TrialRunTracker::kNumResults>(1)) {
@@ -195,13 +198,20 @@ void SortStage::open(bool reOpen) {
         }
     }
 
+    _specificStats.totalDataSizeBytes += _sorter->totalDataSizeSorted();
     _mergeIt.reset(_sorter->done());
     _specificStats.spills += _sorter->numSpills();
+    _specificStats.keysSorted += _sorter->numSorted();
+    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(_opCtx);
+    metricsCollector.incrementKeysSorted(_sorter->numSorted());
+    metricsCollector.incrementSorterSpills(_sorter->numSpills());
 
     _children[0]->close();
 }
 
 PlanState SortStage::getNext() {
+    auto optTimer(getOptTimer(_opCtx));
+
     // When the sort spilled data to disk then read back the sorted runs.
     if (_mergeIt && _mergeIt->more()) {
         _mergeData = _mergeIt->next();
@@ -213,6 +223,8 @@ PlanState SortStage::getNext() {
 }
 
 void SortStage::close() {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.closes++;
     _mergeIt.reset();
     _sorter.reset();
@@ -224,7 +236,9 @@ std::unique_ptr<PlanStageStats> SortStage::getStats(bool includeDebugInfo) const
 
     if (includeDebugInfo) {
         BSONObjBuilder bob;
-        bob.appendIntOrLL("totalDataSizeSorted", _specificStats.totalDataSizeBytes);
+        bob.appendNumber("memLimit", static_cast<long long>(_specificStats.maxMemoryUsageBytes));
+        bob.appendNumber("totalDataSizeSorted",
+                         static_cast<long long>(_specificStats.totalDataSizeBytes));
         bob.appendBool("usedDisk", _specificStats.spills > 0);
 
         BSONObjBuilder childrenBob(bob.subobjStart("orderBySlots"));
@@ -255,6 +269,16 @@ std::vector<DebugPrinter::Block> SortStage::debugPrint() const {
         }
 
         DebugPrinter::addIdentifier(ret, _obs[idx]);
+    }
+    ret.emplace_back(DebugPrinter::Block("`]"));
+
+    ret.emplace_back(DebugPrinter::Block("[`"));
+    for (size_t idx = 0; idx < _dirs.size(); idx++) {
+        if (idx) {
+            ret.emplace_back(DebugPrinter::Block("`,"));
+        }
+        DebugPrinter::addIdentifier(ret,
+                                    _dirs[idx] == value::SortDirection::Ascending ? "asc" : "desc");
     }
     ret.emplace_back(DebugPrinter::Block("`]"));
 

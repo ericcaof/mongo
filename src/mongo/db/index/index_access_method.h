@@ -162,10 +162,6 @@ public:
                           int64_t* numInserted,
                           int64_t* numDeleted) = 0;
 
-    virtual std::unique_ptr<SortedDataBuilderInterface> makeBulkBuilder(OperationContext* opCtx,
-                                                                        bool dupsAllowed) = 0;
-
-
     /**
      * Returns an unpositioned cursor over 'this' index.
      */
@@ -248,12 +244,6 @@ public:
                               const RecordId& loc,
                               const InsertDeleteOptions& options) = 0;
 
-        /**
-         * Inserts the keyString directly into the sorter. No additional logic (related to multikey
-         * paths, etc.) is performed.
-         */
-        virtual void addToSorter(const KeyString::Value& keyString) = 0;
-
         virtual const MultikeyPaths& getMultikeyPaths() const = 0;
 
         virtual bool isMultikey() const = 0;
@@ -290,7 +280,9 @@ public:
      * new index build.
      */
     virtual std::unique_ptr<BulkBuilder> initiateBulk(
-        size_t maxMemoryUsageBytes, const boost::optional<IndexStateInfo>& stateInfo) = 0;
+        size_t maxMemoryUsageBytes,
+        const boost::optional<IndexStateInfo>& stateInfo,
+        StringData dbName) = 0;
 
     /**
      * Call this when you are ready to finish your bulk work.
@@ -515,9 +507,6 @@ public:
                                                            bool isForward) const final;
     std::unique_ptr<SortedDataInterface::Cursor> newCursor(OperationContext* opCtx) const final;
 
-    std::unique_ptr<SortedDataBuilderInterface> makeBulkBuilder(OperationContext* opCtx,
-                                                                bool dupsAllowed) final;
-
     Status initializeAsEmpty(OperationContext* opCtx) final;
 
     void validate(OperationContext* opCtx,
@@ -541,8 +530,9 @@ public:
                             KeyStringSet multikeyMetadataKeys,
                             MultikeyPaths paths) final;
 
-    std::unique_ptr<BulkBuilder> initiateBulk(
-        size_t maxMemoryUsageBytes, const boost::optional<IndexStateInfo>& stateInfo) final;
+    std::unique_ptr<BulkBuilder> initiateBulk(size_t maxMemoryUsageBytes,
+                                              const boost::optional<IndexStateInfo>& stateInfo,
+                                              StringData dbName) final;
 
     Status commitBulk(OperationContext* opCtx,
                       BulkBuilder* bulk,

@@ -1,7 +1,8 @@
 /**
  * Tests that the migration still proceeds successfully after a state transition write aborts.
  *
- * @tags: [requires_fcv_47, incompatible_with_eft, requires_majority_read_concern]
+ * @tags: [requires_fcv_47, incompatible_with_eft, requires_majority_read_concern,
+ * incompatible_with_windows_tls]
  */
 (function() {
 "use strict";
@@ -57,8 +58,8 @@ function testAbortInitialState(donorRst) {
 
     // Verify that the migration completes successfully.
     assert.commandWorked(migrationThread.returnData());
-    tenantMigrationTest.waitForNodesToReachState(
-        donorRst.nodes, migrationId, tenantId, TenantMigrationTest.State.kCommitted);
+    tenantMigrationTest.waitForDonorNodesToReachState(
+        donorRst.nodes, migrationId, tenantId, TenantMigrationTest.DonorState.kCommitted);
 
     assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 }
@@ -106,12 +107,12 @@ function testAbortStateTransition(donorRst, pauseFailPoint, setUpFailPoints, nex
 
     // Verify that the migration completes successfully.
     assert.commandWorked(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
-    if (nextState === TenantMigrationTest.State.kAborted) {
-        tenantMigrationTest.waitForNodesToReachState(
-            donorRst.nodes, migrationId, tenantId, TenantMigrationTest.State.kAborted);
+    if (nextState === TenantMigrationTest.DonorState.kAborted) {
+        tenantMigrationTest.waitForDonorNodesToReachState(
+            donorRst.nodes, migrationId, tenantId, TenantMigrationTest.DonorState.kAborted);
     } else {
-        tenantMigrationTest.waitForNodesToReachState(
-            donorRst.nodes, migrationId, tenantId, TenantMigrationTest.State.kCommitted);
+        tenantMigrationTest.waitForDonorNodesToReachState(
+            donorRst.nodes, migrationId, tenantId, TenantMigrationTest.DonorState.kCommitted);
     }
     failPointsToClear.forEach(failPoint => {
         failPoint.off();
@@ -126,17 +127,17 @@ testAbortInitialState(donorRst);
 
 jsTest.log("Test aborting donor's state doc update");
 [{
-    pauseFailPoint: "pauseTenantMigrationAfterDataSync",
-    nextState: TenantMigrationTest.State.kBlocking
+    pauseFailPoint: "pauseTenantMigrationBeforeLeavingDataSyncState",
+    nextState: TenantMigrationTest.DonorState.kBlocking
 },
  {
-     pauseFailPoint: "pauseTenantMigrationAfterBlockingStarts",
-     nextState: TenantMigrationTest.State.kCommitted
+     pauseFailPoint: "pauseTenantMigrationBeforeLeavingBlockingState",
+     nextState: TenantMigrationTest.DonorState.kCommitted
  },
  {
-     pauseFailPoint: "pauseTenantMigrationAfterBlockingStarts",
-     setUpFailPoints: ["abortTenantMigrationAfterBlockingStarts"],
-     nextState: TenantMigrationTest.State.kAborted
+     pauseFailPoint: "pauseTenantMigrationBeforeLeavingBlockingState",
+     setUpFailPoints: ["abortTenantMigrationBeforeLeavingBlockingState"],
+     nextState: TenantMigrationTest.DonorState.kAborted
  }].forEach(({pauseFailPoint, setUpFailPoints = [], nextState}) => {
     testAbortStateTransition(donorRst, pauseFailPoint, setUpFailPoints, nextState);
 });

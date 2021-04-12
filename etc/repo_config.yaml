@@ -66,22 +66,6 @@ repos:
 #
 ####################
 
-  - name: rhel62
-    type: rpm
-    edition: org
-    bucket: repo.mongodb.org
-    repos:
-      - yum/redhat/6/mongodb-org
-      - yum/redhat/6Server/mongodb-org
-
-  - name: rhel67
-    type: rpm
-    edition: org
-    bucket: repo.mongodb.org
-    repos:
-      - yum/redhat/6/mongodb-org
-      - yum/redhat/6Server/mongodb-org
-
   - name: rhel70
     type: rpm
     edition: org
@@ -218,19 +202,6 @@ repos:
       - i386
     repos:
       - apt/ubuntu/dists/trusty/mongodb-org
-
-  - name: ubuntu1604
-    type: deb
-    code_name: "xenial"
-    edition: org
-    bucket: repo.mongodb.org
-    component: multiverse
-    architectures:
-      - amd64
-      - arm64
-      - i386
-    repos:
-      - apt/ubuntu/dists/xenial/mongodb-org
 
   - name: ubuntu1804
     type: deb
@@ -441,21 +412,6 @@ repos:
       - i386
     repos:
       - apt/ubuntu/dists/trusty/mongodb-enterprise
-
-  - name: ubuntu1604
-    type: deb
-    code_name: "xenial"
-    edition: enterprise
-    bucket: repo.mongodb.com
-    component: multiverse
-    architectures:
-      - amd64
-      - ppc64el
-      - s390x
-      - arm64
-      - i386
-    repos:
-      - apt/ubuntu/dists/xenial/mongodb-enterprise
 
   - name: ubuntu1804
     type: deb

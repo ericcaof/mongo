@@ -54,9 +54,8 @@
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/roll_back_local_operations.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/db/repl/tenant_migration_donor_util.h"
+#include "mongo/db/repl/tenant_migration_access_blocker_util.h"
 #include "mongo/db/repl/transaction_oplog_application.h"
-#include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/server_recovery.h"
 #include "mongo/db/session_catalog_mongod.h"
@@ -552,7 +551,7 @@ void RollbackImpl::_runPhaseFromAbortToReconstructPreparedTxns(
     // rollback.
     _correctRecordStoreCounts(opCtx);
 
-    tenant_migration_donor::recoverTenantMigrationAccessBlockers(opCtx);
+    tenant_migration_access_blocker::recoverTenantMigrationAccessBlockers(opCtx);
 
     // Reconstruct prepared transactions after counts have been adjusted. Since prepared
     // transactions were aborted (i.e. the in-memory counts were rolled-back) before computing
@@ -631,7 +630,7 @@ void RollbackImpl::_correctRecordStoreCounts(OperationContext* opCtx) {
                               "namespace"_attr = nss.ns(),
                               "uuid"_attr = uuid.toString(),
                               "ident"_attr = ident,
-                              "error"_attr = exec->statestr(state));
+                              "error"_attr = exec->stateToStr(state));
                 continue;
             }
             newCount = countFromScan;
@@ -1064,11 +1063,11 @@ Status RollbackImpl::_checkAgainstTimeLimit(
         return Status(ErrorCodes::OplogStartMissing, "no oplog during rollback");
     }
     const auto topOfOplogBSON = topOfOplogSW.getValue().first;
-    const auto topOfOplog = uassertStatusOK(OplogEntry::parse(topOfOplogBSON));
+    const auto topOfOplogOpAndWallTime = OpTimeAndWallTime::parse(topOfOplogBSON);
 
-    _rollbackStats.lastLocalOptime = topOfOplog.getOpTime();
+    _rollbackStats.lastLocalOptime = topOfOplogOpAndWallTime.opTime;
 
-    auto topOfOplogWallTime = topOfOplog.getWallClockTime();
+    auto topOfOplogWallTime = topOfOplogOpAndWallTime.wallTime;
     // We check the difference between the top of the oplog and the first oplog entry after the
     // common point when computing the rollback time limit.
     auto firstOpWallClockTimeAfterCommonPoint =
@@ -1226,8 +1225,12 @@ Status RollbackImpl::_triggerOpObserver(OperationContext* opCtx) {
 
 void RollbackImpl::_transitionFromRollbackToSecondary(OperationContext* opCtx) {
     invariant(opCtx);
-    invariant(_replicationCoordinator->getMemberState() == MemberState(MemberState::RS_ROLLBACK));
 
+    // It is possible that this node has actually been removed due to a reconfig via
+    // heartbeat during rollback. But it should be fine to transition to SECONDARY
+    // and this won't change how the node reports its member state since topology
+    // coordinator will always check if the node exists in its local config when
+    // returning member state.
     LOGV2(21611, "Transition to SECONDARY");
 
     ReplicationStateTransitionLockGuard transitionGuard(opCtx, MODE_X);

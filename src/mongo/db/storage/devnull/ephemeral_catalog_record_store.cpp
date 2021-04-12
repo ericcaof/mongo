@@ -36,7 +36,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/storage/oplog_hack.h"
+#include "mongo/db/record_id_helpers.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
@@ -150,6 +150,11 @@ public:
         return {{_it->first, _it->second.toRecordData()}};
     }
 
+    boost::optional<Record> seekNear(const RecordId& id) final {
+        // not implemented
+        return boost::none;
+    }
+
     void save() final {
         if (!_needFirstSeek && !_lastMoveWasRestore)
             _savedId = _it == _records.end() ? RecordId() : _it->first;
@@ -223,6 +228,11 @@ public:
         return {{_it->first, _it->second.toRecordData()}};
     }
 
+    boost::optional<Record> seekNear(const RecordId& id) final {
+        // not implemented
+        return boost::none;
+    }
+
     void save() final {
         if (!_needFirstSeek && !_lastMoveWasRestore)
             _savedId = _it == _records.rend() ? RecordId() : _it->first;
@@ -269,26 +279,14 @@ EphemeralForTestRecordStore::EphemeralForTestRecordStore(StringData ns,
                                                          StringData identName,
                                                          std::shared_ptr<void>* dataInOut,
                                                          bool isCapped,
-                                                         int64_t cappedMaxSize,
-                                                         int64_t cappedMaxDocs,
                                                          CappedCallback* cappedCallback)
     : RecordStore(ns, identName),
       _isCapped(isCapped),
-      _cappedMaxSize(cappedMaxSize),
-      _cappedMaxDocs(cappedMaxDocs),
       _cappedCallback(cappedCallback),
       _data(*dataInOut ? static_cast<Data*>(dataInOut->get())
                        : new Data(ns, NamespaceString::oplog(ns))) {
     if (!*dataInOut) {
         dataInOut->reset(_data);  // takes ownership
-    }
-
-    if (_isCapped) {
-        invariant(_cappedMaxSize > 0);
-        invariant(_cappedMaxDocs == -1 || _cappedMaxDocs > 0);
-    } else {
-        invariant(_cappedMaxSize == -1);
-        invariant(_cappedMaxDocs == -1);
     }
 }
 
@@ -355,38 +353,10 @@ void EphemeralForTestRecordStore::deleteRecord(WithLock lk,
     invariant(_data->records.erase(loc) == 1);
 }
 
-bool EphemeralForTestRecordStore::cappedAndNeedDelete(WithLock, OperationContext* opCtx) const {
-    if (!_isCapped)
-        return false;
-
-    if (_data->dataSize > _cappedMaxSize)
-        return true;
-
-    if ((_cappedMaxDocs != -1) && (numRecords(opCtx) > _cappedMaxDocs))
-        return true;
-
-    return false;
-}
-
-void EphemeralForTestRecordStore::cappedDeleteAsNeeded(WithLock lk, OperationContext* opCtx) {
-    while (cappedAndNeedDelete(lk, opCtx)) {
-        invariant(!_data->records.empty());
-
-        Records::iterator oldest = _data->records.begin();
-        RecordId id = oldest->first;
-        RecordData data = oldest->second.toRecordData();
-
-        if (_cappedCallback)
-            uassertStatusOK(_cappedCallback->aboutToDeleteCapped(opCtx, id, data));
-
-        deleteRecord(lk, opCtx, id);
-    }
-}
-
 StatusWith<RecordId> EphemeralForTestRecordStore::extractAndCheckLocForOplog(WithLock,
                                                                              const char* data,
                                                                              int len) const {
-    StatusWith<RecordId> status = oploghack::extractKey(data, len);
+    StatusWith<RecordId> status = record_id_helpers::extractKeyOptime(data, len);
     if (!status.isOK())
         return status;
 
@@ -403,14 +373,6 @@ StatusWith<RecordId> EphemeralForTestRecordStore::extractAndCheckLocForOplog(Wit
 Status EphemeralForTestRecordStore::insertRecords(OperationContext* opCtx,
                                                   std::vector<Record>* inOutRecords,
                                                   const std::vector<Timestamp>& timestamps) {
-
-    for (auto& record : *inOutRecords) {
-        if (_isCapped && record.data.size() > _cappedMaxSize) {
-            // We use dataSize for capped rollover and we don't want to delete everything if we know
-            // this won't fit.
-            return Status(ErrorCodes::BadValue, "object to insert exceeds cappedMaxSize");
-        }
-    }
     const auto insertSingleFn = [this, opCtx](Record* record) {
         stdx::lock_guard<stdx::recursive_mutex> lock(_data->recordsMutex);
         EphemeralForTestRecord rec(record->data.size());
@@ -432,8 +394,6 @@ Status EphemeralForTestRecordStore::insertRecords(OperationContext* opCtx,
         record->id = loc;
 
         opCtx->recoveryUnit()->registerChange(std::make_unique<InsertChange>(opCtx, _data, loc));
-        cappedDeleteAsNeeded(lock, opCtx);
-
         return Status::OK();
     };
 
@@ -464,8 +424,6 @@ Status EphemeralForTestRecordStore::updateRecord(OperationContext* opCtx,
         std::make_unique<RemoveChange>(opCtx, _data, loc, *oldRecord));
     _data->dataSize += len - oldLen;
     *oldRecord = newRecord;
-
-    cappedDeleteAsNeeded(lock, opCtx);
     return Status::OK();
 }
 
@@ -491,8 +449,6 @@ StatusWith<RecordData> EphemeralForTestRecordStore::updateWithDamages(
     opCtx->recoveryUnit()->registerChange(
         std::make_unique<RemoveChange>(opCtx, _data, loc, *oldRecord));
     *oldRecord = newRecord;
-
-    cappedDeleteAsNeeded(lock, opCtx);
 
     char* root = newRecord.data.get();
     mutablebson::DamageVector::const_iterator where = damages.begin();
@@ -543,16 +499,6 @@ void EphemeralForTestRecordStore::cappedTruncateAfter(OperationContext* opCtx,
     }
 }
 
-void EphemeralForTestRecordStore::appendCustomStats(OperationContext* opCtx,
-                                                    BSONObjBuilder* result,
-                                                    double scale) const {
-    result->appendBool("capped", _isCapped);
-    if (_isCapped) {
-        result->appendIntOrLL("max", _cappedMaxDocs);
-        result->appendIntOrLL("maxSize", _cappedMaxSize / scale);
-    }
-}
-
 int64_t EphemeralForTestRecordStore::storageSize(OperationContext* opCtx,
                                                  BSONObjBuilder* extraInfo,
                                                  int infoLevel) const {
@@ -563,32 +509,7 @@ int64_t EphemeralForTestRecordStore::storageSize(OperationContext* opCtx,
 
 RecordId EphemeralForTestRecordStore::allocateLoc(WithLock) {
     RecordId out = RecordId(_data->nextId++);
-    invariant(out.isNormal());
+    invariant(out.isValid());
     return out;
 }
-
-boost::optional<RecordId> EphemeralForTestRecordStore::oplogStartHack(
-    OperationContext* opCtx, const RecordId& startingPosition) const {
-    if (!_data->isOplog)
-        return boost::none;
-
-    stdx::lock_guard<stdx::recursive_mutex> lock(_data->recordsMutex);
-    const Records& records = _data->records;
-
-    if (records.empty())
-        return RecordId();
-
-    Records::const_iterator it = records.lower_bound(startingPosition);
-    if (it == records.end() || it->first > startingPosition) {
-        // If the startingPosition is before the oldest oplog entry, this ensures that we return
-        // RecordId() as specified in record_store.h.
-        if (it == records.begin()) {
-            return RecordId();
-        }
-        --it;
-    }
-
-    return it->first;
-}
-
 }  // namespace mongo

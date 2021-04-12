@@ -1,7 +1,7 @@
 // @tags: [
 //   assumes_balancer_off,
+//   requires_multi_updates,
 //   requires_non_retryable_writes,
-//   sbe_incompatible,
 // ]
 (function() {
 "use strict";
@@ -11,6 +11,12 @@ t.drop();
 
 // Include helpers for analyzing explain output.
 load("jstests/libs/analyze_plan.js");
+load("jstests/libs/sbe_explain_helpers.js");
+
+const isSBEEnabled = (() => {
+    const getParam = db.adminCommand({getParameter: 1, featureFlagSBE: 1});
+    return getParam.hasOwnProperty("featureFlagSBE") && getParam.featureFlagSBE.value;
+})();
 
 assert.commandWorked(t.insert({_id: {x: 1}, z: 1}));
 assert.commandWorked(t.insert({_id: {x: 2}, z: 2}));
@@ -35,31 +41,31 @@ assert.eq(8, t.findOne({_id: 3}).z);
 const query = {
     _id: {x: 2}
 };
-let explain = t.find(query).explain(true);
-assert.eq(1, explain.executionStats.nReturned);
-assert.eq(1, explain.executionStats.totalKeysExamined);
-assert(isIdhack(db, explain.queryPlanner.winningPlan));
+let explain = t.find(query).explain("allPlansExecution");
+assert.eq(1, explain.executionStats.nReturned, explain);
+assert.eq(1, explain.executionStats.totalKeysExamined, explain);
+assertIdHackPlan(db, getWinningPlan(explain.queryPlanner), "FETCH", isSBEEnabled);
 
 // ID hack cannot be used with hint().
 t.createIndex({_id: 1, a: 1});
 explain = t.find(query).hint({_id: 1, a: 1}).explain();
-assert(!isIdhack(db, explain.queryPlanner.winningPlan));
+assertNonIdHackPlan(db, getWinningPlan(explain.queryPlanner), isSBEEnabled);
 
 // ID hack cannot be used with skip().
 explain = t.find(query).skip(1).explain();
-assert(!isIdhack(db, explain.queryPlanner.winningPlan));
+assertNonIdHackPlan(db, getWinningPlan(explain.queryPlanner), isSBEEnabled);
 
 // ID hack cannot be used with a regex predicate.
 assert.commandWorked(t.insert({_id: "abc"}));
 explain = t.find({_id: /abc/}).explain();
 assert.eq({_id: "abc"}, t.findOne({_id: /abc/}));
-assert(!isIdhack(db, explain.queryPlanner.winningPlan));
+assertNonIdHackPlan(db, getWinningPlan(explain.queryPlanner), isSBEEnabled);
 
 // Covered query returning _id field only can be handled by ID hack.
 explain = t.find(query, {_id: 1}).explain();
-assert(isIdhack(db, explain.queryPlanner.winningPlan));
+assertIdHackPlan(db, getWinningPlan(explain.queryPlanner), "FETCH", isSBEEnabled);
 // Check doc from covered ID hack query.
-assert.eq({_id: {x: 2}}, t.findOne(query, {_id: 1}));
+assert.eq({_id: {x: 2}}, t.findOne(query, {_id: 1}), explain);
 
 //
 // Non-covered projection for idhack.
@@ -104,5 +110,5 @@ assert.eq(0, t.find({_id: 1}).hint({_id: 1}).max({_id: 0}).itcount());
 assert.eq(0, t.find({_id: 1}).hint({_id: 1}).min({_id: 2}).itcount());
 
 explain = t.find({_id: 2}).hint({_id: 1}).min({_id: 1}).max({_id: 3}).explain();
-assert(!isIdhack(db, explain.queryPlanner.winningPlan));
+assertNonIdHackPlan(db, getWinningPlan(explain.queryPlanner), isSBEEnabled);
 })();

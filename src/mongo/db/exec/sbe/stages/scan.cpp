@@ -37,7 +37,7 @@
 
 namespace mongo {
 namespace sbe {
-ScanStage::ScanStage(const NamespaceStringOrUUID& name,
+ScanStage::ScanStage(CollectionUUID collectionUuid,
                      boost::optional<value::SlotId> recordSlot,
                      boost::optional<value::SlotId> recordIdSlot,
                      std::vector<std::string> fields,
@@ -49,7 +49,7 @@ ScanStage::ScanStage(const NamespaceStringOrUUID& name,
                      LockAcquisitionCallback lockAcquisitionCallback,
                      ScanOpenCallback openCallback)
     : PlanStage(seekKeySlot ? "seek"_sd : "scan"_sd, yieldPolicy, nodeId),
-      _name(name),
+      _collUuid(collectionUuid),
       _recordSlot(recordSlot),
       _recordIdSlot(recordIdSlot),
       _fields(std::move(fields)),
@@ -63,7 +63,7 @@ ScanStage::ScanStage(const NamespaceStringOrUUID& name,
 }
 
 std::unique_ptr<PlanStage> ScanStage::clone() const {
-    return std::make_unique<ScanStage>(_name,
+    return std::make_unique<ScanStage>(_collUuid,
                                        _recordSlot,
                                        _recordIdSlot,
                                        _fields,
@@ -96,6 +96,9 @@ void ScanStage::prepare(CompileCtx& ctx) {
     if (_seekKeySlot) {
         _seekKeyAccessor = ctx.getAccessor(*_seekKeySlot);
     }
+
+    std::tie(_collName, _catalogEpoch) =
+        acquireCollection(_opCtx, _collUuid, _lockAcquisitionCallback, _coll);
 }
 
 value::SlotAccessor* ScanStage::getAccessor(CompileCtx& ctx, value::SlotId slot) {
@@ -131,10 +134,7 @@ void ScanStage::doRestoreState() {
         return;
     }
 
-    _coll.emplace(_opCtx, _name);
-    if (_lockAcquisitionCallback) {
-        _lockAcquisitionCallback(_opCtx, *_coll);
-    }
+    restoreCollection(_opCtx, _collName, _collUuid, _catalogEpoch, _lockAcquisitionCallback, _coll);
 
     if (_cursor) {
         const bool couldRestore = _cursor->restore();
@@ -166,22 +166,26 @@ void ScanStage::doAttachToTrialRunTracker(TrialRunTracker* tracker) {
 }
 
 void ScanStage::open(bool reOpen) {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.opens++;
     invariant(_opCtx);
-    if (!reOpen) {
-        invariant(!_cursor);
-        invariant(!_coll);
-        _coll.emplace(_opCtx, _name);
-        if (_lockAcquisitionCallback) {
-            _lockAcquisitionCallback(_opCtx, *_coll);
-        }
+
+    if (_open) {
+        tassert(5071001, "reopened ScanStage but reOpen=false", reOpen);
+        tassert(5071002, "ScanStage is open but _coll is not held", _coll);
+        tassert(5071003, "ScanStage is open but don't have _cursor", _cursor);
     } else {
-        invariant(_cursor);
-        invariant(_coll);
+        tassert(5071004, "first open to ScanStage but reOpen=true", !reOpen);
+        if (!_coll) {
+            // We're being opened after 'close()'. We need to re-acquire '_coll' in this case and
+            // make some validity checks (the collection has not been dropped, renamed, etc.).
+            tassert(5071005, "ScanStage is not open but have _cursor", !_cursor);
+            restoreCollection(
+                _opCtx, _collName, _collUuid, _catalogEpoch, _lockAcquisitionCallback, _coll);
+        }
     }
 
-    // TODO: this is currently used only to wait for oplog entries to become visible, so we
-    // may want to consider to move this logic into storage API instead.
     if (_openCallback) {
         _openCallback(_opCtx, _coll->getCollection(), reOpen);
     }
@@ -209,6 +213,8 @@ void ScanStage::open(bool reOpen) {
 }
 
 PlanState ScanStage::getNext() {
+    auto optTimer(getOptTimer(_opCtx));
+
     if (!_cursor) {
         return trackPlanState(PlanState::IS_EOF);
     }
@@ -230,7 +236,7 @@ PlanState ScanStage::getNext() {
 
     if (_recordIdAccessor) {
         _recordIdAccessor->reset(value::TypeTags::RecordId,
-                                 value::bitcastFrom<int64_t>(nextRecord->id.repr()));
+                                 value::bitcastFrom<int64_t>(nextRecord->id.getLong()));
     }
 
     if (!_fieldAccessors.empty()) {
@@ -271,6 +277,8 @@ PlanState ScanStage::getNext() {
 }
 
 void ScanStage::close() {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.closes++;
     _cursor.reset();
     _coll.reset();
@@ -283,15 +291,15 @@ std::unique_ptr<PlanStageStats> ScanStage::getStats(bool includeDebugInfo) const
 
     if (includeDebugInfo) {
         BSONObjBuilder bob;
-        bob.appendNumber("numReads", _specificStats.numReads);
+        bob.appendNumber("numReads", static_cast<long long>(_specificStats.numReads));
         if (_recordSlot) {
-            bob.appendIntOrLL("recordSlot", *_recordSlot);
+            bob.appendNumber("recordSlot", static_cast<long long>(*_recordSlot));
         }
         if (_recordIdSlot) {
-            bob.appendIntOrLL("recordIdSlot", *_recordIdSlot);
+            bob.appendNumber("recordIdSlot", static_cast<long long>(*_recordIdSlot));
         }
         if (_seekKeySlot) {
-            bob.appendIntOrLL("seekKeySlot", *_seekKeySlot);
+            bob.appendNumber("seekKeySlot", static_cast<long long>(*_seekKeySlot));
         }
         bob.append("fields", _fields);
         bob.append("outputSlots", _vars);
@@ -332,13 +340,15 @@ std::vector<DebugPrinter::Block> ScanStage::debugPrint() const {
     ret.emplace_back(DebugPrinter::Block("`]"));
 
     ret.emplace_back("@\"`");
-    DebugPrinter::addIdentifier(ret, _name.toString());
+    DebugPrinter::addIdentifier(ret, _collUuid.toString());
     ret.emplace_back("`\"");
+
+    ret.emplace_back(_forward ? "true" : "false");
 
     return ret;
 }
 
-ParallelScanStage::ParallelScanStage(const NamespaceStringOrUUID& name,
+ParallelScanStage::ParallelScanStage(CollectionUUID collectionUuid,
                                      boost::optional<value::SlotId> recordSlot,
                                      boost::optional<value::SlotId> recordIdSlot,
                                      std::vector<std::string> fields,
@@ -346,7 +356,7 @@ ParallelScanStage::ParallelScanStage(const NamespaceStringOrUUID& name,
                                      PlanYieldPolicy* yieldPolicy,
                                      PlanNodeId nodeId)
     : PlanStage("pscan"_sd, yieldPolicy, nodeId),
-      _name(name),
+      _collUuid(collectionUuid),
       _recordSlot(recordSlot),
       _recordIdSlot(recordIdSlot),
       _fields(std::move(fields)),
@@ -357,7 +367,7 @@ ParallelScanStage::ParallelScanStage(const NamespaceStringOrUUID& name,
 }
 
 ParallelScanStage::ParallelScanStage(const std::shared_ptr<ParallelState>& state,
-                                     const NamespaceStringOrUUID& name,
+                                     CollectionUUID collectionUuid,
                                      boost::optional<value::SlotId> recordSlot,
                                      boost::optional<value::SlotId> recordIdSlot,
                                      std::vector<std::string> fields,
@@ -365,7 +375,7 @@ ParallelScanStage::ParallelScanStage(const std::shared_ptr<ParallelState>& state
                                      PlanYieldPolicy* yieldPolicy,
                                      PlanNodeId nodeId)
     : PlanStage("pscan"_sd, yieldPolicy, nodeId),
-      _name(name),
+      _collUuid(collectionUuid),
       _recordSlot(recordSlot),
       _recordIdSlot(recordIdSlot),
       _fields(std::move(fields)),
@@ -376,7 +386,7 @@ ParallelScanStage::ParallelScanStage(const std::shared_ptr<ParallelState>& state
 
 std::unique_ptr<PlanStage> ParallelScanStage::clone() const {
     return std::make_unique<ParallelScanStage>(_state,
-                                               _name,
+                                               _collUuid,
                                                _recordSlot,
                                                _recordIdSlot,
                                                _fields,
@@ -401,6 +411,8 @@ void ParallelScanStage::prepare(CompileCtx& ctx) {
         auto [itRename, insertedRename] = _varAccessors.emplace(_vars[idx], it->second.get());
         uassert(4822817, str::stream() << "duplicate field: " << _vars[idx], insertedRename);
     }
+
+    std::tie(_collName, _catalogEpoch) = acquireCollection(_opCtx, _collUuid, nullptr, _coll);
 }
 
 value::SlotAccessor* ParallelScanStage::getAccessor(CompileCtx& ctx, value::SlotId slot) {
@@ -436,10 +448,7 @@ void ParallelScanStage::doRestoreState() {
         return;
     }
 
-    _coll.emplace(_opCtx, _name);
-
-    uassertStatusOK(repl::ReplicationCoordinator::get(_opCtx)->checkCanServeReadsFor(
-        _opCtx, _coll->getNss(), true));
+    restoreCollection(_opCtx, _collName, _collUuid, _catalogEpoch, nullptr, _coll);
 
     if (_cursor) {
         const bool couldRestore = _cursor->restore();
@@ -463,15 +472,17 @@ void ParallelScanStage::doAttachToOperationContext(OperationContext* opCtx) {
 }
 
 void ParallelScanStage::open(bool reOpen) {
+    auto optTimer(getOptTimer(_opCtx));
+
     invariant(_opCtx);
     invariant(!reOpen, "parallel scan is not restartable");
 
-    invariant(!_cursor);
-    invariant(!_coll);
-    _coll.emplace(_opCtx, _name);
-
-    uassertStatusOK(repl::ReplicationCoordinator::get(_opCtx)->checkCanServeReadsFor(
-        _opCtx, _coll->getNss(), true));
+    if (!_coll) {
+        // we're being opened after 'close()'. we need to re-acquire '_coll' in this case and
+        // make some validity checks (the collection has not been dropped, renamed, etc.).
+        tassert(5071013, "ParallelScanStage is not open but have _cursor", !_cursor);
+        restoreCollection(_opCtx, _collName, _collUuid, _catalogEpoch, nullptr, _coll);
+    }
 
     const auto& collection = _coll->getCollection();
 
@@ -524,6 +535,8 @@ boost::optional<Record> ParallelScanStage::nextRange() {
 }
 
 PlanState ParallelScanStage::getNext() {
+    auto optTimer(getOptTimer(_opCtx));
+
     if (!_cursor) {
         _commonStats.isEOF = true;
         return PlanState::IS_EOF;
@@ -553,7 +566,7 @@ PlanState ParallelScanStage::getNext() {
 
     if (_recordIdAccessor) {
         _recordIdAccessor->reset(value::TypeTags::RecordId,
-                                 value::bitcastFrom<int64_t>(nextRecord->id.repr()));
+                                 value::bitcastFrom<int64_t>(nextRecord->id.getLong()));
     }
 
 
@@ -587,6 +600,8 @@ PlanState ParallelScanStage::getNext() {
 }
 
 void ParallelScanStage::close() {
+    auto optTimer(getOptTimer(_opCtx));
+
     _cursor.reset();
     _coll.reset();
     _open = false;
@@ -625,7 +640,7 @@ std::vector<DebugPrinter::Block> ParallelScanStage::debugPrint() const {
     ret.emplace_back(DebugPrinter::Block("`]"));
 
     ret.emplace_back("@\"`");
-    DebugPrinter::addIdentifier(ret, _name.toString());
+    DebugPrinter::addIdentifier(ret, _collUuid.toString());
     ret.emplace_back("`\"");
 
     return ret;

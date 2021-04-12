@@ -1,14 +1,12 @@
 /**
  * Tests that the client can retry commitTransaction on the tenant migration recipient.
  *
- * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft]
+ * @tags: [requires_fcv_49, requires_majority_read_concern, incompatible_with_eft,
+ * incompatible_with_windows_tls]
  */
 
 (function() {
 "use strict";
-
-// Direct writes to config.transactions cannot be part of a session.
-TestData.disableImplicitSessions = true;
 
 load("jstests/replsets/libs/tenant_migration_test.js");
 load("jstests/replsets/libs/tenant_migration_util.js");
@@ -16,24 +14,25 @@ load("jstests/replsets/rslib.js");
 load("jstests/libs/uuid_util.js");
 
 const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
+const kGarbageCollectionParams = {
+    // Set the delay before a donor state doc is garbage collected to be short to speed up
+    // the test.
+    tenantMigrationGarbageCollectionDelayMS: 3 * 1000,
+
+    // Set the TTL monitor to run at a smaller interval to speed up the test.
+    ttlMonitorSleepSecs: 1,
+};
+
 const donorRst = new ReplSetTest({
     nodes: 1,
     name: "donor",
-    nodeOptions: Object.assign(migrationX509Options.donor, {
-        setParameter: {
-            // Set the delay before a donor state doc is garbage collected to be short to speed up
-            // the test.
-            tenantMigrationGarbageCollectionDelayMS: 3 * 1000,
-
-            // Set the TTL monitor to run at a smaller interval to speed up the test.
-            ttlMonitorSleepSecs: 1,
-        }
-    })
+    nodeOptions: Object.assign(migrationX509Options.donor, {setParameter: kGarbageCollectionParams})
 });
 const recipientRst = new ReplSetTest({
     nodes: [{}, {rsConfig: {priority: 0}}, {rsConfig: {priority: 0}}],
     name: "recipient",
-    nodeOptions: migrationX509Options.recipient
+    nodeOptions:
+        Object.assign(migrationX509Options.recipient, {setParameter: kGarbageCollectionParams})
 });
 
 donorRst.startSet();
@@ -75,7 +74,8 @@ assert.commandWorked(donorPrimary.getCollection(kNs).insert(
     session.endSession();
 }
 
-let txnEntryOnDonor = donorPrimary.getCollection("config.transactions").find().toArray()[0];
+const waitAfterStartingOplogApplier = configureFailPoint(
+    recipientPrimary, "fpAfterStartingOplogApplierMigrationRecipientInstance", {action: "hang"});
 
 jsTest.log("Run a migration to completion");
 const migrationId = UUID();
@@ -83,62 +83,51 @@ const migrationOpts = {
     migrationIdString: extractUUIDFromObject(migrationId),
     tenantId: kTenantId,
 };
-assert.commandWorked(tenantMigrationTest.runMigration(migrationOpts));
+tenantMigrationTest.startMigration(migrationOpts);
 
-const donorDoc =
-    donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS).findOne({tenantId: kTenantId});
+// Hang the recipient during oplog application before we continue to run more transactions on the
+// donor. This is to test applying multiple transactions on multiple sessions in the same batch.
+waitAfterStartingOplogApplier.wait();
+const waitInOplogApplier = configureFailPoint(recipientPrimary, "hangInTenantOplogApplication");
+tenantMigrationTest.insertDonorDB(kDbName, kCollName, [{_id: 3, x: 3}, {_id: 4, x: 4}]);
 
-tenantMigrationTest.waitForMigrationGarbageCollection(donorRst.nodes, migrationId, kTenantId);
+waitInOplogApplier.wait();
 
-{
-    jsTest.log("Run another transaction after the migration");
-    const session = donorPrimary.startSession({causalConsistency: false});
+jsTestLog("Run transactions while the migration is running");
+// Run transactions against the donor on different sessions.
+for (let i = 0; i < 10; i++) {
+    const session = donorPrimary.startSession();
     const sessionDb = session.getDatabase(kDbName);
     const sessionColl = sessionDb[kCollName];
 
     session.startTransaction({writeConcern: {w: "majority"}});
-    const findAndModifyRes1 = sessionColl.findAndModify({query: {x: 1}, remove: true});
-    assert.eq({_id: 1, x: 1}, findAndModifyRes1);
+    assert.commandWorked(sessionColl.updateMany({}, {$push: {transactions: `session${i}_txn1`}}));
     assert.commandWorked(session.commitTransaction_forTesting());
-    assert.sameMembers(sessionColl.find({}).toArray(), [{_id: 2, x: 2}]);
+
+    session.startTransaction({writeConcern: {w: "majority"}});
+    assert.commandWorked(sessionColl.updateMany({}, {$push: {transactions: `session${i}_txn2`}}));
+    assert.commandWorked(session.commitTransaction_forTesting());
     session.endSession();
 }
 
-// Test the aggregation pipeline the recipient would use for getting the config.transactions entry
-// on the donor. The recipient will use the real startFetchingTimestamp, but this test uses the
-// donor's commit timestamp as a substitute.
-const startFetchingTimestamp = donorDoc.commitOrAbortOpTime.ts;
-const aggRes = donorPrimary.getDB("config").runCommand({
-    aggregate: "transactions",
-    pipeline: [
-        {$match: {"lastWriteOpTime.ts": {$lt: startFetchingTimestamp}, "state": "committed"}},
-    ],
-    readConcern: {level: "majority", afterClusterTime: startFetchingTimestamp},
-    hint: "_id_",
-    cursor: {},
+waitAfterStartingOplogApplier.off();
+waitInOplogApplier.off();
+
+assert.commandWorked(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
+tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString);
+tenantMigrationTest.waitForMigrationGarbageCollection(migrationId, kTenantId);
+
+// Test the client can retry commitTransaction against the recipient for transactions that committed
+// on the donor.
+const donorTxnEntries = donorPrimary.getDB("config")["transactions"].find().toArray();
+jsTestLog(`Donor config.transactions: ${tojson(donorTxnEntries)}`);
+const recipientTxnEntries = recipientPrimary.getDB("config")["transactions"].find().toArray();
+jsTestLog(`Recipient config.transactions: ${tojson(recipientTxnEntries)}`);
+donorTxnEntries.forEach((txnEntry) => {
+    jsTestLog("Retrying transaction on recipient: " + tojson(txnEntry));
+    assert.commandWorked(recipientPrimary.adminCommand(
+        {commitTransaction: 1, lsid: txnEntry._id, txnNumber: txnEntry.txnNum, autocommit: false}));
 });
-assert.eq(1, aggRes.cursor.firstBatch.length);
-assert.eq(txnEntryOnDonor, aggRes.cursor.firstBatch[0]);
-
-// Test the client can retry commitTransaction for that transaction that committed prior to the
-// migration.
-
-// Insert the config.transactions entry on the recipient, but with a dummy lastWriteOpTime. The
-// recipient should not need a real lastWriteOpTime to support a commitTransaction retry.
-txnEntryOnDonor.lastWriteOpTime.ts = new Timestamp(0, 0);
-assert.commandWorked(
-    recipientPrimary.getCollection("config.transactions").insert([txnEntryOnDonor]));
-recipientRst.awaitLastOpCommitted();
-recipientRst.getSecondaries().forEach(node => {
-    assert.eq(1, node.getCollection("config.transactions").count(txnEntryOnDonor));
-});
-
-assert.commandWorked(recipientPrimary.adminCommand({
-    commitTransaction: 1,
-    lsid: txnEntryOnDonor._id,
-    txnNumber: txnEntryOnDonor.txnNum,
-    autocommit: false
-}));
 
 donorRst.stopSet();
 recipientRst.stopSet();

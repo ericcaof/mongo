@@ -1,7 +1,4 @@
 // Test $text with $textScore projection.
-// @tags: [
-//   sbe_incompatible,
-// ]
 (function() {
 "use strict";
 
@@ -110,10 +107,10 @@ assert.neq(-1,
 let explainOutput = t.find({$text: {$search: "textual content -irrelevant"}}, {
                          score: {$meta: "textScore"}
                      }).explain();
-assert(planHasStage(db, explainOutput.queryPlanner.winningPlan, "TEXT_OR"));
+assert(planHasStage(db, getWinningPlan(explainOutput.queryPlanner), "TEXT_OR"), explainOutput);
 
 explainOutput = t.find({$text: {$search: "textual content -irrelevant"}}).explain();
-assert(!planHasStage(db, explainOutput.queryPlanner.winningPlan, "TEXT_OR"));
+assert(!planHasStage(db, getWinningPlan(explainOutput.queryPlanner), "TEXT_OR"), explainOutput);
 
 // Scores should exist.
 assert.eq(results.length, 2);

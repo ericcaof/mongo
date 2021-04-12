@@ -42,11 +42,20 @@ std::pair<value::TypeTags, value::Value> convertFrom(bool view,
 const char* advance(const char* be, size_t fieldNameSize);
 
 inline auto fieldNameView(const char* be) noexcept {
-    return std::string_view{be + 1};
+    return StringData{be + 1};
 }
 
-void convertToBsonObj(BSONArrayBuilder& builder, value::Array* arr);
-void convertToBsonObj(BSONObjBuilder& builder, value::Object* obj);
+template <class ArrayBuilder>
+void convertToBsonObj(ArrayBuilder& builder, value::Array* arr);
+
+template <class ObjBuilder>
+void convertToBsonObj(ObjBuilder& builder, value::Object* obj);
+
+template <class ObjBuilder>
+void appendValueToBsonObj(ObjBuilder& builder,
+                          StringData name,
+                          value::TypeTags tag,
+                          value::Value val);
 }  // namespace bson
 }  // namespace sbe
 }  // namespace mongo

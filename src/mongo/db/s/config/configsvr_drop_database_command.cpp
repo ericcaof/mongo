@@ -29,23 +29,24 @@
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/api_parameters.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/s/config/sharding_catalog_manager.h"
-#include "mongo/db/s/dist_lock_manager.h"
-#include "mongo/db/s/sharding_logging.h"
+#include "mongo/db/s/drop_database_legacy.h"
 #include "mongo/s/catalog/type_database.h"
-#include "mongo/s/catalog_cache.h"
-#include "mongo/s/grid.h"
-#include "mongo/util/scopeguard.h"
 
+// TODO (SERVER-54879): Remove this command entirely after 5.0 branches
 namespace mongo {
 namespace {
+
+using FeatureCompatibility = ServerGlobalParams::FeatureCompatibility;
+using FCVersion = FeatureCompatibility::Version;
 
 /**
  * Internal sharding command run on config servers to drop a database.
@@ -89,14 +90,14 @@ public:
         return Status::OK();
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
+    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
         return cmdObj.firstElement().str();
     }
 
     bool run(OperationContext* opCtx,
              const std::string& dbname_unused,
              const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
+             BSONObjBuilder& result) override {
         uassert(ErrorCodes::IllegalOperation,
                 "_configsvrDropDatabase can only be run on config servers",
                 serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
@@ -117,115 +118,17 @@ public:
                               << cmdObj,
                 opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
 
-        auto const catalogClient = Grid::get(opCtx)->catalogClient();
-        auto const catalogManager = ShardingCatalogManager::get(opCtx);
+        FixedFCVRegion fcvRegion(opCtx);
 
-        auto scopedLock = catalogManager->serializeCreateOrDropDatabase(opCtx, dbname);
+        uassert(ErrorCodes::CommandNotSupported,
+                "The _configsvrDropDatabase command is only supported under feature compatibility "
+                "version 4.4",
+                fcvRegion == FCVersion::kFullyDowngradedTo44);
 
-        auto dbDistLock = uassertStatusOK(DistLockManager::get(opCtx)->lock(
-            opCtx, dbname, "dropDatabase", DistLockManager::kDefaultLockTimeout));
-
-        // Invalidate the database metadata so the next access kicks off a full reload.
-        ON_BLOCK_EXIT([opCtx, dbname] { Grid::get(opCtx)->catalogCache()->purgeDatabase(dbname); });
-
-        DatabaseType dbType;
-        try {
-            dbType = catalogClient->getDatabase(
-                opCtx, dbname, repl::ReadConcernArgs::get(opCtx).getLevel());
-        } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
-            // If the namespace isn't found, treat the drop as a success. In case the drop just
-            // happened and has not fully propagated, set the client's last optime to the system's
-            // last optime to ensure the client waits.
-            result.append("info", "database does not exist");
-            repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
-            return true;
-        }
-
-        uassertStatusOK(ShardingLogging::get(opCtx)->logChangeChecked(
-            opCtx,
-            "dropDatabase.start",
-            dbname,
-            BSONObj(),
-            ShardingCatalogClient::kMajorityWriteConcern));
-
-        // Drop the database's collections.
-        for (const auto& nss : catalogClient->getAllShardedCollectionsForDb(
-                 opCtx, dbname, repl::ReadConcernArgs::get(opCtx).getLevel())) {
-            auto collDistLock = uassertStatusOK(DistLockManager::get(opCtx)->lock(
-                opCtx, nss.ns(), "dropCollection", DistLockManager::kDefaultLockTimeout));
-            catalogManager->dropCollection(opCtx, nss);
-        }
-
-        // Drop the database from the primary shard first.
-        _dropDatabaseFromShard(opCtx, dbType.getPrimary(), dbname);
-
-        // Drop the database from each of the remaining shards.
-        const auto allShardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIdsNoReload();
-        for (const ShardId& shardId : allShardIds) {
-            _dropDatabaseFromShard(opCtx, shardId, dbname);
-        }
-
-
-        // Remove the database entry from the metadata.
-        const Status status =
-            catalogClient->removeConfigDocuments(opCtx,
-                                                 DatabaseType::ConfigNS,
-                                                 BSON(DatabaseType::name(dbname)),
-                                                 ShardingCatalogClient::kMajorityWriteConcern);
-        uassertStatusOKWithContext(
-            status, str::stream() << "Could not remove database '" << dbname << "' from metadata");
-
-        // Send _flushDatabaseCacheUpdates to all shards
-        IgnoreAPIParametersBlock ignoreApiParametersBlock{opCtx};
-        for (const ShardId& shardId : allShardIds) {
-            const auto shard =
-                uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId));
-            auto cmdResponse = uassertStatusOK(shard->runCommandWithFixedRetryAttempts(
-                opCtx,
-                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                "admin",
-                BSON("_flushDatabaseCacheUpdates" << dbname),
-                Shard::RetryPolicy::kIdempotent));
-            uassertStatusOK(cmdResponse.commandStatus);
-        }
-
-        ShardingLogging::get(opCtx)->logChange(
-            opCtx, "dropDatabase", dbname, BSONObj(), ShardingCatalogClient::kMajorityWriteConcern);
-
-        result.append("dropped", dbname);
+        dropDatabaseLegacy(opCtx, dbname);
+        repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
         return true;
     }
-
-private:
-    /**
-     * Sends the 'dropDatabase' command for the specified database to the specified shard. Throws
-     * DBException on failure.
-     */
-    static void _dropDatabaseFromShard(OperationContext* opCtx,
-                                       const ShardId& shardId,
-                                       const std::string& dbName) {
-
-        const auto dropDatabaseCommandBSON = [opCtx] {
-            BSONObjBuilder builder;
-            builder.append("dropDatabase", 1);
-            builder.append(WriteConcernOptions::kWriteConcernField,
-                           opCtx->getWriteConcern().toBSON());
-            return builder.obj();
-        }();
-
-        const auto shard =
-            uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId));
-        auto cmdDropDatabaseResult = uassertStatusOK(shard->runCommandWithFixedRetryAttempts(
-            opCtx,
-            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-            dbName,
-            dropDatabaseCommandBSON,
-            Shard::RetryPolicy::kIdempotent));
-
-        uassertStatusOK(cmdDropDatabaseResult.commandStatus);
-        uassertStatusOK(cmdDropDatabaseResult.writeConcernStatus);
-    };
-
 } configsvrDropDatabaseCmd;
 
 }  // namespace

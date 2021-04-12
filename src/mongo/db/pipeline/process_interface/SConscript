@@ -50,6 +50,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/index_builds_coordinator_mongod',
         '$BUILD_DIR/mongo/db/repl/primary_only_service',
         '$BUILD_DIR/mongo/db/session_catalog',
+        '$BUILD_DIR/mongo/db/stats/fill_locker_info',
         '$BUILD_DIR/mongo/db/storage/backup_cursor_hooks',
         '$BUILD_DIR/mongo/scripting/scripting_common',
     ],
@@ -64,7 +65,6 @@ env.Library(
         'mongod_process_interfaces',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/s/common_s',
         '$BUILD_DIR/mongo/s/sharding_api',
     ],
 )
@@ -116,6 +116,7 @@ env.CppUnitTest(
         'standalone_process_interface_test.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/query/query_test_service_context',
         '$BUILD_DIR/mongo/db/service_context_test_fixture',
         '$BUILD_DIR/mongo/db/vector_clock_mongod',

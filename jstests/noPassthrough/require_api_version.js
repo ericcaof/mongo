@@ -4,29 +4,43 @@
  * This test is incompatible with parallel and passthrough suites; concurrent jobs fail while
  * requireApiVersion is true.
  *
- * @tags: [requires_journaling, requires_replication, requires_transactions]
+ * @tags: [
+ *   requires_journaling,
+ *   requires_replication,
+ *   requires_transactions,
+ * ]
  */
 
 (function() {
 "use strict";
 
-function runTest(db, supportsTransctions, isMongos) {
+function runTest(db, supportsTransctions, isMongos, writeConcern = {}, secondaries = []) {
     assert.commandWorked(db.runCommand({setParameter: 1, requireApiVersion: true}));
+    for (const secondary of secondaries) {
+        assert.commandWorked(secondary.adminCommand({setParameter: 1, requireApiVersion: true}));
+    }
+
     assert.commandFailedWithCode(db.runCommand({ping: 1}), 498870, "command without apiVersion");
     assert.commandWorked(db.runCommand({ping: 1, apiVersion: "1"}));
     assert.commandFailed(db.runCommand({ping: 1, apiVersion: "not a real API version"}));
 
+    // Create a collection and do some writes with writeConcern majority.
+    const collName = "testColl";
+    assert.commandWorked(db.runCommand({create: collName, apiVersion: "1", writeConcern}));
+    assert.commandWorked(db.runCommand(
+        {insert: collName, documents: [{a: 1, b: 2}], apiVersion: "1", writeConcern}));
+
     // User management commands loop back into the system so make sure they set apiVersion
     // internally
-    assert.commandWorked(
-        db.adminCommand({createRole: 'testRole', apiVersion: "1", privileges: [], roles: []}));
-    assert.commandWorked(db.adminCommand({dropRole: 'testRole', apiVersion: "1"}));
+    assert.commandWorked(db.adminCommand(
+        {createRole: 'testRole', apiVersion: "1", writeConcern, privileges: [], roles: []}));
+    assert.commandWorked(db.adminCommand({dropRole: 'testRole', apiVersion: "1", writeConcern}));
 
     /*
      * "getMore" never accepts or requires apiVersion.
      */
-    assert.commandWorked(
-        db.runCommand({insert: "collection", documents: [{}, {}, {}], apiVersion: "1"}));
+    assert.commandWorked(db.runCommand(
+        {insert: "collection", documents: [{}, {}, {}], apiVersion: "1", writeConcern}));
     let reply = db.runCommand({find: "collection", batchSize: 1, apiVersion: "1"});
     assert.commandWorked(reply);
     assert.commandWorked(db.runCommand({getMore: reply.cursor.id, collection: "collection"}));
@@ -97,17 +111,56 @@ function runTest(db, supportsTransctions, isMongos) {
 
     assert.commandWorked(
         db.runCommand({setParameter: 1, requireApiVersion: false, apiVersion: "1"}));
+    for (const secondary of secondaries) {
+        assert.commandWorked(
+            secondary.adminCommand({setParameter: 1, requireApiVersion: false, apiVersion: "1"}));
+    }
     assert.commandWorked(db.runCommand({ping: 1}));
 }
+
+function requireApiVersionOnShardOrConfigServerTest() {
+    let shardsvrMongod =
+        MongoRunner.runMongod({shardsvr: "", setParameter: {"requireApiVersion": true}});
+    assert.eq(null,
+              shardsvrMongod,
+              "mongod should not be able to start up with --shardsvr and requireApiVersion=true");
+
+    let configsvrMongod =
+        MongoRunner.runMongod({configsvr: "", setParameter: {"requireApiVersion": 1}});
+    assert.eq(null,
+              configsvrMongod,
+              "mongod should not be able to start up with --configsvr and requireApiVersion=true");
+
+    shardsvrMongod = MongoRunner.runMongod({shardsvr: ""});
+    assert.neq(null, shardsvrMongod, "mongod was not able to start up");
+    assert.commandFailed(
+        shardsvrMongod.adminCommand({setParameter: 1, requireApiVersion: true}),
+        "should not be able to set requireApiVersion=true on mongod that was started with --shardsvr");
+    MongoRunner.stopMongod(shardsvrMongod);
+
+    configsvrMongod = MongoRunner.runMongod({configsvr: ""});
+    assert.neq(null, configsvrMongod, "mongod was not able to start up");
+    assert.commandFailed(
+        configsvrMongod.adminCommand({setParameter: 1, requireApiVersion: 1}),
+        "should not be able to set requireApiVersion=true on mongod that was started with --configsvr");
+    MongoRunner.stopMongod(configsvrMongod);
+}
+
+requireApiVersionOnShardOrConfigServerTest();
 
 const mongod = MongoRunner.runMongod();
 runTest(mongod.getDB("admin"), false /* supportsTransactions */, false /* isMongos */);
 MongoRunner.stopMongod(mongod);
 
-const rst = new ReplSetTest({nodes: 1});
+const rst = new ReplSetTest({nodes: 3});
 rst.startSet();
-rst.initiate();
-runTest(rst.getPrimary().getDB("admin"), true /* supportsTransactions */, false /* isMongos */);
+rst.initiateWithHighElectionTimeout();
+
+runTest(rst.getPrimary().getDB("admin"),
+        true /* supportsTransactions */,
+        false /* isMongos */,
+        {w: "majority"} /* writeConcern */,
+        rst.getSecondaries());
 rst.stopSet();
 
 const st = new ShardingTest({});

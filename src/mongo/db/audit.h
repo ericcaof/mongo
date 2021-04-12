@@ -37,13 +37,15 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/user.h"
-#include "mongo/db/ops/write_ops_parsers.h"
+#include "mongo/db/ops/write_ops.h"
 #include "mongo/rpc/op_msg.h"
+#include "mongo/util/functional.h"
 
 namespace mongo {
 
 class AuthorizationSession;
 class BSONObj;
+class BSONObjBuilder;
 class Client;
 class NamespaceString;
 class OperationContext;
@@ -55,6 +57,22 @@ class Document;
 }  // namespace mutablebson
 
 namespace audit {
+
+/**
+ * Struct that temporarily stores client information when an audit hook
+ * executes on a separate thread with a new Client. In those cases, ImpersonatedClientAttrs
+ * can bundle all relevant client attributes necessary for auditing and be safely
+ * passed into the new thread, where the new Client will be loaded with the userNames and
+ * roleNames stored in ImpersonatedClientAttrs.
+ */
+struct ImpersonatedClientAttrs {
+    std::vector<UserName> userNames;
+    std::vector<RoleName> roleNames;
+
+    ImpersonatedClientAttrs() = default;
+
+    ImpersonatedClientAttrs(Client* client);
+};
 
 /**
  * Narrow API for the parts of mongo::Command used by the audit library.
@@ -70,12 +88,64 @@ public:
 };
 
 /**
+ * Logs the metadata for a client connection once it is finalized.
+ */
+void logClientMetadata(Client* client);
+
+/**
+ * AuthenticateEvent is a opaque view into a finished authentication handshake.
+ *
+ * This object is only valid within its initial stack context.
+ */
+class AuthenticateEvent {
+public:
+    using Appender = unique_function<void(BSONObjBuilder*)>;
+
+    AuthenticateEvent(StringData mechanism,
+                      StringData db,
+                      StringData user,
+                      Appender appender,
+                      ErrorCodes::Error result)
+        : _mechanism(mechanism),
+          _db(db),
+          _user(user),
+          _appender(std::move(appender)),
+          _result(result) {}
+
+    StringData getMechanism() const {
+        return _mechanism;
+    }
+
+    StringData getDatabase() const {
+        return _db;
+    }
+
+    StringData getUser() const {
+        return _user;
+    }
+
+    ErrorCodes::Error getResult() const {
+        return _result;
+    }
+
+    void appendExtraInfo(BSONObjBuilder* bob) const {
+        _appender(bob);
+    }
+
+private:
+    StringData _mechanism;
+    StringData _db;
+    StringData _user;
+
+    Appender _appender;
+
+    ErrorCodes::Error _result;
+};
+
+/**
  * Logs the result of an authentication attempt.
  */
-void logAuthentication(Client* client,
-                       StringData mechanism,
-                       const UserName& user,
-                       ErrorCodes::Error result);
+void logAuthentication(Client* client, const AuthenticateEvent& event);
 
 //
 // Authorization (authz) logging functions.
@@ -275,18 +345,20 @@ void logLogout(Client* client,
 void logCreateIndex(Client* client,
                     const BSONObj* indexSpec,
                     StringData indexname,
-                    StringData nsname);
+                    const NamespaceString& nsname,
+                    StringData indexBuildState,
+                    ErrorCodes::Error result);
 
 /**
  * Logs the result of a createCollection command.
  */
-void logCreateCollection(Client* client, StringData nsname);
+void logCreateCollection(Client* client, const NamespaceString& nsname);
 
 /**
  * Logs the result of a createView command.
  */
 void logCreateView(Client* client,
-                   StringData nsname,
+                   const NamespaceString& nsname,
                    StringData viewOn,
                    BSONArray pipeline,
                    ErrorCodes::Error code);
@@ -294,7 +366,7 @@ void logCreateView(Client* client,
 /**
  * Logs the result of an importCollection command.
  */
-void logImportCollection(Client* client, StringData nsname);
+void logImportCollection(Client* client, const NamespaceString& nsname);
 
 /**
  * Logs the result of a createDatabase command.
@@ -305,12 +377,21 @@ void logCreateDatabase(Client* client, StringData dbname);
 /**
  * Logs the result of a dropIndex command.
  */
-void logDropIndex(Client* client, StringData indexname, StringData nsname);
+void logDropIndex(Client* client, StringData indexname, const NamespaceString& nsname);
 
 /**
- * Logs the result of a dropCollection command.
+ * Logs the result of a dropCollection command on a collection.
  */
-void logDropCollection(Client* client, StringData nsname);
+void logDropCollection(Client* client, const NamespaceString& nsname);
+
+/**
+ * Logs the result of a dropCollection command on a view.
+ */
+void logDropView(Client* client,
+                 const NamespaceString& nsname,
+                 StringData viewOn,
+                 const std::vector<BSONObj>& pipeline,
+                 ErrorCodes::Error code);
 
 /**
  * Logs the result of a dropDatabase command.
@@ -320,7 +401,9 @@ void logDropDatabase(Client* client, StringData dbname);
 /**
  * Logs a collection rename event.
  */
-void logRenameCollection(Client* client, StringData source, StringData target);
+void logRenameCollection(Client* client,
+                         const NamespaceString& source,
+                         const NamespaceString& target);
 
 /**
  * Logs the result of a enableSharding command.
@@ -346,6 +429,22 @@ void logShardCollection(Client* client, StringData ns, const BSONObj& keyPattern
  * Logs the result of a refineCollectionShardKey event.
  */
 void logRefineCollectionShardKey(Client* client, StringData ns, const BSONObj& keyPattern);
+
+/**
+ * Logs an insert of a potentially security sensitive record.
+ */
+void logInsertOperation(Client* client, const NamespaceString& nss, const BSONObj& doc);
+
+/**
+ * Logs an update of a potentially security sensitive record.
+ */
+void logUpdateOperation(Client* client, const NamespaceString& nss, const BSONObj& doc);
+
+/**
+ * Logs a deletion of a potentially security sensitive record.
+ */
+void logRemoveOperation(Client* client, const NamespaceString& nss, const BSONObj& doc);
+
 
 }  // namespace audit
 }  // namespace mongo

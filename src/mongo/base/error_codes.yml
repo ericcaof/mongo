@@ -12,9 +12,9 @@ error_categories:
     - NeedRetargettingError
     - WriteConcernError
     - ShutdownError
-    # isCancelationError() includes all codes that,when passed to a function as its parameter
+    # isCancellationError() includes all codes that,when passed to a function as its parameter
     # indicates that it cannot be executed as normal and must abort its intended work.
-    - CancelationError
+    - CancellationError
     - ConnectionFatalMessageParseError
     - ExceededTimeLimitError
     - SnapshotError
@@ -122,10 +122,10 @@ error_codes:
     - {code: 87,name: CannotSplit}
     - {code: 88,name: OBSOLETE_SplitFailed}
     - {code: 89,name: NetworkTimeout,categories: [NetworkError,RetriableError,NetworkTimeoutError]}
-    - {code: 90,name: CallbackCanceled,categories: [CancelationError]}
+    - {code: 90,name: CallbackCanceled,categories: [CancellationError]}
     - {code: 91,name: ShutdownInProgress,
                        extra: ShutdownInProgressQuiesceInfo,
-                       categories: [ShutdownError,CancelationError,RetriableError],
+                       categories: [ShutdownError,CancellationError,RetriableError],
                        extraIsOptional: True}
     - {code: 92,name: SecondaryAheadOfPrimary}
     - {code: 93,name: InvalidReplicaSetConfig}
@@ -368,10 +368,10 @@ error_codes:
     - {code: 307,name: RangeDeletionAbandonedBecauseTaskDocumentDoesNotExist}
     - {code: 308,name: CurrentConfigNotCommittedYet}
     - {code: 309,name: ExhaustCommandFinished}
-    - {code: 310,name: PeriodicJobIsStopped,categories: [CancelationError]}
+    - {code: 310,name: PeriodicJobIsStopped,categories: [CancellationError]}
 
     - {code: 311,name: TransactionCoordinatorCanceled,categories: [InternalOnly]}
-    - {code: 312,name: OperationIsKilledAndDelisted,categories: [CancelationError,InternalOnly]}
+    - {code: 312,name: OperationIsKilledAndDelisted,categories: [CancellationError,InternalOnly]}
 
     - {code: 313,name: ResumableRangeDeleterDisabled}
     - {code: 314,name: ObjectIsBusy}
@@ -387,7 +387,7 @@ error_codes:
     - {code: 319,name: MovePrimaryInProgress}
 
     - {code: 320, name: TenantMigrationConflict,extra: TenantMigrationConflictInfo,categories: [TenantMigrationError]}
-    - {code: 321, name: TenantMigrationCommitted,extra: TenantMigrationCommittedInfo,categories: [TenantMigrationError]}
+    - {code: 321, name: TenantMigrationCommitted, categories: [TenantMigrationError]}
 
     - {code: 322, name: APIVersionError, categories: [VersionedAPIError]}
     - {code: 323, name: APIStrictError, categories: [VersionedAPIError]}
@@ -409,10 +409,27 @@ error_codes:
 
     - {code: 332, name: CannotDowngrade}
 
-    - {code: 333, name: ServiceExecutorInShutdown, categories: [ShutdownError,CancelationError,InternalOnly]}
+    - {code: 333, name: ServiceExecutorInShutdown, categories: [ShutdownError,CancellationError,InternalOnly]}
     - {code: 334, name: MechanismUnavailable}
 
     - {code: 335, name: TenantMigrationForgotten}
+
+    - {code: 336, name: TimeseriesBucketCleared, categories: [InternalOnly]}
+
+    - {code: 337, name: AuthenticationAbandoned, categories: [InternalOnly]}
+    
+    - {code: 338, name: ReshardCollectionInProgress}
+
+    - {code: 339, name: NoSuchReshardCollection}
+    - {code: 340, name: ReshardCollectionCommitted}
+    - {code: 341, name: ReshardCollectionAborted}
+    - {code: 342, name: ReshardingCriticalSectionTimeout}
+
+    # ShardCannotRefreshDueToLocksHeld will be retried by the shards. Note that it is not under the
+    # NeedRetargettingError, meaning MongoS will pass it through to the client, because there is no
+    # case where it would be possible for MongoS to retry where MongoD couldn't.
+    - {code: 343, name: ShardCannotRefreshDueToLocksHeld,
+                  extra: ShardCannotRefreshDueToLocksHeldInfo}
 
     # Error codes 4000-8999 are reserved.
 
@@ -420,10 +437,11 @@ error_codes:
     - {code: 9001,name: SocketException,categories: [NetworkError,RetriableError]}
     - {code: 9996,name: OBSOLETE_RecvStaleConfig}
     - {code: 10003,name: CannotGrowDocumentInCappedNamespace}
+    - {code: 10058,name: LegacyNotPrimary}
     - {code: 10107,name: NotWritablePrimary,categories: [NotPrimaryError,RetriableError]}
     - {code: 10334,name: BSONObjectTooLarge}
     - {code: 11000,name: DuplicateKey,extra: DuplicateKeyErrorInfo}
-    - {code: 11600,name: InterruptedAtShutdown,categories: [Interruption,ShutdownError,CancelationError,RetriableError]}
+    - {code: 11600,name: InterruptedAtShutdown,categories: [Interruption,ShutdownError,CancellationError,RetriableError]}
     - {code: 11601,name: Interrupted,categories: [Interruption]}
     - {code: 11602,name: InterruptedDueToReplStateChange,categories: [Interruption,NotPrimaryError,RetriableError]}
     - {code: 12586,name: BackgroundOperationInProgressForDatabase}
@@ -438,5 +456,5 @@ error_codes:
     - {code: 13436,name: NotPrimaryOrSecondary,categories: [NotPrimaryError,RetriableError]}
     - {code: 14031,name: OutOfDiskSpace}
     - {code: 17280,name: OBSOLETE_KeyTooLong}
-    - {code: 46841,name: ClientMarkedKilled,categories: [Interruption,CancelationError]}
+    - {code: 46841,name: ClientMarkedKilled,categories: [Interruption,CancellationError]}
 

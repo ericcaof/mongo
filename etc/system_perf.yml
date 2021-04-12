@@ -1,6 +1,11 @@
 command_type: system
 stepback: false
 
+## Parameters for parameterized builds (see https://github.com/evergreen-ci/evergreen/wiki/Parameterized-Builds)
+parameters:
+  - key: patch_compile_flags
+    description: "Additional SCons flags to be applied during scons compile invocations in this patch"
+
 variables:
   ###
   # Leave this section uncommented to enable compile.
@@ -18,19 +23,21 @@ variables:
     []
   ###
 
-  ###
-  # **Or**: Leave this section uncommented to bypass/skip compile.
-  # _skip_compile_amazon2: &_compile_amazon2
-  #     - name: genny_generate_all_tasks
-  #       variant: compile-amazon2
-  # _skip_compile_rhel70: &_compile_rhel70
-  #     - name: genny_generate_all_tasks
-  #       variant: compile-amazon2
-  # _skip_expansions: &_expansion_updates
-  #   # This is the normal (amazon2) "compile" artifact from https://evergreen.mongodb.com/version/sys_perf_4.4_78207ca380688c73b1a217f23d5b7c8803bef9cd
-  #   - key: mongodb_binary_archive
-  #     value: https://dsi-donot-remove.s3-us-west-2.amazonaws.com/compile_artifacts/mongodb-sys_perf_4.4_78207ca380688c73b1a217f23d5b7c8803bef9cd.tar.gz
-  ##
+###
+# **Or**: Leave this section uncommented to bypass/skip compile.
+#  _skip_compile_amazon2: &_compile_amazon2
+#      - name: genny_generate_all_tasks
+#        variant: compile-amazon2
+#  _skip_compile_rhel70: &_compile_rhel70
+#      - name: genny_generate_all_tasks
+#        variant: compile-amazon2
+#  _skip_expansions: &_expansion_updates
+#      # This is the normal (amazon2) "compile" artifact from https://evergreen.mongodb.com/version/sys_perf_4.4_78207ca380688c73b1a217f23d5b7c8803bef9cd
+#      - key: mdb_binary_for_client
+#        value: https://dsi-donot-remove.s3-us-west-2.amazonaws.com/compile_artifacts/mongodb-sys_perf_4.4_78207ca380688c73b1a217f23d5b7c8803bef9cd.tar.gz
+#      - key: mdb_binary_for_server
+#        value: https://dsi-donot-remove.s3-us-west-2.amazonaws.com/compile_artifacts/mongodb-sys_perf_4.4_78207ca380688c73b1a217f23d5b7c8803bef9cd.tar.gz
+###
 
   _src_dir: &src_dir src/mongo
   _modules: &modules
@@ -74,7 +81,6 @@ modules:
   repo: git@github.com:10gen/linkbench2.git
   prefix: ../../src
   branch: master
-  ref: 63207190657737b32eb0e81c5b81ad1b8bad0e5a
 - name: mongo-perf
   repo: git@github.com:mongodb/mongo-perf.git
   prefix: ../../src
@@ -164,10 +170,6 @@ functions:
       type: test
       params:
         script: ./src/dsi/run-dsi determine_failure -m TEST
-    - command: json.send
-      params:
-        name: "perf"
-        file: "./build/LegacyPerfJson/perf.json"
     - command: shell.exec
       type: test
       params:
@@ -175,6 +177,10 @@ functions:
           ./src/dsi/run-dsi analysis
           # detect outliers needs to run, so defer the post_run_check exit status to later
           echo $? > post_run_check.status
+    - command: json.send
+      params:
+        name: "perf"
+        file: "./build/LegacyPerfJson/perf.json"
     - command: shell.exec
       params:
         script: |
@@ -194,23 +200,6 @@ functions:
           set -o verbose
           source ./signal_processing_venv/bin/activate
           detect-changes --config .signal-processing.yml --mongo-repo=./src/mongo
-    - command: shell.exec
-      params:
-        script: |
-          set -o verbose
-          source ./signal_processing_venv/bin/activate
-          detect-outliers --config .signal-processing.yml
-    - command: shell.exec
-      type: setup
-      params:
-        script: |
-          set -o verbose
-          filename=rejects.json
-          if [ -s "$filename" ]; then
-            echo "Rejecting task due to the following outliers:"
-            cat "$filename"
-            exit ${detected_outlier_exit_code|0}
-          fi
     - command: shell.exec
       type: test
       params:
@@ -360,7 +349,7 @@ functions:
           set -o errexit
           set -o verbose
           source "${workdir}/compile_venv/bin/activate"
-          python ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} install-core MONGO_VERSION=${version} DESTDIR=$(pwd)/mongodb
+          python ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} install-core MONGO_VERSION=${version} DESTDIR=$(pwd)/mongodb ${patch_compile_flags|}
           mkdir -p mongodb/jstests/hooks
           if [ -d jstests/hooks ]
           then
@@ -403,7 +392,7 @@ tasks:
         file: ./expansions.yml
     - command: shell.exec
       params:
-        script: ./src/genny/scripts/genny_auto_tasks.sh all_tasks
+        script: ./src/dsi/run-dsi schedule_tasks --tasks all_tasks
     - command: generate.tasks
       params:
         files:
@@ -419,7 +408,7 @@ tasks:
         file: ./expansions.yml
     - command: shell.exec
       params:
-        script: ./src/genny/scripts/genny_auto_tasks.sh variant_tasks
+        script: ./src/dsi/run-dsi schedule_tasks --tasks variant_tasks
     - command: generate.tasks
       params:
         files:
@@ -435,7 +424,7 @@ tasks:
         file: ./expansions.yml
     - command: shell.exec
       params:
-        script: ./src/genny/scripts/genny_auto_tasks.sh patch_tasks
+        script: ./src/dsi/run-dsi schedule_tasks --tasks patch_tasks
     - command: generate.tasks
       params:
         files:
@@ -480,22 +469,10 @@ tasks:
         directory: *src_dir
         revisions:
           dsi: ${dsi_rev}
-    # Use AWS user that has route53 permissions required by certbot plugin
-    - command: shell.exec
-      params:
-        script: |
-          sudo -i
-          mkdir /root/.aws
-          cat > /root/.aws/credentials << EOF
-          [default]
-          aws_access_key_id = ${terraform_key}
-          aws_secret_access_key = ${terraform_secret}
-          EOF
-          exit
     # Run the script to generate ssl cert files
     - command: shell.exec
       params:
-        script: ./src/dsi/run-dsi ./src/dsi/configurations/mongodb_setup/ssl/generate-ssl-cert.sh
+        script: AWS_ACCESS_KEY_ID=${terraform_key} AWS_SECRET_ACCESS_KEY=${terraform_secret} ./src/dsi/run-dsi generate_ssl_cert
     # Upload files for further DSI usage
     - command: s3.put
       params:
@@ -1273,6 +1250,41 @@ buildvariants:
     - name: genny_patch_tasks
     - name: genny_auto_tasks
 
+- name: linux-shard-lite-all-feature-flags
+  display_name: Linux Shard Lite (all feature flags)
+  batchtime: 10080  # 7 days
+  modules: *modules
+  expansions:
+    mongodb_setup: shard-lite-all-feature-flags
+    infrastructure_provisioning: shard-lite
+    platform: linux
+    project_dir: *project_dir
+    authentication: enabled
+    storageEngine: wiredTiger
+  run_on:
+    - "rhel70-perf-shard-lite"
+  depends_on: *_compile_amazon2
+  tasks:
+    - name: genny_patch_tasks
+    - name: genny_auto_tasks
+
+- name: linux-shard-single
+  display_name: Linux Shard Single
+  batchtime: 5760  # 4 days
+  modules: *modules
+  expansions:
+    mongodb_setup: shard-single
+    infrastructure_provisioning: shard-single
+    platform: linux
+    project_dir: *project_dir
+    authentication: enabled
+    storageEngine: wiredTiger
+  run_on:
+      - "rhel70-perf-shard-lite"
+  depends_on: *_compile_amazon2
+  tasks:
+    - name: genny_patch_tasks
+    - name: genny_auto_tasks
 
 - name: linux-3-node-replSet
   display_name: Linux 3-Node ReplSet
@@ -1298,7 +1310,7 @@ buildvariants:
     - name: misc_workloads
     - name: map_reduce_workloads
 #    Disable the workload until TIG-2695 is done
-#    - name: refine_shard_key_transaction_stress
+    - name: refine_shard_key_transaction_stress
     - name: smoke_test
     - name: retryable_writes_workloads
     - name: industry_benchmarks_wmajority
@@ -1361,12 +1373,14 @@ buildvariants:
         variant: compile-amazon2
   tasks: *3nodetasks
 
+# Note that the "disabled-feature-flags" part of the name is kept to avoid breaking
+# history even though the display name is "all feature flags"
 - name: linux-3-node-replSet-disabled-feature-flags
-  display_name: Linux 3-Node ReplSet (disabled feature flags)
+  display_name: Linux 3-Node ReplSet (all feature flags)
   batchtime: 10080  # 7 days
   modules: *modules
   expansions:
-    mongodb_setup: replica-disabled-feature-flags
+    mongodb_setup: replica-all-feature-flags
     infrastructure_provisioning: replica
     platform: linux
     project_dir: *project_dir
@@ -1486,7 +1500,7 @@ buildvariants:
     mongodb_setup: initialsync-logkeeper
     infrastructure_provisioning: initialsync-logkeeper
     # EBS logkeeper snapshot with FCV set to 4.4
-    snapshotId: snap-0b0b8b2ad16e8f14e
+    snapshotId: snap-0dba360e743e27ea0
     platform: linux
     authentication: disabled
     storageEngine: wiredTiger
@@ -1509,7 +1523,7 @@ buildvariants:
 #    mongodb_setup: initialsync-logkeeper
 #    infrastructure_provisioning: initialsync-logkeeper-snapshot-update
 #    # Update this to latest snapshot after each LTS release.
-#    snapshotId: snap-0b0b8b2ad16e8f14e
+#    snapshotId: snap-0dba360e743e27ea0
 #    platform: linux
 #    authentication: disabled
 #    storageEngine: wiredTiger

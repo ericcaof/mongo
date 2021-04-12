@@ -241,31 +241,32 @@ void Pipeline::optimizePipeline() {
         return;
     }
 
+    optimizeContainer(&_sources);
+}
+
+void Pipeline::optimizeContainer(SourceContainer* container) {
     SourceContainer optimizedSources;
 
-    SourceContainer::iterator itr = _sources.begin();
-
-    // We could be swapping around stages during this process, so disconnect the pipeline to prevent
-    // us from entering a state with dangling pointers.
-    unstitch();
+    SourceContainer::iterator itr = container->begin();
     try {
-        while (itr != _sources.end()) {
+        while (itr != container->end()) {
             invariant((*itr).get());
-            itr = (*itr).get()->optimizeAt(itr, &_sources);
+            itr = (*itr).get()->optimizeAt(itr, container);
         }
 
         // Once we have reached our final number of stages, optimize each individually.
-        for (auto&& source : _sources) {
+        for (auto&& source : *container) {
             if (auto out = source->optimize()) {
                 optimizedSources.push_back(out);
             }
         }
-        _sources.swap(optimizedSources);
+        container->swap(optimizedSources);
     } catch (DBException& ex) {
         ex.addContext("Failed to optimize pipeline");
         throw;
     }
-    stitch();
+
+    stitch(container);
 }
 
 bool Pipeline::aggHasWriteStage(const BSONObj& cmd) {
@@ -421,20 +422,19 @@ vector<BSONObj> Pipeline::serializeToBson() const {
     return asBson;
 }
 
-void Pipeline::unstitch() {
-    for (auto&& stage : _sources) {
-        stage->setSource(nullptr);
-    }
+void Pipeline::stitch() {
+    stitch(&_sources);
 }
 
-void Pipeline::stitch() {
-    if (_sources.empty()) {
+void Pipeline::stitch(SourceContainer* container) {
+    if (container->empty()) {
         return;
     }
+
     // Chain together all the stages.
-    DocumentSource* prevSource = _sources.front().get();
+    DocumentSource* prevSource = container->front().get();
     prevSource->setSource(nullptr);
-    for (SourceContainer::iterator iter(++_sources.begin()), listEnd(_sources.end());
+    for (Pipeline::SourceContainer::iterator iter(++container->begin()), listEnd(container->end());
          iter != listEnd;
          ++iter) {
         intrusive_ptr<DocumentSource> pTemp(*iter);
@@ -484,12 +484,23 @@ void Pipeline::addFinalSource(intrusive_ptr<DocumentSource> source) {
     _sources.push_back(source);
 }
 
-DepsTracker Pipeline::getDependencies(QueryMetadataBitSet unavailableMetadata) const {
-    DepsTracker deps(unavailableMetadata);
+DepsTracker Pipeline::getDependencies(
+    boost::optional<QueryMetadataBitSet> unavailableMetadata) const {
+    return getDependenciesForContainer(getContext(), _sources, unavailableMetadata);
+}
+
+DepsTracker Pipeline::getDependenciesForContainer(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const SourceContainer& container,
+    boost::optional<QueryMetadataBitSet> unavailableMetadata) {
+    // If 'unavailableMetadata' was not specified, we assume all metadata is available. This allows
+    // us to call 'deps.setNeedsMetadata()' without throwing.
+    DepsTracker deps(unavailableMetadata.get_value_or(DepsTracker::kNoMetadata));
+
     bool hasUnsupportedStage = false;
     bool knowAllFields = false;
     bool knowAllMeta = false;
-    for (auto&& source : _sources) {
+    for (auto&& source : container) {
         DepsTracker localDeps(deps.getUnavailableMetadata());
         DepsTracker::State status = source->getDependencies(&localDeps);
 
@@ -521,11 +532,11 @@ DepsTracker Pipeline::getDependencies(QueryMetadataBitSet unavailableMetadata) c
     if (!knowAllFields)
         deps.needWholeDocument = true;  // don't know all fields we need
 
-    if (!unavailableMetadata[DocumentMetadataFields::kTextScore]) {
+    if (!deps.getUnavailableMetadata()[DocumentMetadataFields::kTextScore]) {
         // There is a text score available. If we are the first half of a split pipeline, then we
         // have to assume future stages might depend on the textScore (unless we've encountered a
         // stage that doesn't preserve metadata).
-        if (getContext()->needsMerge && !knowAllMeta) {
+        if (expCtx->needsMerge && !knowAllMeta) {
             deps.setNeedsMetadata(DocumentMetadataFields::kTextScore, true);
         }
     } else {

@@ -29,14 +29,54 @@
 
 #pragma once
 
+#include "mongo/db/pipeline/accumulation_statement.h"
+#include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_set_window_fields_gen.h"
+#include "mongo/db/pipeline/window_function/partition_iterator.h"
+#include "mongo/db/pipeline/window_function/window_bounds.h"
+#include "mongo/db/pipeline/window_function/window_function_exec.h"
+#include "mongo/db/pipeline/window_function/window_function_expression.h"
 
 namespace mongo {
 
-class DocumentSourceSetWindowFields final : public DocumentSource {
+class WindowFunctionExec;
+
+struct WindowFunctionStatement {
+    std::string fieldName;  // top-level fieldname, not a path
+    boost::intrusive_ptr<window_function::Expression> expr;
+
+    WindowFunctionStatement(std::string fieldName,
+                            boost::intrusive_ptr<window_function::Expression> expr)
+        : fieldName(std::move(fieldName)), expr(std::move(expr)) {}
+
+    static WindowFunctionStatement parse(BSONElement elem,
+                                         const boost::optional<SortPattern>& sortBy,
+                                         ExpressionContext* expCtx);
+    void serialize(MutableDocument& outputFields,
+                   boost::optional<ExplainOptions::Verbosity> explain) const;
+};
+
+/**
+ * $setWindowFields is an alias: it desugars to some combination of projection, sorting,
+ * and $_internalSetWindowFields.
+ */
+namespace document_source_set_window_fields {
+constexpr StringData kStageName = "$setWindowFields"_sd;
+
+std::list<boost::intrusive_ptr<DocumentSource>> createFromBson(
+    BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+std::list<boost::intrusive_ptr<DocumentSource>> create(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    boost::optional<boost::intrusive_ptr<Expression>> partitionBy,
+    const boost::optional<SortPattern>& sortBy,
+    std::vector<WindowFunctionStatement> outputFields);
+}  // namespace document_source_set_window_fields
+
+class DocumentSourceInternalSetWindowFields final : public DocumentSource {
 public:
-    static constexpr StringData kStageName = "$setWindowFields"_sd;
+    static constexpr StringData kStageName = "$_internalSetWindowFields"_sd;
 
     /**
      * Parses 'elem' into a $setWindowFields stage, or throws a AssertionException if 'elem' was an
@@ -46,20 +86,22 @@ public:
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
 
-    DocumentSourceSetWindowFields(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                  boost::optional<boost::intrusive_ptr<Expression>> partitionBy,
-                                  boost::optional<BSONObj> sortBy,
-                                  BSONObj fields)
+    DocumentSourceInternalSetWindowFields(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        boost::optional<boost::intrusive_ptr<Expression>> partitionBy,
+        const boost::optional<SortPattern>& sortBy,
+        std::vector<WindowFunctionStatement> outputFields)
         : DocumentSource(kStageName, expCtx),
           _partitionBy(partitionBy),
           _sortBy(std::move(sortBy)),
-          _fields(std::move(fields)) {}
+          _outputFields(std::move(outputFields)),
+          _iterator(expCtx.get(), pSource, std::move(partitionBy)) {}
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         return StageConstraints(StreamType::kBlocking,
                                 PositionRequirement::kNone,
                                 HostTypeRequirement::kNone,
-                                DiskUseRequirement::kWritesTmpData,
+                                DiskUseRequirement::kNoDiskUse,
                                 FacetRequirement::kAllowed,
                                 TransactionRequirement::kAllowed,
                                 LookupRequirement::kAllowed,
@@ -79,10 +121,23 @@ public:
 
     DocumentSource::GetNextResult doGetNext();
 
+    void setSource(DocumentSource* source) final {
+        pSource = source;
+        _iterator.setSource(source);
+    }
+
 private:
+    DocumentSource::GetNextResult getNextInput();
+    void initialize();
+
     boost::optional<boost::intrusive_ptr<Expression>> _partitionBy;
-    boost::optional<BSONObj> _sortBy;
-    BSONObj _fields;
+    boost::optional<SortPattern> _sortBy;
+    std::vector<WindowFunctionStatement> _outputFields;
+    PartitionIterator _iterator;
+    StringMap<std::unique_ptr<WindowFunctionExec>> _executableOutputs;
+    bool _init = false;
+    bool _eof = false;
+    size_t _maxMemory = 0;
 };
 
 }  // namespace mongo

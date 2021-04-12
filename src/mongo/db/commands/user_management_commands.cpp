@@ -46,6 +46,7 @@
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/address_restriction.h"
+#include "mongo/db/auth/auth_options_gen.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege_parser.h"
@@ -57,6 +58,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/run_aggregate.h"
+#include "mongo/db/commands/test_commands.h"
 #include "mongo/db/commands/user_management_commands_common.h"
 #include "mongo/db/commands/user_management_commands_gen.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -241,7 +243,7 @@ Status insertAuthzDocument(OperationContext* opCtx,
         BSONObj res;
         client.runCommand(collectionName.db().toString(),
                           [&] {
-                              write_ops::Insert insertOp(collectionName);
+                              write_ops::InsertCommandRequest insertOp(collectionName);
                               insertOp.setDocuments({document});
                               return insertOp.toBSON({});
                           }(),
@@ -277,7 +279,7 @@ Status updateAuthzDocuments(OperationContext* opCtx,
         BSONObj res;
         client.runCommand(collectionName.db().toString(),
                           [&] {
-                              write_ops::Update updateOp(collectionName);
+                              write_ops::UpdateCommandRequest updateOp(collectionName);
                               updateOp.setUpdates({[&] {
                                   write_ops::UpdateOpEntry entry;
                                   entry.setQ(query);
@@ -351,7 +353,7 @@ Status removeAuthzDocuments(OperationContext* opCtx,
         BSONObj res;
         client.runCommand(collectionName.db().toString(),
                           [&] {
-                              write_ops::Delete deleteOp(collectionName);
+                              write_ops::DeleteCommandRequest deleteOp(collectionName);
                               deleteOp.setDeletes({[&] {
                                   write_ops::DeleteOpEntry entry;
                                   entry.setQ(query);
@@ -788,7 +790,7 @@ public:
 
     StatusWith<std::uint32_t> insert(const NamespaceString& nss, const std::vector<BSONObj>& docs) {
         dassert(nss.db() == kAdminDB);
-        write_ops::Insert op(nss);
+        write_ops::InsertCommandRequest op(nss);
         op.setDocuments(docs);
         return doCrudOp(op.toBSON({}));
     }
@@ -799,7 +801,7 @@ public:
         entry.setQ(query);
         entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(update));
         entry.setMulti(true);
-        write_ops::Update op(nss);
+        write_ops::UpdateCommandRequest op(nss);
         op.setUpdates({entry});
         return doCrudOp(op.toBSON({}));
     }
@@ -809,7 +811,7 @@ public:
         write_ops::DeleteOpEntry entry;
         entry.setQ(query);
         entry.setMulti(true);
-        write_ops::Delete op(nss);
+        write_ops::DeleteCommandRequest op(nss);
         op.setDeletes({entry});
         return doCrudOp(op.toBSON({}));
     }
@@ -1418,8 +1420,8 @@ UsersInfoReply CmdUMCTyped<UsersInfoCommand, UsersInfoReply, UMCInfoParams>::Inv
         DBDirectClient client(opCtx);
 
         rpc::OpMsgReplyBuilder replyBuilder;
-        AggregateCommand aggRequest(AuthorizationManager::usersCollectionNamespace,
-                                    std::move(pipeline));
+        AggregateCommandRequest aggRequest(AuthorizationManager::usersCollectionNamespace,
+                                           std::move(pipeline));
         // Impose no cursor privilege requirements, as cursor is drained internally
         uassertStatusOK(runAggregate(opCtx,
                                      AuthorizationManager::usersCollectionNamespace,
@@ -1756,6 +1758,72 @@ void CmdUMCTyped<RevokeRolesFromRoleCommand, void>::Invocation::typedRun(Operati
     uassertStatusOK(status);
 }
 
+/**
+ * Attempt to complete a transaction, retrying up to two times (3 total attempts).
+ * Emit an audit entry prior to the first commit attempt,
+ * but do not repeat the audit entry for retries.
+ */
+using TxnOpsCallback = std::function<Status(UMCTransaction&)>;
+using TxnAuditCallback = std::function<void()>;
+
+bool shouldRetryTransaction(const Status& status) {
+    return (status == ErrorCodes::LockTimeout) || (status == ErrorCodes::SnapshotUnavailable);
+}
+
+Status retryTransactionOps(OperationContext* opCtx,
+                           StringData forCommand,
+                           TxnOpsCallback ops,
+                           TxnAuditCallback audit) {
+    // In practice this status never makes it to a return
+    // since its populated with the return from ops(),
+    // but guard against bit-rot by pre-populating a generic failure.
+    Status status(ErrorCodes::OperationFailed, "Operation was never attempted");
+
+    // Be more patient with our test runner which is likely to be
+    // doing aggressive reelections and failovers and replication shenanigans.
+    const int kMaxAttempts = getTestCommandsEnabled() ? 10 : 3;
+
+    for (int tries = kMaxAttempts; tries > 0; --tries) {
+        if (tries < kMaxAttempts) {
+            // Emit log on all but the first attempt.
+            LOGV2_DEBUG(5297200,
+                        4,
+                        "Retrying user management command transaction",
+                        "command"_attr = forCommand,
+                        "reason"_attr = status);
+        }
+
+        UMCTransaction txn(opCtx, forCommand);
+        status = ops(txn);
+        if (!status.isOK()) {
+            if (!shouldRetryTransaction(status)) {
+                return status;
+            }
+            continue;
+        }
+
+        if (tries == kMaxAttempts) {
+            // Only emit audit on first attempt.
+            audit();
+        }
+
+        status = txn.commit();
+        if (status.isOK()) {
+            // Success, see ya later!
+            return status;
+        }
+
+        // Try to responsibly abort, but accept not being able to.
+        txn.abort().ignore();
+
+        if (!shouldRetryTransaction(status)) {
+            return status;
+        }
+    }
+
+    return status;
+}
+
 CmdUMCTyped<DropRoleCommand, void> cmdDropRole;
 template <>
 void CmdUMCTyped<DropRoleCommand, void>::Invocation::typedRun(OperationContext* opCtx) {
@@ -1783,40 +1851,40 @@ void CmdUMCTyped<DropRoleCommand, void>::Invocation::typedRun(OperationContext* 
         }
     });
 
-    UMCTransaction txn(opCtx, DropRoleCommand::kCommandName);
+    const auto dropRoleOps = [&](UMCTransaction& txn) -> Status {
+        // Remove this role from all users
+        auto swCount = txn.update(AuthorizationManager::usersCollectionNamespace,
+                                  BSON("roles" << BSON("$elemMatch" << roleName.toBSON())),
+                                  BSON("$pull" << BSON("roles" << roleName.toBSON())));
+        if (!swCount.isOK()) {
+            return useDefaultCode(swCount.getStatus(), ErrorCodes::UserModificationFailed)
+                .withContext(str::stream() << "Failed to remove role " << roleName.getFullName()
+                                           << " from all users");
+        }
 
-    // Remove this role from all users
-    auto swCount = txn.update(AuthorizationManager::usersCollectionNamespace,
-                              BSON("roles" << BSON("$elemMatch" << roleName.toBSON())),
-                              BSON("$pull" << BSON("roles" << roleName.toBSON())));
-    if (!swCount.isOK()) {
-        uassertStatusOK(useDefaultCode(swCount.getStatus(), ErrorCodes::UserModificationFailed)
-                            .withContext(str::stream()
-                                         << "Failed to remove role " << roleName.getFullName()
-                                         << " from all users"));
-    }
+        // Remove this role from all other roles
+        swCount = txn.update(AuthorizationManager::rolesCollectionNamespace,
+                             BSON("roles" << BSON("$elemMatch" << roleName.toBSON())),
+                             BSON("$pull" << BSON("roles" << roleName.toBSON())));
+        if (!swCount.isOK()) {
+            return useDefaultCode(swCount.getStatus(), ErrorCodes::RoleModificationFailed)
+                .withContext(str::stream() << "Failed to remove role " << roleName.getFullName()
+                                           << " from all users");
+        }
 
-    // Remove this role from all other roles
-    swCount = txn.update(AuthorizationManager::rolesCollectionNamespace,
-                         BSON("roles" << BSON("$elemMatch" << roleName.toBSON())),
-                         BSON("$pull" << BSON("roles" << roleName.toBSON())));
-    if (!swCount.isOK()) {
-        uassertStatusOK(useDefaultCode(swCount.getStatus(), ErrorCodes::RoleModificationFailed)
-                            .withContext(str::stream()
-                                         << "Failed to remove role " << roleName.getFullName()
-                                         << " from all users"));
-    }
+        // Finally, remove the actual role document
+        swCount = txn.remove(AuthorizationManager::rolesCollectionNamespace, roleName.toBSON());
+        if (!swCount.isOK()) {
+            return swCount.getStatus().withContext(str::stream() << "Failed to remove role "
+                                                                 << roleName.getFullName());
+        }
 
-    // Finally, remove the actual role document
-    swCount = txn.remove(AuthorizationManager::rolesCollectionNamespace, roleName.toBSON());
-    if (!swCount.isOK()) {
-        uassertStatusOK(swCount.getStatus().withContext(str::stream() << "Failed to remove role "
-                                                                      << roleName.getFullName()));
-    }
+        return Status::OK();
+    };
 
-    audit::logDropRole(client, roleName);
-
-    auto status = txn.commit();
+    auto status = retryTransactionOps(opCtx, DropRoleCommand::kCommandName, dropRoleOps, [&] {
+        audit::logDropRole(client, roleName);
+    });
     if (!status.isOK()) {
         uassertStatusOK(status.withContext("Failed applying dropRole transaction"));
     }
@@ -1845,50 +1913,54 @@ CmdUMCTyped<DropAllRolesFromDatabaseCommand, DropAllRolesFromDatabaseReply>::Inv
         }
     });
 
-    UMCTransaction txn(opCtx, DropAllRolesFromDatabaseCommand::kCommandName);
-    auto roleMatch = BSON(AuthorizationManager::ROLE_DB_FIELD_NAME << dbname);
-    auto rolesMatch = BSON("roles" << roleMatch);
+    DropAllRolesFromDatabaseReply reply;
+    const auto dropRoleOps = [&](UMCTransaction& txn) -> Status {
+        auto roleMatch = BSON(AuthorizationManager::ROLE_DB_FIELD_NAME << dbname);
+        auto rolesMatch = BSON("roles" << roleMatch);
 
-    // Remove these roles from all users
-    auto swCount = txn.update(
-        AuthorizationManager::usersCollectionNamespace, rolesMatch, BSON("$pull" << rolesMatch));
-    if (!swCount.isOK()) {
-        uassertStatusOK(useDefaultCode(swCount.getStatus(), ErrorCodes::UserModificationFailed)
-                            .withContext(str::stream() << "Failed to remove roles from \"" << dbname
-                                                       << "\" db from all users"));
-    }
+        // Remove these roles from all users
+        auto swCount = txn.update(AuthorizationManager::usersCollectionNamespace,
+                                  rolesMatch,
+                                  BSON("$pull" << rolesMatch));
+        if (!swCount.isOK()) {
+            return useDefaultCode(swCount.getStatus(), ErrorCodes::UserModificationFailed)
+                .withContext(str::stream() << "Failed to remove roles from \"" << dbname
+                                           << "\" db from all users");
+        }
 
-    // Remove these roles from all other roles
-    swCount = txn.update(AuthorizationManager::rolesCollectionNamespace,
-                         BSON("roles.db" << dbname),
-                         BSON("$pull" << rolesMatch));
-    if (!swCount.isOK()) {
-        uassertStatusOK(useDefaultCode(swCount.getStatus(), ErrorCodes::RoleModificationFailed)
-                            .withContext(str::stream() << "Failed to remove roles from \"" << dbname
-                                                       << "\" db from all roles"));
-    }
+        // Remove these roles from all other roles
+        swCount = txn.update(AuthorizationManager::rolesCollectionNamespace,
+                             BSON("roles.db" << dbname),
+                             BSON("$pull" << rolesMatch));
+        if (!swCount.isOK()) {
+            return useDefaultCode(swCount.getStatus(), ErrorCodes::RoleModificationFailed)
+                .withContext(str::stream() << "Failed to remove roles from \"" << dbname
+                                           << "\" db from all roles");
+        }
 
-    // Finally, remove the actual role documents
-    swCount = txn.remove(AuthorizationManager::rolesCollectionNamespace, roleMatch);
-    if (!swCount.isOK()) {
-        uassertStatusOK(swCount.getStatus().withContext(
-            str::stream() << "Removed roles from \"" << dbname
-                          << "\" db "
-                             " from all users and roles but failed to actually delete"
-                             " those roles themselves"));
-    }
+        // Finally, remove the actual role documents
+        swCount = txn.remove(AuthorizationManager::rolesCollectionNamespace, roleMatch);
+        if (!swCount.isOK()) {
+            return swCount.getStatus().withContext(
+                str::stream() << "Removed roles from \"" << dbname
+                              << "\" db "
+                                 " from all users and roles but failed to actually delete"
+                                 " those roles themselves");
+        }
 
-    audit::logDropAllRolesFromDatabase(Client::getCurrent(), dbname);
+        reply.setCount(swCount.getValue());
+        return Status::OK();
+    };
 
-    auto status = txn.commit();
+    auto status =
+        retryTransactionOps(opCtx, DropAllRolesFromDatabaseCommand::kCommandName, dropRoleOps, [&] {
+            audit::logDropAllRolesFromDatabase(Client::getCurrent(), dbname);
+        });
     if (!status.isOK()) {
         uassertStatusOK(
             status.withContext("Failed applying dropAllRolesFromDatabase command transaction"));
     }
 
-
-    DropAllRolesFromDatabaseReply reply;
-    reply.setCount(swCount.getValue());
     return reply;
 }
 

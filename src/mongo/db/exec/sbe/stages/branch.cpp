@@ -106,6 +106,8 @@ value::SlotAccessor* BranchStage::getAccessor(CompileCtx& ctx, value::SlotId slo
 }
 
 void BranchStage::open(bool reOpen) {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.opens++;
     _specificStats.numTested++;
 
@@ -132,6 +134,8 @@ void BranchStage::open(bool reOpen) {
 }
 
 PlanState BranchStage::getNext() {
+    auto optTimer(getOptTimer(_opCtx));
+
     if (!_activeBranch) {
         return trackPlanState(PlanState::IS_EOF);
     }
@@ -158,6 +162,8 @@ PlanState BranchStage::getNext() {
 }
 
 void BranchStage::close() {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.closes++;
 
     if (_thenOpened) {
@@ -178,11 +184,13 @@ std::unique_ptr<PlanStageStats> BranchStage::getStats(bool includeDebugInfo) con
 
     if (includeDebugInfo) {
         BSONObjBuilder bob;
-        bob.appendNumber("numTested", _specificStats.numTested);
-        bob.appendNumber("thenBranchOpens", _specificStats.thenBranchOpens);
-        bob.appendNumber("thenBranchCloses", _specificStats.thenBranchCloses);
-        bob.appendNumber("elseBranchOpens", _specificStats.elseBranchOpens);
-        bob.appendNumber("elseBranchCloses", _specificStats.elseBranchCloses);
+        bob.appendNumber("numTested", static_cast<long long>(_specificStats.numTested));
+        bob.appendNumber("thenBranchOpens", static_cast<long long>(_specificStats.thenBranchOpens));
+        bob.appendNumber("thenBranchCloses",
+                         static_cast<long long>(_specificStats.thenBranchCloses));
+        bob.appendNumber("elseBranchOpens", static_cast<long long>(_specificStats.elseBranchOpens));
+        bob.appendNumber("elseBranchCloses",
+                         static_cast<long long>(_specificStats.elseBranchCloses));
         bob.append("filter", DebugPrinter{}.print(_filter->debugPrint()));
         bob.append("thenSlots", _inputThenVals);
         bob.append("elseSlots", _inputElseVals);

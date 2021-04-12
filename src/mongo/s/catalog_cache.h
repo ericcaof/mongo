@@ -40,8 +40,6 @@
 
 namespace mongo {
 
-class BSONObjBuilder;
-
 static constexpr int kMaxNumStaleVersionRetries = 10;
 
 using DatabaseTypeCache = ReadThroughCache<std::string, DatabaseType, ComparableDatabaseVersion>;
@@ -238,6 +236,7 @@ private:
     private:
         LookupResult _lookupDatabase(OperationContext* opCtx,
                                      const std::string& dbName,
+                                     const ValueHandle& dbType,
                                      const ComparableDatabaseVersion& previousDbVersion);
 
         CatalogCacheLoader& _catalogCacheLoader;

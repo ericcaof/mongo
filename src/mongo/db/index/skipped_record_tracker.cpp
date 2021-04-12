@@ -32,6 +32,7 @@
 #include "mongo/db/index/skipped_record_tracker.h"
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/logv2/log.h"
@@ -67,21 +68,28 @@ void SkippedRecordTracker::finalizeTemporaryTable(OperationContext* opCtx,
 }
 
 void SkippedRecordTracker::record(OperationContext* opCtx, const RecordId& recordId) {
-    auto toInsert = BSON(kRecordIdField << recordId.repr());
+    BSONObjBuilder builder;
+    recordId.serializeToken(kRecordIdField, &builder);
+    BSONObj toInsert = builder.obj();
 
     // Lazily initialize table when we record the first document.
     if (!_skippedRecordsTable) {
         _skippedRecordsTable =
             opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStore(opCtx);
     }
-    // A WriteUnitOfWork may not already be active if the originating operation was part of an
-    // insert into the external sorter.
-    WriteUnitOfWork wuow(opCtx);
-    uassertStatusOK(
-        _skippedRecordsTable->rs()
-            ->insertRecord(opCtx, toInsert.objdata(), toInsert.objsize(), Timestamp::min())
-            .getStatus());
-    wuow.commit();
+
+    writeConflictRetry(
+        opCtx,
+        "recordSkippedRecordTracker",
+        NamespaceString::kIndexBuildEntryNamespace.ns(),
+        [&]() {
+            WriteUnitOfWork wuow(opCtx);
+            uassertStatusOK(
+                _skippedRecordsTable->rs()
+                    ->insertRecord(opCtx, toInsert.objdata(), toInsert.objsize(), Timestamp::min())
+                    .getStatus());
+            wuow.commit();
+        });
 }
 
 bool SkippedRecordTracker::areAllRecordsApplied(OperationContext* opCtx) const {
@@ -132,8 +140,7 @@ Status SkippedRecordTracker::retrySkippedRecords(OperationContext* opCtx,
         const BSONObj doc = record->data.toBson();
 
         // This is the RecordId of the skipped record from the collection.
-        const RecordId skippedRecordId(doc[kRecordIdField].Long());
-
+        RecordId skippedRecordId = RecordId::deserializeToken(doc[kRecordIdField]);
         WriteUnitOfWork wuow(opCtx);
 
         // If the record still exists, get a potentially new version of the document to index.

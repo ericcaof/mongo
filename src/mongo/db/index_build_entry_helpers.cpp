@@ -290,6 +290,13 @@ StatusWith<IndexBuildEntry> getIndexBuildEntry(OperationContext* opCtx, UUID ind
     // build entry from the config db collection.
     hangBeforeGettingIndexBuildEntry.pauseWhileSet(Interruptible::notInterruptible());
 
+    if (!collection.getDb()) {
+        str::stream ss;
+        ss << "Cannot read " << NamespaceString::kIndexBuildEntryNamespace.ns()
+           << ". Database not found: " << NamespaceString::kIndexBuildEntryNamespace.db();
+        return Status(ErrorCodes::NamespaceNotFound, ss);
+    }
+
     if (!collection) {
         str::stream ss;
         ss << "Collection not found: " << NamespaceString::kIndexBuildEntryNamespace.ns();
@@ -297,11 +304,17 @@ StatusWith<IndexBuildEntry> getIndexBuildEntry(OperationContext* opCtx, UUID ind
     }
 
     BSONObj obj;
-    bool foundObj = Helpers::findOne(opCtx,
-                                     collection.getCollection(),
-                                     BSON("_id" << indexBuildUUID),
-                                     obj,
-                                     /*requireIndex=*/true);
+    // This operation does not perform any writes, but the index building code is sensitive to
+    // exceptions and we must protect it from unanticipated write conflicts from reads.
+    bool foundObj = writeConflictRetry(
+        opCtx, "getIndexBuildEntry", NamespaceString::kIndexBuildEntryNamespace.ns(), [&]() {
+            return Helpers::findOne(opCtx,
+                                    collection.getCollection(),
+                                    BSON("_id" << indexBuildUUID),
+                                    obj,
+                                    /*requireIndex=*/true);
+        });
+
     if (!foundObj) {
         str::stream ss;
         ss << "No matching IndexBuildEntry found with indexBuildUUID: " << indexBuildUUID;

@@ -67,7 +67,12 @@ public:
                                                const NamespaceString& nss,
                                                const BSONObj& query,
                                                const BSONObj& sort,
-                                               boost::optional<long long> limit);
+                                               boost::optional<long long> limit,
+                                               const boost::optional<BSONObj>& hint = boost::none);
+
+    Status runAggregation(OperationContext* opCtx,
+                          const AggregateCommandRequest& aggRequest,
+                          std::function<bool(const std::vector<BSONObj>& batch)> callback);
 
 private:
     /**

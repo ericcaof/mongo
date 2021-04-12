@@ -38,46 +38,61 @@
 #include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/exchange_spec_gen.h"
 #include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
+#include "mongo/db/pipeline/plan_executor_pipeline.h"
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/idl/basic_types_gen.h"
 
 namespace mongo {
 
 template <typename T>
 class StatusWith;
 class Document;
-class AggregateCommand;
+class AggregateCommandRequest;
+class OperationContext;
 
 namespace aggregation_request_helper {
 
 /**
- * Helpers to serialize/deserialize AggregateCommand.
+ * Helpers to serialize/deserialize AggregateCommandRequest.
  */
 static constexpr StringData kBatchSizeField = "batchSize"_sd;
 static constexpr long long kDefaultBatchSize = 101;
 
 /**
- * Create a new instance of AggregateCommand by parsing the raw command object. Returns a
- * non-OK status if a required field was missing, if there was an unrecognized field name or if
- * there was a bad value for one of the fields.
+ * Create a new instance of AggregateCommandRequest by parsing the raw command object. Throws an
+ * exception if a required field was missing, if there was an unrecognized field name, or if there
+ * was a bad value for one of the fields.
  *
  * If we are parsing a request for an explained aggregation with an explain verbosity provided,
  * then 'explainVerbosity' contains this information. In this case, 'cmdObj' may not itself
  * contain the explain specifier. Otherwise, 'explainVerbosity' should be boost::none.
  */
-StatusWith<AggregateCommand> parseFromBSON(
+AggregateCommandRequest parseFromBSON(NamespaceString nss,
+                                      const BSONObj& cmdObj,
+                                      boost::optional<ExplainOptions::Verbosity> explainVerbosity,
+                                      bool apiStrict);
+
+StatusWith<AggregateCommandRequest> parseFromBSONForTests(
     NamespaceString nss,
     const BSONObj& cmdObj,
-    boost::optional<ExplainOptions::Verbosity> explainVerbosity = boost::none);
+    boost::optional<ExplainOptions::Verbosity> explainVerbosity = boost::none,
+    bool apiStrict = false);
 
 /**
  * Convenience overload which constructs the request's NamespaceString from the given database
  * name and command object.
  */
-StatusWith<AggregateCommand> parseFromBSON(
+AggregateCommandRequest parseFromBSON(const std::string& dbName,
+                                      const BSONObj& cmdObj,
+                                      boost::optional<ExplainOptions::Verbosity> explainVerbosity,
+                                      bool apiStrict);
+
+StatusWith<AggregateCommandRequest> parseFromBSONForTests(
     const std::string& dbName,
     const BSONObj& cmdObj,
-    boost::optional<ExplainOptions::Verbosity> explainVerbosity = boost::none);
+    boost::optional<ExplainOptions::Verbosity> explainVerbosity = boost::none,
+    bool apiStrict = false);
 
 /*
  * The first field in 'cmdObj' must be a string representing a valid collection name, or the
@@ -95,35 +110,61 @@ NamespaceString parseNs(const std::string& dbname, const BSONObj& cmdObj);
  * command, like: {explain: {aggregate: ...}, ...}, explain options are not part of the aggregate
  * command object.
  */
-Document serializeToCommandDoc(const AggregateCommand& request);
+Document serializeToCommandDoc(const AggregateCommandRequest& request);
 
-BSONObj serializeToCommandObj(const AggregateCommand& request);
+BSONObj serializeToCommandObj(const AggregateCommandRequest& request);
 
 /**
- * Validate the aggregate command object.
+ * Validates if 'AggregateCommandRequest' specs complies with API versioning. Throws uassert in case
+ * of any failure.
  */
-Status validate(const BSONObj& cmdObj, boost::optional<ExplainOptions::Verbosity> explainVerbosity);
+void validateRequestForAPIVersion(const OperationContext* opCtx,
+                                  const AggregateCommandRequest& request);
+
+/**
+ * Returns the type of resumable scan required by this aggregation, if applicable. Otherwise returns
+ * ResumableScanType::kNone.
+ */
+PlanExecutorPipeline::ResumableScanType getResumableScanType(const AggregateCommandRequest& request,
+                                                             bool isChangeStream);
 }  // namespace aggregation_request_helper
 
 /**
- * Custom serializers/deserializers for AggregateCommand.
+ * Custom serializers/deserializers for AggregateCommandRequest.
+ *
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
  */
-
-long long parseBatchSizeFromBSON(const BSONElement& cursorElem);
-
 boost::optional<mongo::ExplainOptions::Verbosity> parseExplainModeFromBSON(
     const BSONElement& explainElem);
 
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
 void serializeExplainToBSON(const mongo::ExplainOptions::Verbosity& explain,
                             StringData fieldName,
                             BSONObjBuilder* builder);
 
-void serializeBatchSizeToBSON(const std::int64_t& batchSize,
-                              StringData fieldName,
-                              BSONObjBuilder* builder);
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
+mongo::SimpleCursorOptions parseAggregateCursorFromBSON(const BSONElement& cursorElem);
+
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
+void serializeAggregateCursorToBSON(const SimpleCursorOptions& cursor,
+                                    StringData fieldName,
+                                    BSONObjBuilder* builder);
 
 /**
  * Parse an aggregation pipeline definition from 'pipelineElem'.
+ *
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
  */
 static std::vector<BSONObj> parsePipelineFromBSON(const BSONElement& pipelineElem) {
     std::vector<BSONObj> pipeline;

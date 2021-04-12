@@ -9,6 +9,7 @@ from shrub.v2 import BuildVariant, ShrubProject
 
 # pylint: disable=wrong-import-position
 import buildscripts.ciconfig.evergreen as _evergreen
+from buildscripts.burn_in_tests import TaskInfo
 from buildscripts.evergreen_generate_resmoke_tasks import Suite
 from buildscripts.tests.test_burn_in_tests import get_evergreen_config, mock_changed_git_files
 from buildscripts import selected_tests as under_test
@@ -94,7 +95,7 @@ class TestAcceptance(unittest.TestCase):
 
         # assert that generated suite files have the suite name and the variant name in the
         # filename, to prevent tasks on different variants from using the same suite file
-        self.assertIn("auth_enterprise-rhel-62-64-bit-dynamic-required_0.yml", config_dict)
+        self.assertIn("auth_enterprise-rhel-80-64-bit-dynamic-required_0.yml", config_dict)
 
         # assert that tasks are generated on all required build variants
         build_variants_with_generated_tasks = json.loads(
@@ -105,10 +106,10 @@ class TestAcceptance(unittest.TestCase):
         # jstests/auth/auth1.js belongs to two suites, auth and auth_audit,
         # max_sub_suites = 3, resulting in 3 subtasks being generated
         # for each, hence 6 tasks total
-        rhel_62_with_generated_tasks = next(
+        rhel_80_with_generated_tasks = next(
             (variant for variant in build_variants_with_generated_tasks
-             if variant["name"] == "enterprise-rhel-62-64-bit-dynamic-required"), None)
-        self.assertEqual(len(rhel_62_with_generated_tasks["tasks"]), 6)
+             if variant["name"] == "enterprise-rhel-80-64-bit-dynamic-required"), None)
+        self.assertEqual(len(rhel_80_with_generated_tasks["tasks"]), 6)
 
     @unittest.skipIf(sys.platform.startswith("win"), "not supported on windows")
     def test_when_task_mappings_are_found_for_changed_files(self):
@@ -142,10 +143,10 @@ class TestAcceptance(unittest.TestCase):
         # tasks total
         build_variants_with_generated_tasks = json.loads(
             config_dict["selected_tests_config.json"])["buildvariants"]
-        rhel_62_with_generated_tasks = next(
+        rhel_80_with_generated_tasks = next(
             (variant for variant in build_variants_with_generated_tasks
-             if variant["name"] == "enterprise-rhel-62-64-bit-dynamic-required"), None)
-        self.assertEqual(len(rhel_62_with_generated_tasks["tasks"]), 4)
+             if variant["name"] == "enterprise-rhel-80-64-bit-dynamic-required"), None)
+        self.assertEqual(len(rhel_80_with_generated_tasks["tasks"]), 4)
 
 
 class TestSelectedTestsConfigOptions(unittest.TestCase):
@@ -421,13 +422,25 @@ class TestGetTaskConfigsForTestMappings(unittest.TestCase):
         ]
         exclude_task_mock.return_value = False
         tests_by_task = {
-            "jsCore_auth": {
-                "tests": [
-                    "jstests/core/currentop_waiting_for_latch.js",
-                    "jstests/core/latch_analyzer.js",
-                ],
-            },
-            "auth_gen": {"tests": ["jstests/auth/auth3.js"], },
+            "jsCore_auth":
+                TaskInfo(
+                    display_task_name="task 1",
+                    tests=[
+                        "jstests/core/currentop_waiting_for_latch.js",
+                        "jstests/core/latch_analyzer.js",
+                    ],
+                    resmoke_args="",
+                    use_multiversion=None,
+                    distro="",
+                ),
+            "auth_gen":
+                TaskInfo(
+                    display_task_name="task 2",
+                    tests=["jstests/auth/auth3.js"],
+                    resmoke_args="",
+                    use_multiversion=None,
+                    distro="",
+                ),
         }
         get_evg_task_config_mock.side_effect = [{"task_config_key": "task_config_value_1"},
                                                 {"task_config_key": "task_config_value_2"}]

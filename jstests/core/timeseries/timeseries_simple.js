@@ -2,13 +2,11 @@
  * Tests inserting sample data into the time-series buckets collection.
  * This test is for the simple case of only one measurement per bucket.
  * @tags: [
- *     assumes_unsharded_collection,         # TODO(SERVER-53816): remove
- *     does_not_support_causal_consistency,  # TODO(SERVER-53819): remove
+ *     assumes_no_implicit_collection_creation_after_drop,
  *     does_not_support_stepdowns,
  *     requires_fcv_49,
  *     requires_find_command,
  *     requires_getmore,
- *     sbe_incompatible,
  * ]
  */
 (function() {
@@ -21,18 +19,14 @@ if (!TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo())) {
     return;
 }
 
-const testDB = db.getSiblingDB(jsTestName());
-assert.commandWorked(testDB.dropDatabase());
-
-const coll = testDB.getCollection('t');
-const bucketsColl = testDB.getCollection('system.buckets.' + coll.getName());
+const coll = db.timeseries_simple;
+const bucketsColl = db.getCollection('system.buckets.' + coll.getName());
 
 coll.drop();
 
 const timeFieldName = 'time';
-assert.commandWorked(
-    testDB.createCollection(coll.getName(), {timeseries: {timeField: timeFieldName}}));
-assert.contains(bucketsColl.getName(), testDB.getCollectionNames());
+assert.commandWorked(db.createCollection(coll.getName(), {timeseries: {timeField: timeFieldName}}));
+assert.contains(bucketsColl.getName(), db.getCollectionNames());
 
 Random.setRandomSeed();
 const numHosts = 10;
@@ -77,7 +71,7 @@ for (let i = 0; i < numDocs; i++) {
 
     jsTestLog('Inserting doc into time-series collection: ' + i + ': ' + tojson(doc));
     let start = new Date();
-    assert.commandWorked(coll.insert(doc));
+    assert.commandWorked(coll.insert(doc, {ordered: false}));
     jsTestLog('Insertion took ' + ((new Date()).getTime() - start.getTime()) +
               ' ms. Retrieving doc from view: ' + i);
     start = new Date();

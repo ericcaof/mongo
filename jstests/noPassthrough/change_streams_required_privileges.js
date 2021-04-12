@@ -1,6 +1,10 @@
 // Tests that a change stream requires the correct privileges to be run.
 // This test uses the WiredTiger storage engine, which does not support running without journaling.
-// @tags: [requires_replication, requires_journaling, requires_majority_read_concern]
+// @tags: [
+//   requires_journaling,
+//   requires_majority_read_concern,
+//   requires_replication,
+// ]
 (function() {
 "use strict";
 

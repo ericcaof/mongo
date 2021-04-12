@@ -1,5 +1,13 @@
+# This file contains the list of all build variants running on *ALL* Evergreen mongo waterfalls.
+# This enables arbitrary versions of mongo binaries/artifacts/debug symbols to be downloaded
+# with `python buildscripts/resmoke.py setup-multiversion`
+#
+# PLEASE DO NOT REMOVE ANYTHING, unless a build variant no longer runs in any Evergreen project.
+
+
 evergreen_projects:
   - mongodb-mongo-master
+  - mongodb-mongo-v4.9
   - mongodb-mongo-v4.8
   - mongodb-mongo-v4.7
   - mongodb-mongo-v4.4
@@ -10,7 +18,6 @@ evergreen_projects:
 
 
 evergreen_buildvariants:
-
   - name: ubuntu1604
     edition: targeted
     platform: ubuntu1604
@@ -20,17 +27,6 @@ evergreen_buildvariants:
     edition: enterprise
     platform: ubuntu1604
     architecture: x86_64
-
-  - name: enterprise-ubuntu1604-arm64
-    edition: enterprise
-    platform: ubuntu1604
-    architecture: aarch64
-
-  - name: enterprise-ubuntu1604-arm64
-    edition: enterprise
-    platform: ubuntu1604
-    architecture: arm64
-    versions: ["3.4", "3.6", "4.0"]
 
   - name: ubuntu1804
     edition: targeted

@@ -1,7 +1,9 @@
 /**
  * Confirms slow currentOp logging does not conflict with processing commitIndexBuild, which may
  * block replication.
- * @tags: [requires_replication]
+ * @tags: [
+ *   requires_replication,
+ * ]
  */
 (function() {
 "use strict";

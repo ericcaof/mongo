@@ -44,6 +44,9 @@
 #include "mongo/db/logical_session_cache.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
+#include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/document_source_union_with.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
@@ -108,7 +111,7 @@ void sendRetryableWriteBatchRequestToConfig(OperationContext* opCtx,
     auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
+        write_ops::InsertCommandRequest insertOp(nss);
         insertOp.setDocuments(docs);
         return insertOp;
     }());
@@ -130,6 +133,282 @@ void sendRetryableWriteBatchRequestToConfig(OperationContext* opCtx,
 
     uassertStatusOK(batchResponse.toStatus());
     uassertStatusOK(writeStatus);
+}
+
+AggregateCommandRequest makeCollectionAndChunksAggregation(OperationContext* opCtx,
+                                                           const NamespaceString& nss,
+                                                           const ChunkVersion& sinceVersion) {
+    auto expCtx = make_intrusive<ExpressionContext>(opCtx, nullptr, nss);
+    StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces;
+    resolvedNamespaces[CollectionType::ConfigNS.coll()] = {CollectionType::ConfigNS,
+                                                           std::vector<BSONObj>()};
+    resolvedNamespaces[ChunkType::ConfigNS.coll()] = {ChunkType::ConfigNS, std::vector<BSONObj>()};
+    expCtx->setResolvedNamespaces(resolvedNamespaces);
+
+    using Doc = Document;
+    using Arr = std::vector<Value>;
+
+    Pipeline::SourceContainer stages;
+
+    // 1. Match config.collections entries with {_id: nss}. This stage will produce, at most, one
+    // config.collections document.
+    // {
+    //     $match: {
+    //         _id: <nss>
+    //     }
+    // }
+    stages.emplace_back(DocumentSourceMatch::create(
+        Doc{{CollectionType::kNssFieldName, nss.toString()}}.toBson(), expCtx));
+
+    // 2. Four $unionWith stages, each one of them guarded by a mutually exclusive condition on
+    // metadata format ('timestamp' exists) and whether the refresh is incremental ('lastmodEpoch'
+    // matches sinceVersion.epoch), so that only a single one of them will possibly execute their
+    // $lookup stage. This is necessary because the query optimizer is not able to use indexes when
+    // a $match inside a $lookup includes a $cond operator. Also note that depending on the metadata
+    // format (indicated by the presence of 'timestamp'), we have different guarantees about what
+    // indexes are present (ns_1_lastmod_1 or uuid_1_lastmod_1), so we must avoid possibly executing
+    // a $lookup that would need an inexistent index, even if it was to return empty results.
+    //
+    // The $lookup stages get the config.chunks documents according to the metadata format and the
+    // type of refresh (incremental or full), sorted by ascending 'lastmod'. The $lookup is
+    // immediately followed by $unwind to take advantage of the $lookup + $unwind coalescence
+    // optimization which avoids creating large intermediate documents.
+    //
+    // This $unionWith stage will produce one result document for each config.chunks document
+    // matching the refresh query.
+    // Note that we must not make any assumption on where the document produced by stage 1 will be
+    // placed in the response in relation with the documents produced by stage 2. The
+    // config.collections document produced in stage 1 could be interleaved between the
+    // config.chunks documents produced by stage 2.
+    //
+    // {
+    //     $unionWith: {
+    //         coll: "collections",
+    //         pipeline: [
+    //             { $match: { _id: <nss> } },
+    //             { $match: { timestamp: { $exists: 0 } } },
+    //             { $match: { lastmodEpoch: <sinceVersion.epoch> } },
+    //             {
+    //                 $lookup: {
+    //                     from: "chunks",
+    //                     as: "chunks",
+    //                     let: { local_ns: "$_id" },
+    //                     pipeline: [
+    //                         {
+    //                             $match: {
+    //                                 $expr: {
+    //                                     $eq: ["$ns", "$$local_ns"],
+    //                                 },
+    //                             }
+    //                         },
+    //                         { $match: { lastmod: { $gte: <sinceVersion> } } },
+    //                         {
+    //                             $sort: {
+    //                                 lastmod: 1
+    //                             }
+    //                         }
+    //                     ]
+    //                 }
+    //             },
+    //             {
+    //                 $unwind: {
+    //                     path: "$chunks"
+    //                 }
+    //             },
+    //             {
+    //                 $project: { _id: false, chunks: true }
+    //             }
+    //         ]
+    //     }
+    // },
+    // {
+    //     $unionWith: {
+    //         coll: "collections",
+    //         pipeline: [
+    //             { $match: { _id: <nss> } },
+    //             { $match: { timestamp: { $exists: 1 } } },
+    //             { $match: { lastmodEpoch: <sinceVersion.epoch> } },
+    //             {
+    //                 $lookup: {
+    //                     from: "chunks",
+    //                     as: "chunks",
+    //                     let: { local_uuid: "$uuid" },
+    //                     pipeline: [
+    //                         {
+    //                             $match: {
+    //                                 $expr: {
+    //                                     $eq: ["$uuid", "$$local_uuid"],
+    //                                 },
+    //                             }
+    //                         },
+    //                         { $match: { lastmod: { $gte: <sinceVersion> } } },
+    //                         {
+    //                             $sort: {
+    //                                 lastmod: 1
+    //                             }
+    //                         }
+    //                     ]
+    //                 }
+    //             },
+    //             {
+    //                 $unwind: {
+    //                     path: "$chunks"
+    //                 }
+    //             },
+    //             {
+    //                 $project: { _id: false, chunks: true }
+    //             },
+    //         ]
+    //     }
+    // },
+    // {
+    //     $unionWith: {
+    //         coll: "collections",
+    //         pipeline: [
+    //             { $match: { _id: <nss> } },
+    //             { $match: { timestamp: { $exists: 0 } } },
+    //             { $match: { lastmodEpoch: { $ne: <sinceVersion.epoch> } } },
+    //             {
+    //                 $lookup: {
+    //                     from: "chunks",
+    //                     as: "chunks",
+    //                     let: { local_ns: "$_id" },
+    //                     pipeline: [
+    //                         {
+    //                             $match: {
+    //                                 $expr: {
+    //                                     $eq: ["$ns", "$$local_ns"],
+    //                                 },
+    //                             }
+    //                         },
+    //                         {
+    //                             $sort: {
+    //                                 lastmod: 1
+    //                             }
+    //                         }
+    //                     ]
+    //                 }
+    //             },
+    //             {
+    //                 $unwind: {
+    //                     path: "$chunks"
+    //                 }
+    //             },
+    //             {
+    //                 $project: { _id: false, chunks: true }
+    //             },
+    //         ]
+    //     }
+    // },
+    // {
+    //     $unionWith: {
+    //         coll: "collections",
+    //         pipeline: [
+    //             { $match: { _id: <nss> } },
+    //             { $match: { timestamp: { $exists: 1 } } },
+    //             { $match: { lastmodEpoch: { $ne: <sinceVersion.epoch> } } },
+    //             {
+    //                 $lookup: {
+    //                     from: "chunks",
+    //                     as: "chunks",
+    //                     let: { local_uuid: "$uuid" },
+    //                     pipeline: [
+    //                         {
+    //                             $match: {
+    //                                 $expr: {
+    //                                     $eq: ["$uuid", "$$local_uuid"],
+    //                                 },
+    //                             }
+    //                         },
+    //                         {
+    //                             $sort: {
+    //                                 lastmod: 1
+    //                             }
+    //                         }
+    //                     ]
+    //                 }
+    //             },
+    //             {
+    //                 $unwind: {
+    //                     path: "$chunks"
+    //                 }
+    //             },
+    //             {
+    //                 $project: { _id: false, chunks: true }
+    //             },
+    //         ]
+    //     }
+    // }
+    const auto buildUnionWithFn = [&](bool withUUID, bool incremental) {
+        const auto lastmodEpochMatch = Doc{{incremental ? "$eq" : "$ne", sinceVersion.epoch()}};
+
+        const auto letExpr = withUUID ? Doc{{"local_uuid", "$" + CollectionType::kUuidFieldName}}
+                                      : Doc{{"local_ns", "$" + CollectionType::kNssFieldName}};
+
+        const auto eqNsOrUuidExpr = withUUID
+            ? Arr{Value{"$" + ChunkType::collectionUUID.name()}, Value{"$$local_uuid"_sd}}
+            : Arr{Value{"$" + ChunkType::ns.name()}, Value{"$$local_ns"_sd}};
+
+        constexpr auto chunksLookupOutputFieldName = "chunks"_sd;
+
+        const auto lookupPipeline = [&]() {
+            return Doc{
+                {"from", ChunkType::ConfigNS.coll()},
+                {"as", chunksLookupOutputFieldName},
+                {"let", letExpr},
+                {"pipeline",
+                 Arr{Value{Doc{{"$match", Doc{{"$expr", Doc{{"$eq", eqNsOrUuidExpr}}}}}}},
+                     incremental
+                         ? Value{Doc{{"$match",
+                                      Doc{{ChunkType::lastmod.name(),
+                                           Doc{{"$gte", Timestamp(sinceVersion.toLong())}}}}}}}
+                         : Value{/*noop*/},
+                     Value{Doc{{"$sort", Doc{{ChunkType::lastmod.name(), 1}}}}}}}};
+        }();
+
+        return Doc{
+            {"coll", CollectionType::ConfigNS.coll()},
+            {"pipeline",
+             Arr{Value{Doc{{"$match", Doc{{CollectionType::kNssFieldName, nss.toString()}}}}},
+                 Value{
+                     Doc{{"$match",
+                          Doc{{CollectionType::kTimestampFieldName, Doc{{"$exists", withUUID}}}}}}},
+                 Value{Doc{{"$match", Doc{{CollectionType::kEpochFieldName, lastmodEpochMatch}}}}},
+                 Value{Doc{{"$lookup", lookupPipeline}}},
+                 Value{Doc{{"$unwind", Doc{{"path", "$" + chunksLookupOutputFieldName}}}}},
+                 Value{Doc{
+                     {"$project", Doc{{"_id", false}, {chunksLookupOutputFieldName, true}}}}}}}};
+    };
+
+    // TODO SERVER-53283: Once 5.0 has branched out this stage is no longer necessary.
+    stages.emplace_back(DocumentSourceUnionWith::createFromBson(
+        Doc{{"$unionWith", buildUnionWithFn(false /* withUUID */, true /* incremental */)}}
+            .toBson()
+            .firstElement(),
+        expCtx));
+
+    stages.emplace_back(DocumentSourceUnionWith::createFromBson(
+        Doc{{"$unionWith", buildUnionWithFn(true /* withUUID */, true /* incremental */)}}
+            .toBson()
+            .firstElement(),
+        expCtx));
+
+    // TODO SERVER-53283: Once 5.0 has branched out this stage is no longer necessary.
+    stages.emplace_back(DocumentSourceUnionWith::createFromBson(
+        Doc{{"$unionWith", buildUnionWithFn(false /* withUUID */, false /* incremental */)}}
+            .toBson()
+            .firstElement(),
+        expCtx));
+
+    stages.emplace_back(DocumentSourceUnionWith::createFromBson(
+        Doc{{"$unionWith", buildUnionWithFn(true /* withUUID */, false /* incremental */)}}
+            .toBson()
+            .firstElement(),
+        expCtx));
+
+    auto pipeline = Pipeline::create(std::move(stages), expCtx);
+    auto serializedPipeline = pipeline->serializeToBson();
+    return AggregateCommandRequest(CollectionType::ConfigNS, std::move(serializedPipeline));
 }
 
 }  // namespace
@@ -404,14 +683,15 @@ StatusWith<std::vector<ChunkType>> ShardingCatalogClientImpl::getChunks(
     const BSONObj& sort,
     boost::optional<int> limit,
     OpTime* opTime,
-    repl::ReadConcernLevel readConcern) {
+    repl::ReadConcernLevel readConcern,
+    const boost::optional<BSONObj>& hint) {
     invariant(serverGlobalParams.clusterRole == ClusterRole::ConfigServer ||
               readConcern == repl::ReadConcernLevel::kMajorityReadConcern);
 
     // Convert boost::optional<int> to boost::optional<long long>.
     auto longLimit = limit ? boost::optional<long long>(*limit) : boost::none;
     auto findStatus = _exhaustiveFindOnConfig(
-        opCtx, kConfigReadSelector, readConcern, ChunkType::ConfigNS, query, sort, longLimit);
+        opCtx, kConfigReadSelector, readConcern, ChunkType::ConfigNS, query, sort, longLimit, hint);
     if (!findStatus.isOK()) {
         return findStatus.getStatus().withContext("Failed to load chunks");
     }
@@ -435,6 +715,77 @@ StatusWith<std::vector<ChunkType>> ShardingCatalogClientImpl::getChunks(
 
     return chunks;
 }
+
+std::pair<CollectionType, std::vector<ChunkType>> ShardingCatalogClientImpl::getCollectionAndChunks(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const ChunkVersion& sinceVersion,
+    const repl::ReadConcernArgs& readConcern) {
+    auto aggRequest = makeCollectionAndChunksAggregation(opCtx, nss, sinceVersion);
+    aggRequest.setReadConcern(readConcern.toBSONInner());
+    aggRequest.setWriteConcern(WriteConcernOptions());
+
+    const auto readPref = (serverGlobalParams.clusterRole == ClusterRole::ConfigServer)
+        ? ReadPreferenceSetting()
+        : Grid::get(opCtx)->readPreferenceWithConfigTime(kConfigReadSelector);
+    aggRequest.setUnwrappedReadPref(readPref.toContainingBSON());
+
+    // Run the aggregation
+    std::vector<BSONObj> aggResult;
+    auto callback = [&aggResult](const std::vector<BSONObj>& batch) {
+        aggResult.insert(aggResult.end(),
+                         std::make_move_iterator(batch.begin()),
+                         std::make_move_iterator(batch.end()));
+        return true;
+    };
+
+    const auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+    for (int retry = 1; retry <= kMaxWriteRetry; retry++) {
+        const Status status = configShard->runAggregation(opCtx, aggRequest, callback);
+        if (retry < kMaxWriteRetry &&
+            configShard->isRetriableError(status.code(), Shard::RetryPolicy::kIdempotent)) {
+            aggResult.clear();
+            continue;
+        }
+        uassertStatusOK(status);
+        break;
+    }
+
+    uassert(ErrorCodes::NamespaceNotFound,
+            stream() << "Collection " << nss.ns() << " not found",
+            !aggResult.empty());
+
+    boost::optional<CollectionType> coll;
+    std::vector<ChunkType> chunks;
+    chunks.reserve(aggResult.size() - 1);
+
+    // The aggregation may return the config.collections document anywhere between the
+    // config.chunks documents.
+    for (const auto& elem : aggResult) {
+        const auto chunkElem = elem.getField("chunks");
+        if (chunkElem) {
+            auto chunkRes = uassertStatusOK(ChunkType::fromConfigBSON(chunkElem.Obj()));
+            chunks.emplace_back(std::move(chunkRes));
+        } else {
+            uassert(5520100,
+                    "Found more than one 'collections' documents in aggregation response",
+                    !coll);
+            coll.emplace(elem);
+
+            uassert(ErrorCodes::NamespaceNotFound,
+                    str::stream() << "Collection " << nss.ns() << " is dropped.",
+                    !coll->getDropped());
+        }
+    }
+
+    uassert(5520101, "'collections' document not found in aggregation response", coll);
+
+    uassert(ErrorCodes::ConflictingOperationInProgress,
+            stream() << "No chunks were found for the collection " << nss,
+            !chunks.empty());
+
+    return {std::move(*coll), std::move(chunks)};
+};
 
 StatusWith<std::vector<TagsType>> ShardingCatalogClientImpl::getTagsForCollection(
     OperationContext* opCtx, const NamespaceString& nss) {
@@ -692,7 +1043,7 @@ Status ShardingCatalogClientImpl::insertConfigDocument(OperationContext* opCtx,
     const BSONElement idField = doc.getField("_id");
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
+        write_ops::InsertCommandRequest insertOp(nss);
         insertOp.setDocuments({doc});
         return insertOp;
     }());
@@ -819,7 +1170,7 @@ StatusWith<bool> ShardingCatalogClientImpl::_updateConfigDocument(
     invariant(nss.db() == NamespaceString::kConfigDb);
 
     BatchedCommandRequest request([&] {
-        write_ops::Update updateOp(nss);
+        write_ops::UpdateCommandRequest updateOp(nss);
         updateOp.setUpdates({[&] {
             write_ops::UpdateOpEntry entry;
             entry.setQ(query);
@@ -853,7 +1204,7 @@ Status ShardingCatalogClientImpl::removeConfigDocuments(OperationContext* opCtx,
     invariant(nss.db() == NamespaceString::kConfigDb);
 
     BatchedCommandRequest request([&] {
-        write_ops::Delete deleteOp(nss);
+        write_ops::DeleteCommandRequest deleteOp(nss);
         deleteOp.setDeletes({[&] {
             write_ops::DeleteOpEntry entry;
             entry.setQ(query);
@@ -877,9 +1228,10 @@ StatusWith<repl::OpTimeWith<vector<BSONObj>>> ShardingCatalogClientImpl::_exhaus
     const NamespaceString& nss,
     const BSONObj& query,
     const BSONObj& sort,
-    boost::optional<long long> limit) {
+    boost::optional<long long> limit,
+    const boost::optional<BSONObj>& hint) {
     auto response = Grid::get(opCtx)->shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
-        opCtx, readPref, readConcern, nss, query, sort, limit);
+        opCtx, readPref, readConcern, nss, query, sort, limit, hint);
     if (!response.isOK()) {
         return response.getStatus();
     }

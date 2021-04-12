@@ -5,7 +5,11 @@ Import("has_option")
 Import("use_libunwind")
 Import("debugBuild")
 
-env = env.Clone()
+env = env.Clone(
+    # Building with hidden visibility interferes with intercepting the
+    # libc allocation functions.
+    DISALLOW_VISHIDDEN=True,
+)
 
 if use_libunwind:
     env.Append(
@@ -103,7 +107,9 @@ def removeIfPresent(lst, item):
     except ValueError:
         pass
 
-for to_remove in ['-Werror', "-Wsign-compare","-Wall","-Werror=unused-result"]:
+env['CCFLAGS_WERROR'] = []
+env['CXXFLAGS_WERROR'] = []
+for to_remove in ["-Wsign-compare", "-Wall"]:
     removeIfPresent(env['CCFLAGS'], to_remove)
 
 if not env.TargetOSIs('windows'):

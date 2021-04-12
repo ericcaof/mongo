@@ -114,6 +114,9 @@ public:
     repl::ReplicationCoordinator::StatusAndDuration awaitReplication(
         OperationContext*, const repl::OpTime&, const WriteConcernOptions&) override;
 
+    SharedSemiFuture<void> awaitReplicationAsyncNoWTimeout(const repl::OpTime&,
+                                                           const WriteConcernOptions&) override;
+
     void stepDown(OperationContext*, bool, const Milliseconds&, const Milliseconds&) override;
 
     Status checkIfWriteConcernCanBeSatisfied(const WriteConcernOptions&) const override;
@@ -203,6 +206,8 @@ public:
     Status doReplSetReconfig(OperationContext* opCtx,
                              GetNewConfigFn getNewConfig,
                              bool force) override;
+
+    Status doOptimizedReconfig(OperationContext* opCtx, GetNewConfigFn getNewConfig) override;
 
     Status awaitConfigCommitment(OperationContext* opCtx, bool waitForOplogCommitment) override;
 

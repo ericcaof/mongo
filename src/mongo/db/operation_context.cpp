@@ -72,8 +72,11 @@ const auto kNoWaiterThread = stdx::thread::id();
 }  // namespace
 
 OperationContext::OperationContext(Client* client, OperationId opId)
+    : OperationContext(client, OperationIdSlot(opId)) {}
+
+OperationContext::OperationContext(Client* client, OperationIdSlot&& opIdSlot)
     : _client(client),
-      _opId(opId),
+      _opId(std::move(opIdSlot)),
       _elapsedTime(client ? client->getServiceContext()->getTickSource()
                           : SystemTickSource::get()) {}
 
@@ -289,8 +292,9 @@ Status OperationContext::checkForInterruptNoAssert() noexcept {
 // - _baton is notified (someone's queuing work for the baton)
 // - _baton::run returns (timeout fired / networking is ready / socket disconnected)
 //
-// We release the lock held by m whenever we call markKilled, since it may trigger CancelationSource
-// cancelation which can in turn emplace a SharedPromise which then may acquire a mutex.
+// We release the lock held by m whenever we call markKilled, since it may trigger
+// CancellationSource cancellation which can in turn emplace a SharedPromise which then may acquire
+// a mutex.
 StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAssertUntil(
     stdx::condition_variable& cv, BasicLockableAdapter m, Date_t deadline) noexcept {
     invariant(getClient());
@@ -387,7 +391,7 @@ void OperationContext::setOperationKey(OperationKey opKey) {
     invariant(!_opKey);
 
     _opKey.emplace(std::move(opKey));
-    OperationKeyManager::get(_client).add(*_opKey, _opId);
+    OperationKeyManager::get(_client).add(*_opKey, _opId.getId());
 }
 
 void OperationContext::releaseOperationKey() {

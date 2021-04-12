@@ -41,6 +41,8 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/multi_key_path_tracker.h"
+#include "mongo/db/record_id_helpers.h"
 #include "mongo/db/storage/storage_debug_util.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/string_map.h"
@@ -133,7 +135,15 @@ void IndexConsistency::repairMissingIndexEntries(OperationContext* opCtx,
     for (auto it = _missingIndexEntries.begin(); it != _missingIndexEntries.end();) {
         const IndexKey& key = it->first;
         const KeyString::Value& ks = it->second.keyString;
-        const RecordId rid = KeyString::decodeRecordIdAtEnd(ks.getBuffer(), ks.getSize());
+        const KeyFormat keyFormat = _validateState->getCollection()->getRecordStore()->keyFormat();
+
+        RecordId rid;
+        if (keyFormat == KeyFormat::Long) {
+            rid = KeyString::decodeRecordIdLongAtEnd(ks.getBuffer(), ks.getSize());
+        } else {
+            invariant(keyFormat == KeyFormat::String);
+            rid = KeyString::decodeRecordIdStrAtEnd(ks.getBuffer(), ks.getSize());
+        }
 
         const std::string& indexName = key.first;
         if (indexName != index->descriptor()->indexName()) {
@@ -282,6 +292,17 @@ void IndexConsistency::addIndexEntryErrors(ValidateResults* results) {
     }
 }
 
+void IndexConsistency::addDocumentMultikeyPaths(IndexInfo* indexInfo,
+                                                const MultikeyPaths& newPaths) {
+    invariant(newPaths.size());
+    if (indexInfo->docMultikeyPaths.size()) {
+        MultikeyPathTracker::mergeMultikeyPaths(&indexInfo->docMultikeyPaths, newPaths);
+    } else {
+        // Instantiate the multikey paths. Also indicates that this index uses multikeyPaths.
+        indexInfo->docMultikeyPaths = newPaths;
+    }
+}
+
 void IndexConsistency::addDocKey(OperationContext* opCtx,
                                  const KeyString::Value& ks,
                                  IndexInfo* indexInfo,
@@ -359,7 +380,7 @@ void IndexConsistency::addIndexKey(OperationContext* opCtx,
 
         IndexKey key = _generateKeyForMap(*indexInfo, ks);
         if (_missingIndexEntries.count(key) == 0) {
-            if (_validateState->shouldRunRepair()) {
+            if (_validateState->fixErrors()) {
                 // Removing extra index entries.
                 InsertDeleteOptions options;
                 options.dupsAllowed = !indexInfo->unique;
@@ -479,14 +500,17 @@ BSONObj IndexConsistency::_generateInfo(const std::string& indexName,
 
     BSONObj rehydratedKey = b.done();
 
+    BSONObjBuilder infoBuilder;
+    infoBuilder.append("indexName", indexName);
+    recordId.serializeToken("recordId", &infoBuilder);
+
     if (!idKey.isEmpty()) {
-        invariant(idKey.nFields() == 1);
-        return BSON("indexName" << indexName << "recordId" << recordId.repr() << "idKey" << idKey
-                                << "indexKey" << rehydratedKey);
-    } else {
-        return BSON("indexName" << indexName << "recordId" << recordId.repr() << "indexKey"
-                                << rehydratedKey);
+        infoBuilder.append("idKey", idKey);
     }
+
+    infoBuilder.append("indexKey", rehydratedKey);
+
+    return infoBuilder.obj();
 }
 
 uint32_t IndexConsistency::_hashKeyString(const KeyString::Value& ks,

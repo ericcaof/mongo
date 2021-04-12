@@ -1,4 +1,8 @@
-// @tags: [does_not_support_stepdowns, requires_profiling, requires_sharding]
+// @tags: [
+//   does_not_support_stepdowns,
+//   requires_profiling,
+//   requires_sharding,
+// ]
 
 // Confirms that profiled aggregation execution contains expected values for usedDisk.
 

@@ -1,3 +1,6 @@
+/**
+ * @tags: [requires_fcv_49]
+ */
 load('jstests/libs/sessions_collection.js');
 
 (function() {
@@ -126,6 +129,7 @@ var shardConfig = shard.getDB("config");
     assert.commandWorked(shardAdmin.runCommand({refreshLogicalSessionCacheNow: 1}));
     assert.eq(shardConfig.system.sessions.count(), 2, "did not flush shard's sessions");
 
+    rs.awaitLastOpCommitted();
     assert.commandWorked(mongosAdmin.runCommand({refreshLogicalSessionCacheNow: 1}));
     assert.eq(shardConfig.system.sessions.count(), 4, "did not flush mongos' sessions");
 }

@@ -1,5 +1,7 @@
 // Tests that stashed transaction resources are destroyed at shutdown and stepdown.
-// @tags: [uses_transactions]
+// @tags: [
+//   uses_transactions,
+// ]
 (function() {
 "use strict";
 

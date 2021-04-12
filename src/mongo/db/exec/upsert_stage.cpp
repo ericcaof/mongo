@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2019 MongoDB, Inc.
+ *    Copyright (C) 2019-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -148,11 +148,11 @@ void UpsertStage::_performInsert(BSONObj newDocument) {
 
     writeConflictRetry(opCtx(), "upsert", collection()->ns().ns(), [&] {
         WriteUnitOfWork wunit(opCtx());
-        uassertStatusOK(
-            collection()->insertDocument(opCtx(),
-                                         InsertStatement(_params.request->getStmtId(), newDocument),
-                                         _params.opDebug,
-                                         _params.request->isFromMigration()));
+        uassertStatusOK(collection()->insertDocument(
+            opCtx(),
+            InsertStatement(_params.request->getStmtIds(), newDocument),
+            _params.opDebug,
+            _params.request->isFromMigration()));
 
         // Technically, we should save/restore state here, but since we are going to return
         // immediately after, it would just be wasted work.

@@ -350,7 +350,7 @@ let MongosAPIParametersUtil = (function() {
             commandName: "drop",
             run: {
                 inAPIVersion1: true,
-                shardCommandName: "drop",
+                shardCommandName: "_shardsvrDropCollection",
                 permittedInTxn: false,
                 command: () => ({drop: "collection"})
             }
@@ -385,8 +385,7 @@ let MongosAPIParametersUtil = (function() {
             commandName: "dropDatabase",
             run: {
                 inAPIVersion1: true,
-                configServerCommandName: "_configsvrDropDatabase",
-                shardCommandName: "dropDatabase",
+                shardCommandName: "_shardsvrDropDatabase",
                 permittedInTxn: false,
                 command: () => ({dropDatabase: 1})
             }
@@ -825,7 +824,6 @@ let MongosAPIParametersUtil = (function() {
             commandName: "movePrimary",
             run: {
                 inAPIVersion1: false,
-                configServerCommandName: "_configsvrMovePrimary",
                 shardCommandName: "_shardsvrMovePrimary",
                 runsAgainstAdminDb: true,
                 permittedInTxn: false,
@@ -943,15 +941,11 @@ let MongosAPIParametersUtil = (function() {
         },
         {commandName: "replSetGetStatus", skip: "not supported in mongos"},
         {
-            commandName: "resetError",
-            skip: "executes locally on mongos (not sent to any remote node)"
-        },
-        {
             commandName: "reshardCollection",
             run: {
                 inAPIVersion1: false,
                 permittedInTxn: false,
-                configServerCommandName: "_configsvrReshardCollection",
+                shardCommandName: "_shardsvrReshardCollection",
                 requiresShardedCollection: true,
                 // reshardCollection internally does atClusterTime reads.
                 requiresCommittedReads: true,
@@ -1095,8 +1089,7 @@ let MongosAPIParametersUtil = (function() {
             commandName: "shardCollection",
             run: {
                 inAPIVersion1: false,
-                configServerCommandName: "_configsvrShardCollection",
-                shardCommandName: "_shardsvrShardCollection",
+                shardCommandName: "_shardsvrCreateCollection",
                 runsAgainstAdminDb: true,
                 permittedInTxn: false,
                 permittedOnShardedCollection: false,
@@ -1106,10 +1099,6 @@ let MongosAPIParametersUtil = (function() {
                 },
                 command: () => ({shardCollection: "db.collection", key: {_id: 1}})
             }
-        },
-        {
-            commandName: "shardConnPoolStats",
-            skip: "executes locally on mongos (not sent to any remote node)"
         },
         {commandName: "shutdown", skip: "executes locally on mongos (not sent to any remote node)"},
         {

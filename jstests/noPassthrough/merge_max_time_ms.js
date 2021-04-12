@@ -1,6 +1,9 @@
 /**
  * Test that an aggregation with a $merge stage obeys the maxTimeMS.
- * @tags: [requires_sharding, requires_replication]
+ * @tags: [
+ *   requires_replication,
+ *   requires_sharding,
+ * ]
  */
 (function() {
 load("jstests/aggregation/extras/merge_helpers.js");  // For withEachMergeMode().

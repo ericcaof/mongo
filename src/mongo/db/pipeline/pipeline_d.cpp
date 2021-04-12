@@ -45,8 +45,10 @@
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/multi_iterator.h"
 #include "mongo/db/exec/queued_data_stage.h"
+#include "mongo/db/exec/sample_from_timeseries_bucket.h"
 #include "mongo/db/exec/shard_filter.h"
 #include "mongo/db/exec/trial_stage.h"
+#include "mongo/db/exec/unpack_timeseries_bucket.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
@@ -59,6 +61,7 @@
 #include "mongo/db/pipeline/document_source_geo_near.h"
 #include "mongo/db/pipeline/document_source_geo_near_cursor.h"
 #include "mongo/db/pipeline/document_source_group.h"
+#include "mongo/db/pipeline/document_source_internal_unpack_bucket.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_sample.h"
 #include "mongo/db/pipeline/document_source_sample_from_random_cursor.h"
@@ -77,6 +80,7 @@
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/s/query/document_source_merge_cursors.h"
 #include "mongo/util/time_support.h"
@@ -87,24 +91,20 @@ using boost::intrusive_ptr;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
-using write_ops::Insert;
+using write_ops::InsertCommandRequest;
 
 namespace {
 /**
- * Returns a PlanExecutor which uses a random cursor to sample documents if successful. Returns {}
- * if the storage engine doesn't support random cursors, or if 'sampleSize' is a large enough
- * percentage of the collection.
- *
- * If needed, adds DocumentSourceSampleFromRandomCursor to the front of the pipeline, replacing the
- * $sample stage. This is needed if we select an optimized plan for $sample taking advantage of
- * storage engine support for random cursors.
+ * Returns a 'PlanExecutor' which uses a random cursor to sample documents if successful as
+ * determined by the boolean. Returns {} if the storage engine doesn't support random cursors, or if
+ * 'sampleSize' is a large enough percentage of the collection.
  */
-StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorExecutor(
-    const CollectionPtr& coll,
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    long long sampleSize,
-    long long numRecords,
-    Pipeline* pipeline) {
+StatusWith<std::pair<unique_ptr<PlanExecutor, PlanExecutor::Deleter>, bool>>
+createRandomCursorExecutor(const CollectionPtr& coll,
+                           const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                           long long sampleSize,
+                           long long numRecords,
+                           boost::optional<BucketUnpacker> bucketUnpacker) {
     OperationContext* opCtx = expCtx->opCtx;
 
     // Verify that we are already under a collection lock. We avoid taking locks ourselves in this
@@ -113,14 +113,14 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorEx
 
     static const double kMaxSampleRatioForRandCursor = 0.05;
     if (sampleSize > numRecords * kMaxSampleRatioForRandCursor || numRecords <= 100) {
-        return {nullptr};
+        return std::pair{nullptr, false};
     }
 
     // Attempt to get a random cursor from the RecordStore.
     auto rsRandCursor = coll->getRecordStore()->getRandomCursor(opCtx);
     if (!rsRandCursor) {
         // The storage engine has no random cursor support.
-        return {nullptr};
+        return std::pair{nullptr, false};
     }
 
     // Build a MultiIteratorStage and pass it the random-sampling RecordCursor.
@@ -142,14 +142,14 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorEx
     // cursor may have been mistaken. For sharded collections, build a TRIAL plan that will switch
     // to a collection scan if the ratio of orphaned to owned documents encountered over the first
     // 100 works() is such that we would have chosen not to optimize.
-    if (collectionFilter.isSharded()) {
+    static const size_t kMaxPresampleSize = 100;
+    if (collectionFilter.isSharded() && !expCtx->ns.isTimeseriesBucketsCollection()) {
         // The ratio of owned to orphaned documents must be at least equal to the ratio between the
         // requested sampleSize and the maximum permitted sampleSize for the original constraints to
         // be satisfied. For instance, if there are 200 documents and the sampleSize is 5, then at
         // least (5 / (200*0.05)) = (5/10) = 50% of those documents must be owned. If less than 5%
         // of the documents in the collection are owned, we default to the backup plan.
-        static const size_t kMaxPresampleSize = 100;
-        const auto minWorkAdvancedRatio = std::max(
+        const auto minAdvancedToWorkRatio = std::max(
             sampleSize / (numRecords * kMaxSampleRatioForRandCursor), kMaxSampleRatioForRandCursor);
         // The trial plan is SHARDING_FILTER-MULTI_ITERATOR.
         auto randomCursorPlan = std::make_unique<ShardFilterStage>(
@@ -165,25 +165,83 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorEx
                                             std::move(randomCursorPlan),
                                             std::move(collScanPlan),
                                             kMaxPresampleSize,
-                                            minWorkAdvancedRatio);
+                                            minAdvancedToWorkRatio);
+        trialStage = static_cast<TrialStage*>(root.get());
+    } else if (expCtx->ns.isTimeseriesBucketsCollection()) {
+        // Use a 'TrialStage' to run a trial between 'SampleFromTimeseriesBucket' and
+        // 'UnpackTimeseriesBucket' with $sample left in the pipeline in-place. If the buckets are
+        // not sufficiently full, or the 'SampleFromTimeseriesBucket' plan draws too many
+        // duplicates, then we will fall back to the 'TrialStage' backup plan. This backup plan uses
+        // the top-k sort sampling approach.
+        //
+        // Suppose the 'gTimeseriesBucketMaxCount' is 1000, but each bucket only contains 500
+        // documents on average. The observed trial advanced/work ratio approximates the average
+        // bucket fullness, noted here as "abf". In this example, abf = 500 / 1000 = 0.5.
+        // Experiments have shown that the optimized 'SampleFromTimeseriesBucket' algorithm performs
+        // better than backup plan when
+        //
+        //     sampleSize < 0.02 * abf * numRecords * gTimeseriesBucketMaxCount
+        //
+        //  This inequality can be rewritten as
+        //
+        //     abf > sampleSize / (0.02 * numRecords * gTimeseriesBucketMaxCount)
+        //
+        // Therefore, if the advanced/work ratio exceeds this threshold, we will use the
+        // 'SampleFromTimeseriesBucket' plan. Note that as the sample size requested by the user
+        // becomes larger with respect to the number of buckets, we require a higher advanced/work
+        // ratio in order to justify using 'SampleFromTimeseriesBucket'.
+        //
+        // Additionally, we require the 'TrialStage' to approximate the abf as at least 0.25. When
+        // buckets are mostly empty, the 'SampleFromTimeseriesBucket' will be inefficient due to a
+        // lot of sampling "misses".
+        static const auto kCoefficient = 0.02;
+        static const auto kMinBucketFullness = 0.25;
+        const auto minAdvancedToWorkRatio = std::max(
+            std::min(sampleSize / (kCoefficient * numRecords * gTimeseriesBucketMaxCount), 1.0),
+            kMinBucketFullness);
+
+        auto arhashPlan = std::make_unique<SampleFromTimeseriesBucket>(
+            expCtx.get(),
+            ws.get(),
+            std::move(root),
+            *bucketUnpacker,
+            // By using a quantity slightly higher than 'kMaxPresampleSize', we ensure that the
+            // 'SampleFromTimeseriesBucket' stage won't fail due to too many consecutive sampling
+            // attempts during the 'TrialStage's trial period.
+            kMaxPresampleSize + 5,
+            sampleSize,
+            gTimeseriesBucketMaxCount);
+
+        std::unique_ptr<PlanStage> collScanPlan = std::make_unique<CollectionScan>(
+            expCtx.get(), coll, CollectionScanParams{}, ws.get(), nullptr);
+
+        auto topkSortPlan = std::make_unique<UnpackTimeseriesBucket>(
+            expCtx.get(), ws.get(), std::move(collScanPlan), *bucketUnpacker);
+
+        root = std::make_unique<TrialStage>(expCtx.get(),
+                                            ws.get(),
+                                            std::move(arhashPlan),
+                                            std::move(topkSortPlan),
+                                            kMaxPresampleSize,
+                                            minAdvancedToWorkRatio);
         trialStage = static_cast<TrialStage*>(root.get());
     }
 
-    auto exec = plan_executor_factory::make(
-        expCtx, std::move(ws), std::move(root), &coll, PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
+    auto execStatus = plan_executor_factory::make(expCtx,
+                                                  std::move(ws),
+                                                  std::move(root),
+                                                  &coll,
+                                                  PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
+                                                  QueryPlannerParams::RETURN_OWNED_DATA);
+    if (!execStatus.isOK()) {
+        return execStatus.getStatus();
+    }
 
     // For sharded collections, the root of the plan tree is a TrialStage that may have chosen
     // either a random-sampling cursor trial plan or a COLLSCAN backup plan. We can only optimize
     // the $sample aggregation stage if the trial plan was chosen.
-    if (!trialStage || !trialStage->pickedBackupPlan()) {
-        // Replace $sample stage with $sampleFromRandomCursor stage.
-        pipeline->popFront();
-        std::string idString = coll->ns().isOplog() ? "ts" : "_id";
-        pipeline->addInitialSource(
-            DocumentSourceSampleFromRandomCursor::create(expCtx, sampleSize, idString, numRecords));
-    }
-
-    return exec;
+    return std::pair{std::move(execStatus.getValue()),
+                     !trialStage || !trialStage->pickedBackupPlan()};
 }
 
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExecutor(
@@ -196,35 +254,37 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
     BSONObj sortObj,
     SkipThenLimit skipThenLimit,
     boost::optional<std::string> groupIdForDistinctScan,
-    const AggregateCommand* aggRequest,
+    const AggregateCommandRequest* aggRequest,
     const size_t plannerOpts,
     const MatchExpressionParser::AllowedFeatureSet& matcherFeatures) {
-    auto qr = std::make_unique<QueryRequest>(nss);
-    qr->setTailableMode(expCtx->tailableMode);
-    qr->setFilter(queryObj);
-    qr->setProj(projectionObj);
-    qr->setSort(sortObj);
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    query_request_helper::setTailableMode(expCtx->tailableMode, findCommand.get());
+    findCommand->setFilter(queryObj.getOwned());
+    findCommand->setProjection(projectionObj.getOwned());
+    findCommand->setSort(sortObj.getOwned());
     if (auto skip = skipThenLimit.getSkip()) {
-        qr->setSkip(static_cast<std::int64_t>(*skip));
+        findCommand->setSkip(static_cast<std::int64_t>(*skip));
     }
     if (auto limit = skipThenLimit.getLimit()) {
-        qr->setLimit(static_cast<std::int64_t>(*limit));
+        findCommand->setLimit(static_cast<std::int64_t>(*limit));
     }
 
+    bool isExplain = false;
     if (aggRequest) {
-        qr->setExplain(static_cast<bool>(aggRequest->getExplain()));
-        qr->setHint(aggRequest->getHint().value_or(BSONObj()));
+        findCommand->setHint(aggRequest->getHint().value_or(BSONObj()).getOwned());
+        isExplain = static_cast<bool>(aggRequest->getExplain());
     }
 
     // The collation on the ExpressionContext has been resolved to either the user-specified
     // collation or the collection default. This BSON should never be empty even if the resolved
     // collator is simple.
-    qr->setCollation(expCtx->getCollatorBSON());
+    findCommand->setCollation(expCtx->getCollatorBSON().getOwned());
 
     const ExtensionsCallbackReal extensionsCallback(expCtx->opCtx, &nss);
 
     auto cq = CanonicalQuery::canonicalize(expCtx->opCtx,
-                                           std::move(qr),
+                                           std::move(findCommand),
+                                           isExplain,
                                            expCtx,
                                            extensionsCallback,
                                            matcherFeatures,
@@ -318,12 +378,115 @@ StringData extractGeoNearFieldFromIndexes(OperationContext* opCtx,
     }
     MONGO_UNREACHABLE;
 }
+
+/**
+ * This attempts to either extract a $sample stage at the front of the pipeline or a
+ * $_internalUnpackBucket stage at the front of the pipeline immediately followed by a $sample
+ * stage. In the former case a 'nullptr' is returned for the second element of the pair <$sample,
+ * $_internalUnpackBucket>, and if the latter case is encountered both elements of the pair will be
+ * a populated. If the pipeline doesn't contain a $_internalUnpackBucket at the front of the
+ * pipeline immediately followed by a $sample stage, then the first element in the pair will be a
+ * 'nullptr'.
+ */
+std::pair<DocumentSourceSample*, DocumentSourceInternalUnpackBucket*> extractSampleUnpackBucket(
+    const Pipeline::SourceContainer& sources) {
+    DocumentSourceSample* sampleStage = nullptr;
+    DocumentSourceInternalUnpackBucket* unpackStage = nullptr;
+
+    auto sourcesIt = sources.begin();
+    if (sourcesIt != sources.end()) {
+        sampleStage = dynamic_cast<DocumentSourceSample*>(sourcesIt->get());
+        if (sampleStage) {
+            return std::pair{sampleStage, unpackStage};
+        }
+
+        unpackStage = dynamic_cast<DocumentSourceInternalUnpackBucket*>(sourcesIt->get());
+        ++sourcesIt;
+
+        if (unpackStage && sourcesIt != sources.end()) {
+            sampleStage = dynamic_cast<DocumentSourceSample*>(sourcesIt->get());
+            return std::pair{sampleStage, unpackStage};
+        }
+    }
+
+    return std::pair{sampleStage, unpackStage};
+}
 }  // namespace
+
+std::pair<PipelineD::AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
+PipelineD::buildInnerQueryExecutorSample(DocumentSourceSample* sampleStage,
+                                         DocumentSourceInternalUnpackBucket* unpackBucketStage,
+                                         const CollectionPtr& collection,
+                                         Pipeline* pipeline) {
+    tassert(5422105, "sampleStage cannot be a nullptr", sampleStage);
+
+    auto expCtx = pipeline->getContext();
+
+    Pipeline::SourceContainer& sources = pipeline->_sources;
+
+    const long long sampleSize = sampleStage->getSampleSize();
+    const long long numRecords = collection->getRecordStore()->numRecords(expCtx->opCtx);
+
+    boost::optional<BucketUnpacker> bucketUnpacker;
+    if (unpackBucketStage) {
+        bucketUnpacker = unpackBucketStage->bucketUnpacker();
+    }
+    auto&& [exec, isStorageOptimizedSample] = uassertStatusOK(createRandomCursorExecutor(
+        collection, expCtx, sampleSize, numRecords, std::move(bucketUnpacker)));
+
+    AttachExecutorCallback attachExecutorCallback;
+    if (exec) {
+        if (!unpackBucketStage) {
+            if (isStorageOptimizedSample) {
+                // Replace $sample stage with $sampleFromRandomCursor stage.
+                pipeline->popFront();
+                std::string idString = collection->ns().isOplog() ? "ts" : "_id";
+                pipeline->addInitialSource(DocumentSourceSampleFromRandomCursor::create(
+                    expCtx, sampleSize, idString, numRecords));
+            }
+        } else {
+            if (isStorageOptimizedSample) {
+                // If there are non-nullptrs for 'sampleStage' and 'unpackBucketStage', then
+                // 'unpackBucketStage' is at the front of the pipeline immediately followed by a
+                // 'sampleStage'. We need to use a TrialStage approach to handle a problem where
+                // ARHASH sampling can fail due to small measurement counts. We can push sampling
+                // and bucket unpacking down to the PlanStage layer and erase $_internalUnpackBucket
+                // and $sample.
+                sources.erase(sources.begin());
+                sources.erase(sources.begin());
+            } else {
+                // The TrialStage chose the backup plan and we need to erase just the
+                // $_internalUnpackBucket stage and leave $sample where it is.
+                sources.erase(sources.begin());
+            }
+        }
+
+        // The order in which we evaluate these arguments is significant. We'd like to be
+        // sure that the DocumentSourceCursor is created _last_, because if we run into a
+        // case where a DocumentSourceCursor has been created (yet hasn't been put into a
+        // Pipeline) and an exception is thrown, an invariant will trigger in the
+        // DocumentSourceCursor. This is a design flaw in DocumentSourceCursor.
+        auto deps = pipeline->getDependencies(DepsTracker::kAllMetadata);
+        const auto cursorType = deps.hasNoRequirements()
+            ? DocumentSourceCursor::CursorType::kEmptyDocuments
+            : DocumentSourceCursor::CursorType::kRegular;
+        attachExecutorCallback =
+            [cursorType](const CollectionPtr& collection,
+                         std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
+                         Pipeline* pipeline) {
+                auto cursor = DocumentSourceCursor::create(
+                    collection, std::move(exec), pipeline->getContext(), cursorType);
+                pipeline->addInitialSource(std::move(cursor));
+            };
+        return std::pair(std::move(attachExecutorCallback), std::move(exec));
+    }
+    return std::pair(std::move(attachExecutorCallback), nullptr);
+}
 
 std::pair<PipelineD::AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
 PipelineD::buildInnerQueryExecutor(const CollectionPtr& collection,
                                    const NamespaceString& nss,
-                                   const AggregateCommand* aggRequest,
+                                   const AggregateCommandRequest* aggRequest,
                                    Pipeline* pipeline) {
     auto expCtx = pipeline->getContext();
 
@@ -335,31 +498,15 @@ PipelineD::buildInnerQueryExecutor(const CollectionPtr& collection,
     }
 
     if (!sources.empty()) {
-        auto sampleStage = dynamic_cast<DocumentSourceSample*>(sources.front().get());
+        // Try to inspect if the DocumentSourceSample or a DocumentSourceInternalUnpackBucket stage
+        // can be optimized for sampling backed by a storage engine supplied random cursor.
+        auto&& [sampleStage, unpackBucketStage] = extractSampleUnpackBucket(sources);
+
         // Optimize an initial $sample stage if possible.
         if (collection && sampleStage) {
-            const long long sampleSize = sampleStage->getSampleSize();
-            const long long numRecords = collection->getRecordStore()->numRecords(expCtx->opCtx);
-            auto exec = uassertStatusOK(
-                createRandomCursorExecutor(collection, expCtx, sampleSize, numRecords, pipeline));
+            auto [attachExecutorCallback, exec] =
+                buildInnerQueryExecutorSample(sampleStage, unpackBucketStage, collection, pipeline);
             if (exec) {
-                // The order in which we evaluate these arguments is significant. We'd like to be
-                // sure that the DocumentSourceCursor is created _last_, because if we run into a
-                // case where a DocumentSourceCursor has been created (yet hasn't been put into a
-                // Pipeline) and an exception is thrown, an invariant will trigger in the
-                // DocumentSourceCursor. This is a design flaw in DocumentSourceCursor.
-                auto deps = pipeline->getDependencies(DepsTracker::kAllMetadata);
-                const auto cursorType = deps.hasNoRequirements()
-                    ? DocumentSourceCursor::CursorType::kEmptyDocuments
-                    : DocumentSourceCursor::CursorType::kRegular;
-                auto attachExecutorCallback =
-                    [cursorType](const CollectionPtr& collection,
-                                 std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
-                                 Pipeline* pipeline) {
-                        auto cursor = DocumentSourceCursor::create(
-                            collection, std::move(exec), pipeline->getContext(), cursorType);
-                        pipeline->addInitialSource(std::move(cursor));
-                    };
                 return std::make_pair(std::move(attachExecutorCallback), std::move(exec));
             }
         }
@@ -389,10 +536,11 @@ void PipelineD::attachInnerQueryExecutorToPipeline(
     }
 }
 
-void PipelineD::buildAndAttachInnerQueryExecutorToPipeline(const CollectionPtr& collection,
-                                                           const NamespaceString& nss,
-                                                           const AggregateCommand* aggRequest,
-                                                           Pipeline* pipeline) {
+void PipelineD::buildAndAttachInnerQueryExecutorToPipeline(
+    const CollectionPtr& collection,
+    const NamespaceString& nss,
+    const AggregateCommandRequest* aggRequest,
+    Pipeline* pipeline) {
 
     auto callback = PipelineD::buildInnerQueryExecutor(collection, nss, aggRequest, pipeline);
     PipelineD::attachInnerQueryExecutorToPipeline(
@@ -512,7 +660,7 @@ auto buildProjectionForPushdown(const DepsTracker& deps, Pipeline* pipeline) {
 std::pair<PipelineD::AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
 PipelineD::buildInnerQueryExecutorGeneric(const CollectionPtr& collection,
                                           const NamespaceString& nss,
-                                          const AggregateCommand* aggRequest,
+                                          const AggregateCommandRequest* aggRequest,
                                           Pipeline* pipeline) {
     // Make a last effort to optimize pipeline stages before potentially detaching them to be pushed
     // down into the query executor.
@@ -583,9 +731,11 @@ PipelineD::buildInnerQueryExecutorGeneric(const CollectionPtr& collection,
         ? DocumentSourceCursor::CursorType::kEmptyDocuments
         : DocumentSourceCursor::CursorType::kRegular;
 
-    // If this is a change stream pipeline, make sure that we tell DSCursor to track the oplog time.
+    // If this is a change stream pipeline or a resharding resume token has been requested, make
+    // sure that we tell DSCursor to track the oplog time.
     const bool trackOplogTS =
-        (pipeline->peekFront() && pipeline->peekFront()->constraints().isChangeStreamStage());
+        (pipeline->peekFront() && pipeline->peekFront()->constraints().isChangeStreamStage()) ||
+        (aggRequest && aggRequest->getRequestReshardingResumeToken());
 
     auto attachExecutorCallback =
         [cursorType, trackOplogTS](const CollectionPtr& collection,
@@ -601,7 +751,7 @@ PipelineD::buildInnerQueryExecutorGeneric(const CollectionPtr& collection,
 std::pair<PipelineD::AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
 PipelineD::buildInnerQueryExecutorGeoNear(const CollectionPtr& collection,
                                           const NamespaceString& nss,
-                                          const AggregateCommand* aggRequest,
+                                          const AggregateCommandRequest* aggRequest,
                                           Pipeline* pipeline) {
     uassert(ErrorCodes::NamespaceNotFound,
             str::stream() << "$geoNear requires a geo index to run, but " << nss.ns()
@@ -669,11 +819,12 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
     QueryMetadataBitSet unavailableMetadata,
     const BSONObj& queryObj,
     SkipThenLimit skipThenLimit,
-    const AggregateCommand* aggRequest,
+    const AggregateCommandRequest* aggRequest,
     const MatchExpressionParser::AllowedFeatureSet& matcherFeatures,
     bool* hasNoRequirements) {
     invariant(hasNoRequirements);
 
+    // Any data returned from the inner executor must be owned.
     size_t plannerOpts = QueryPlannerParams::DEFAULT;
 
     if (pipeline->peekFront() && pipeline->peekFront()->constraints().isChangeStreamStage()) {
@@ -731,6 +882,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
         // projection at the front of the pipeline, it will be removed and handled by the PlanStage
         // layer. If a projection cannot be pushed down, an empty BSONObj will be returned.
         projObj = buildProjectionForPushdown(deps, pipeline);
+        plannerOpts |= QueryPlannerParams::RETURN_OWNED_DATA;
     }
 
     if (rewrittenGroupStage) {
@@ -796,5 +948,13 @@ Timestamp PipelineD::getLatestOplogTimestamp(const Pipeline* pipeline) {
         return docSourceCursor->getLatestOplogTimestamp();
     }
     return Timestamp();
+}
+
+BSONObj PipelineD::getPostBatchResumeToken(const Pipeline* pipeline) {
+    if (auto docSourceCursor =
+            dynamic_cast<DocumentSourceCursor*>(pipeline->_sources.front().get())) {
+        return docSourceCursor->getPostBatchResumeToken();
+    }
+    return BSONObj{};
 }
 }  // namespace mongo

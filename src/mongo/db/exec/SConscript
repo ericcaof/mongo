@@ -51,6 +51,16 @@ env.Library(
     ],
 )
 
+env.Library(
+    target = "bucket_unpacker",
+    source = [
+        "bucket_unpacker.cpp",
+    ],
+    LIBDEPS = [
+        "document_value/document_value",
+    ],
+)
+
 sortExecutorEnv = env.Clone()
 sortExecutorEnv.InjectThirdParty(libraries=['snappy'])
 sortExecutorEnv.Library(
@@ -133,6 +143,7 @@ env.CppUnitTest(
         "queued_data_stage_test.cpp",
         "sort_test.cpp",
         "working_set_test.cpp",
+        "bucket_unpacker_test.cpp",
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
@@ -141,6 +152,7 @@ env.CppUnitTest(
         "$BUILD_DIR/mongo/db/query/collation/collator_interface_mock",
         "$BUILD_DIR/mongo/db/query/query_test_service_context",
         "$BUILD_DIR/mongo/db/query_exec",
+        "$BUILD_DIR/mongo/db/record_id_helpers",
         "$BUILD_DIR/mongo/db/service_context_d",
         "$BUILD_DIR/mongo/db/service_context_d_test_fixture",
         "$BUILD_DIR/mongo/dbtests/mocklib",

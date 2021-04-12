@@ -66,7 +66,7 @@ class Database;
 class ViewCatalog {
 public:
     using ViewMap = StringMap<std::shared_ptr<ViewDefinition>>;
-    using ViewIteratorCallback = std::function<void(const ViewDefinition& view)>;
+    using ViewIteratorCallback = std::function<bool(const ViewDefinition& view)>;
 
     static std::shared_ptr<const ViewCatalog> get(const Database* db);
     static void set(Database* db, std::unique_ptr<ViewCatalog> catalog);
@@ -77,9 +77,10 @@ public:
     /**
      * Iterates through the catalog, applying 'callback' to each view. This callback function
      * executes under the catalog's mutex, so it must not access other methods of the catalog,
-     * acquire locks or run for a long time.
+     * acquire locks or run for a long time. If the 'callback' returns false, the iterator exists
+     * early.
      */
-    void iterate(OperationContext* opCtx, ViewIteratorCallback callback) const;
+    void iterate(ViewIteratorCallback callback) const;
 
     /**
      * Create a new view 'viewName' with contents defined by running the specified aggregation
@@ -95,8 +96,7 @@ public:
                              const NamespaceString& viewName,
                              const NamespaceString& viewOn,
                              const BSONArray& pipeline,
-                             const BSONObj& collation,
-                             const boost::optional<TimeseriesOptions>& timeseries);
+                             const BSONObj& collation);
 
     /**
      * Drop the view named 'viewName'.
@@ -139,6 +139,13 @@ public:
     StatusWith<ResolvedView> resolveView(OperationContext* opCtx, const NamespaceString& nss) const;
 
     /**
+     * Returns Status::OK with the set of involved namespaces if the given pipeline is eligible to
+     * act as a view definition. Otherwise, returns ErrorCodes::OptionNotSupportedOnView.
+     */
+    static StatusWith<stdx::unordered_set<NamespaceString>> validatePipeline(
+        OperationContext* opCtx, const ViewDefinition& viewDef);
+
+    /**
      * Reloads the in-memory state of the view catalog from the 'system.views' collection catalog.
      * If the 'lookupBehavior' is 'kValidateDurableViews', then the durable view definitions will be
      * validated. Reading stops on the first invalid entry with errors logged and returned. Performs
@@ -154,7 +161,7 @@ public:
     /**
      * Clears the in-memory state of the view catalog.
      */
-    static void clear(const Database* db);
+    static void clear(OperationContext* opCtx, const Database* db);
 
     /**
      * The view catalog needs to ignore external changes for its own modifications.
@@ -168,20 +175,12 @@ private:
                                const NamespaceString& viewName,
                                const NamespaceString& viewOn,
                                const BSONArray& pipeline,
-                               std::unique_ptr<CollatorInterface> collator,
-                               const boost::optional<TimeseriesOptions>& timeseries = boost::none);
+                               std::unique_ptr<CollatorInterface> collator);
     /**
      * Parses the view definition pipeline, attempts to upsert into the view graph, and refreshes
      * the graph if necessary. Returns an error status if the resulting graph would be invalid.
      */
     Status _upsertIntoGraph(OperationContext* opCtx, const ViewDefinition& viewDef);
-
-    /**
-     * Returns Status::OK with the set of involved namespaces if the given pipeline is eligible to
-     * act as a view definition. Otherwise, returns ErrorCodes::OptionNotSupportedOnView.
-     */
-    StatusWith<stdx::unordered_set<NamespaceString>> _validatePipeline(
-        OperationContext* opCtx, const ViewDefinition& viewDef) const;
 
     /**
      * Returns Status::OK if each view namespace in 'refs' has the same default collation as 'view'.

@@ -50,13 +50,18 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/insert.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/idl/command_generic_argument.h"
 #include "mongo/logv2/log.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(failTimeseriesViewCreation);
+
 void _createSystemDotViewsIfNecessary(OperationContext* opCtx, const Database* db) {
     // Create 'system.views' in a separate WUOW if it does not exist.
     if (!CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx,
@@ -69,8 +74,7 @@ void _createSystemDotViewsIfNecessary(OperationContext* opCtx, const Database* d
 
 Status _createView(OperationContext* opCtx,
                    const NamespaceString& nss,
-                   CollectionOptions&& collectionOptions,
-                   const BSONObj& idIndex) {
+                   CollectionOptions&& collectionOptions) {
     return writeConflictRetry(opCtx, "create", nss.ns(), [&] {
         AutoGetOrCreateDb autoDb(opCtx, nss.db(), MODE_IX);
         Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
@@ -107,7 +111,7 @@ Status _createView(OperationContext* opCtx,
 
         // Even though 'collectionOptions' is passed by rvalue reference, it is not safe to move
         // because 'userCreateNS' may throw a WriteConflictException.
-        Status status = db->userCreateNS(opCtx, nss, collectionOptions, true, idIndex);
+        Status status = db->userCreateNS(opCtx, nss, collectionOptions, /*createIdIndex=*/false);
         if (!status.isOK()) {
             return status;
         }
@@ -119,26 +123,180 @@ Status _createView(OperationContext* opCtx,
 
 Status _createTimeseries(OperationContext* opCtx,
                          const NamespaceString& ns,
-                         CollectionOptions&& options) {
+                         const CollectionOptions& options) {
+    // This path should only be taken when a user creates a new time-series collection on the
+    // primary. Secondaries replicate individual oplog entries.
+    invariant(!ns.isTimeseriesBucketsCollection());
+    invariant(opCtx->writesAreReplicated());
+
     auto bucketsNs = ns.makeTimeseriesBucketsNamespace();
 
-    options.viewOn = bucketsNs.coll().toString();
+    auto granularity = options.timeseries->getGranularity();
+    uassert(ErrorCodes::InvalidOptions,
+            "Time-series 'granularity' is required to be 'seconds'",
+            granularity == BucketGranularityEnum::Seconds);
 
-    if (options.timeseries->getMetaField()) {
-        options.pipeline =
-            BSON_ARRAY(BSON("$_internalUnpackBucket"
-                            << BSON("timeField" << options.timeseries->getTimeField() << "metaField"
-                                                << *options.timeseries->getMetaField() << "exclude"
-                                                << BSONArray())));
-    } else {
-        options.pipeline = BSON_ARRAY(
-            BSON("$_internalUnpackBucket" << BSON("timeField" << options.timeseries->getTimeField()
-                                                              << "exclude" << BSONArray())));
-    }
+    auto bucketMaxSpan = options.timeseries->getBucketMaxSpanSeconds();
+    uassert(ErrorCodes::InvalidOptions,
+            "Time-series 'bucketMaxSpanSeconds' is required to be 3600",
+            bucketMaxSpan == 3600);
 
-    return writeConflictRetry(opCtx, "create", ns.ns(), [&]() -> Status {
+
+    // Set the validator option to a JSON schema enforcing constraints on bucket documents.
+    // This validation is only structural to prevent accidental corruption by users and
+    // cannot cover all constraints. Leave the validationLevel and validationAction to their
+    // strict/error defaults.
+    auto timeField = options.timeseries->getTimeField();
+    auto validatorObj = fromjson(fmt::sprintf(R"(
+{
+'$jsonSchema' : {
+    bsonType: 'object',
+    required: ['_id', 'control', 'data'],
+    properties: {
+        _id: {bsonType: 'objectId'},
+        control: {
+            bsonType: 'object',
+            required: ['version', 'min', 'max'],
+            properties: {
+                version: {bsonType: 'number'},
+                min: {
+                    bsonType: 'object',
+                    required: ['%s'],
+                    properties: {'%s': {bsonType: 'date'}}
+                },
+                max: {
+                    bsonType: 'object',
+                    required: ['%s'],
+                    properties: {'%s': {bsonType: 'date'}}
+                },
+                closed: {bsonType: 'bool'}
+            }
+        },
+        data: {bsonType: 'object'},
+        meta: {}
+    },
+    additionalProperties: false
+}
+})",
+                                              timeField,
+                                              timeField,
+                                              timeField,
+                                              timeField));
+
+    bool existingBucketCollectionIsCompatible = false;
+
+    Status ret =
+        writeConflictRetry(opCtx, "createBucketCollection", bucketsNs.ns(), [&]() -> Status {
+            AutoGetDb autoDb(opCtx, bucketsNs.db(), MODE_IX);
+            Lock::CollectionLock bucketsCollLock(opCtx, bucketsNs, MODE_IX);
+
+            auto db = autoDb.ensureDbExists();
+
+            WriteUnitOfWork wuow(opCtx);
+            AutoStatsTracker bucketsStatsTracker(
+                opCtx,
+                bucketsNs,
+                Top::LockType::NotLocked,
+                AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
+                CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(ns.db()));
+
+            // If the buckets collection and time-series view creation roll back, ensure that their
+            // Top entries are deleted.
+            opCtx->recoveryUnit()->onRollback(
+                [serviceContext = opCtx->getServiceContext(), bucketsNs]() {
+                    Top::get(serviceContext).collectionDropped(bucketsNs);
+                });
+
+
+            // Prepare collection option and index spec using the provided options. In case the
+            // collection already exist we use these to validate that they are the same as being
+            // requested here.
+            CollectionOptions bucketsOptions = options;
+            bucketsOptions.validator = validatorObj;
+
+            // If possible, cluster time-series buckets collections by _id.
+            const bool useClusteredIdIndex = gTimeseriesBucketsCollectionClusterById &&
+                opCtx->getServiceContext()->getStorageEngine()->supportsClusteredIdIndex();
+            auto expireAfterSeconds = options.timeseries->getExpireAfterSeconds();
+            if (useClusteredIdIndex) {
+                ClusteredIndexOptions clusteredOptions;
+                if (expireAfterSeconds) {
+                    uassertStatusOK(
+                        index_key_validate::validateExpireAfterSeconds(*expireAfterSeconds));
+                    clusteredOptions.setExpireAfterSeconds(*expireAfterSeconds);
+                }
+                bucketsOptions.clusteredIndex = clusteredOptions;
+            }
+
+            // Create a TTL index on 'control.min.[timeField]' if 'expireAfterSeconds' is provided
+            // and the collection is not clustered by _id.
+            BSONObj indexSpec;
+            std::string indexName;
+            if (expireAfterSeconds && !bucketsOptions.clusteredIndex) {
+                const std::string controlMinTimeField = str::stream()
+                    << "control.min." << options.timeseries->getTimeField();
+                indexName = controlMinTimeField + "_1";
+                indexSpec =
+                    BSON(IndexDescriptor::kIndexVersionFieldName
+                         << IndexDescriptor::kLatestIndexVersion
+                         << IndexDescriptor::kKeyPatternFieldName << BSON(controlMinTimeField << 1)
+                         << IndexDescriptor::kIndexNameFieldName << indexName
+                         << IndexDescriptor::kExpireAfterSecondsFieldName << *expireAfterSeconds);
+            }
+
+            if (auto coll =
+                    CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, bucketsNs)) {
+                // Compare CollectionOptions and eventual TTL index to see if this bucket collection
+                // may be reused for this request.
+                existingBucketCollectionIsCompatible =
+                    DurableCatalog::get(opCtx)
+                        ->getCollectionOptions(opCtx, coll->getCatalogId())
+                        .matchesStorageOptions(
+                            bucketsOptions,
+                            CollatorFactoryInterface::get(opCtx->getServiceContext()));
+                if (expireAfterSeconds && !bucketsOptions.clusteredIndex) {
+                    auto indexDescriptor =
+                        coll->getIndexCatalog()->findIndexByName(opCtx, indexName, true);
+                    existingBucketCollectionIsCompatible &=
+                        indexDescriptor && indexDescriptor->infoObj().woCompare(indexSpec) == 0;
+                }
+
+                return Status(ErrorCodes::NamespaceExists,
+                              str::stream() << "Bucket Collection already exists. NS: " << bucketsNs
+                                            << ". UUID: " << coll->uuid());
+            }
+
+            // Create the buckets collection that will back the view.
+            const bool createIdIndex = !useClusteredIdIndex;
+            uassertStatusOK(db->userCreateNS(opCtx, bucketsNs, bucketsOptions, createIdIndex));
+
+            // Create a TTL index if 'expireAfterSeconds' is provided and the collection is not
+            // clustered by _id.
+            if (expireAfterSeconds && !useClusteredIdIndex) {
+                CollectionWriter collectionWriter(opCtx, bucketsNs);
+                auto indexBuildCoord = IndexBuildsCoordinator::get(opCtx);
+                auto fromMigrate = false;
+                try {
+                    uassertStatusOK(index_key_validate::validateIndexSpecTTL(indexSpec));
+                    indexBuildCoord->createIndexesOnEmptyCollection(
+                        opCtx, collectionWriter, {indexSpec}, fromMigrate);
+                } catch (DBException& ex) {
+                    ex.addContext(str::stream()
+                                  << "failed to create TTL index on bucket collection: "
+                                  << bucketsNs << "; index spec: " << indexSpec);
+                    return ex.toStatus();
+                }
+            }
+            wuow.commit();
+            return Status::OK();
+        });
+
+    // If compatible bucket collection already exists then proceed with creating view definition.
+    if (!ret.isOK() && !existingBucketCollectionIsCompatible)
+        return ret;
+
+    ret = writeConflictRetry(opCtx, "create", ns.ns(), [&]() -> Status {
         AutoGetCollection autoColl(opCtx, ns, MODE_IX, AutoGetCollectionViewMode::kViewsPermitted);
-        Lock::CollectionLock bucketsCollLock(opCtx, bucketsNs, MODE_IX);
         Lock::CollectionLock systemDotViewsLock(
             opCtx,
             NamespaceString(ns.db(), NamespaceString::kSystemDotViewsCollectionName),
@@ -153,7 +311,11 @@ Status _createTimeseries(OperationContext* opCtx,
         }
 
         auto db = autoColl.ensureDbExists();
-        if (ViewCatalog::get(db)->lookup(opCtx, ns.ns())) {
+        if (auto view = ViewCatalog::get(db)->lookup(opCtx, ns.ns())) {
+            if (view->timeseries()) {
+                return {ErrorCodes::NamespaceExists,
+                        str::stream() << "A timeseries collection already exists. NS: " << ns};
+            }
             return {ErrorCodes::NamespaceExists,
                     str::stream() << "A view already exists. NS: " << ns};
         }
@@ -175,111 +337,58 @@ Status _createTimeseries(OperationContext* opCtx,
                                       AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
                                       catalog->getDatabaseProfileLevel(ns.db()));
 
-        AutoStatsTracker bucketsStatsTracker(opCtx,
-                                             bucketsNs,
-                                             Top::LockType::NotLocked,
-                                             AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-                                             catalog->getDatabaseProfileLevel(ns.db()));
+        // If the buckets collection and time-series view creation roll back, ensure that their
+        // Top entries are deleted.
+        opCtx->recoveryUnit()->onRollback([serviceContext = opCtx->getServiceContext(), ns]() {
+            Top::get(serviceContext).collectionDropped(ns);
+        });
 
-        // If the buckets collection and time-series view creation roll back, ensure that their Top
-        // entries are deleted.
-        opCtx->recoveryUnit()->onRollback(
-            [serviceContext = opCtx->getServiceContext(), ns, bucketsNs]() {
-                Top::get(serviceContext).collectionDropped(ns);
-                Top::get(serviceContext).collectionDropped(bucketsNs);
-            });
-
-        CollectionOptions bucketsOptions;
-
-        // Set the validator option to a JSON schema enforcing constraints on bucket documents.
-        // This validation is only structural to prevent accidental corruption by users and cannot
-        // cover all constraints.
-        // Leave the validationLevel and validationAction to their strict/error defaults.
-        auto timeField = options.timeseries->getTimeField();
-        bucketsOptions.validator = fromjson(fmt::sprintf(R"(
-{
-    '$jsonSchema' : {
-        bsonType: 'object',
-        required: ['_id', 'control', 'data'],
-        properties: {
-            _id: {bsonType: 'objectId'},
-            control: {
-                bsonType: 'object',
-                required: ['version', 'min', 'max'],
-                properties: {
-                    version: {bsonType: 'number'},
-                    min: {
-                        bsonType: 'object',
-                        required: ['%s'],
-                        properties: {'%s': {bsonType: 'date'}}
-                    },
-                    max: {
-                        bsonType: 'object',
-                        required: ['%s'],
-                        properties: {'%s': {bsonType: 'date'}}
-                    }
-                }
-            },
-            data: {bsonType: 'object'},
-            meta: {}
-        },
-        additionalProperties: false
-    }
-})",
-                                                         timeField,
-                                                         timeField,
-                                                         timeField,
-                                                         timeField));
-
-        // Create the buckets collection that will back the view.
-        auto bucketsCollection = db->createCollection(opCtx, bucketsNs, bucketsOptions);
-        invariant(bucketsCollection,
-                  str::stream() << "Failed to create buckets collection " << bucketsNs
-                                << " for time-series collection " << ns);
-
-        // Create a TTL index on 'control.min.[timeField]' if 'expireAfterSeconds' is provided.
-        if (auto expireAfterSeconds = options.timeseries->getExpireAfterSeconds()) {
-            CollectionWriter collectionWriter(opCtx, bucketsCollection->uuid());
-            auto indexBuildCoord = IndexBuildsCoordinator::get(opCtx);
-            const std::string controlMinTimeField = str::stream()
-                << "control.min." << options.timeseries->getTimeField();
-            auto indexSpec =
-                BSON(IndexDescriptor::kIndexVersionFieldName
-                     << IndexDescriptor::kLatestIndexVersion
-                     << IndexDescriptor::kKeyPatternFieldName << BSON(controlMinTimeField << 1)
-                     << IndexDescriptor::kIndexNameFieldName << (controlMinTimeField + "_1")
-                     << IndexDescriptor::kExpireAfterSecondsFieldName << *expireAfterSeconds);
-            auto fromMigrate = false;
-            try {
-                uassertStatusOK(index_key_validate::validateIndexSpecTTL(indexSpec));
-                indexBuildCoord->createIndexesOnEmptyCollection(
-                    opCtx, collectionWriter, {indexSpec}, fromMigrate);
-            } catch (DBException& ex) {
-                ex.addContext(str::stream() << "failed to create TTL index on bucket collection: "
-                                            << bucketsNs << "; index spec: " << indexSpec);
-                return ex.toStatus();
-            }
+        if (MONGO_unlikely(failTimeseriesViewCreation.shouldFail(
+                [&ns](const BSONObj& data) { return data["ns"_sd].String() == ns.ns(); }))) {
+            LOGV2(5490200,
+                  "failTimeseriesViewCreation fail point enabled. Failing creation of view "
+                  "definition after bucket collection was created successfully.");
+            return {ErrorCodes::OperationFailed,
+                    str::stream() << "Timeseries view definition " << ns
+                                  << " creation failed due to 'failTimeseriesViewCreation' "
+                                     "fail point enabled."};
         }
 
-        // Create the time-series view. Even though 'options' is passed by rvalue reference, it is
-        // not safe to move because 'userCreateNS' may throw a WriteConflictException.
-        auto status = db->userCreateNS(opCtx, ns, options);
+        CollectionOptions viewOptions;
+        viewOptions.viewOn = bucketsNs.coll().toString();
+        viewOptions.collation = options.collation;
+
+        if (options.timeseries->getMetaField()) {
+            viewOptions.pipeline =
+                BSON_ARRAY(BSON("$_internalUnpackBucket" << BSON(
+                                    "timeField" << options.timeseries->getTimeField() << "metaField"
+                                                << *options.timeseries->getMetaField() << "exclude"
+                                                << BSONArray())));
+        } else {
+            viewOptions.pipeline = BSON_ARRAY(BSON(
+                "$_internalUnpackBucket" << BSON("timeField" << options.timeseries->getTimeField()
+                                                             << "exclude" << BSONArray())));
+        }
+
+        // Create the time-series view.
+        auto status = db->userCreateNS(opCtx, ns, viewOptions);
         if (!status.isOK()) {
             return status.withContext(str::stream() << "Failed to create view on " << bucketsNs
                                                     << " for time-series collection " << ns
-                                                    << " with options " << options.toBSON());
+                                                    << " with options " << viewOptions.toBSON());
         }
 
         wuow.commit();
-
         return Status::OK();
     });
+
+    return ret;
 }
 
 Status _createCollection(OperationContext* opCtx,
                          const NamespaceString& nss,
                          CollectionOptions&& collectionOptions,
-                         const BSONObj& idIndex) {
+                         boost::optional<BSONObj> idIndex) {
     return writeConflictRetry(opCtx, "create", nss.ns(), [&] {
         AutoGetOrCreateDb autoDb(opCtx, nss.db(), MODE_IX);
         Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
@@ -290,10 +399,27 @@ Status _createCollection(OperationContext* opCtx,
             return Status(ErrorCodes::NamespaceExists,
                           str::stream() << "Collection already exists. NS: " << nss);
         }
-        if (ViewCatalog::get(autoDb.getDb())->lookup(opCtx, nss.ns())) {
+        if (auto view = ViewCatalog::get(autoDb.getDb())->lookup(opCtx, nss.ns()); view) {
+            if (view->timeseries()) {
+                return Status(ErrorCodes::NamespaceExists,
+                              str::stream()
+                                  << "A timeseries collection already exists. NS: " << nss);
+            }
             return Status(ErrorCodes::NamespaceExists,
                           str::stream() << "A view already exists. NS: " << nss);
         }
+
+        if (collectionOptions.clusteredIndex && !nss.isTimeseriesBucketsCollection()) {
+            return Status(
+                ErrorCodes::InvalidOptions,
+                "The 'clusteredIndex' option is only supported on time-series buckets collections");
+        }
+
+        if (collectionOptions.clusteredIndex && idIndex && !idIndex->isEmpty()) {
+            return Status(ErrorCodes::InvalidOptions,
+                          "The 'clusteredIndex' option is not supported with the 'idIndex' option");
+        }
+
 
         if (opCtx->writesAreReplicated() &&
             !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss)) {
@@ -318,7 +444,14 @@ Status _createCollection(OperationContext* opCtx,
 
         // Even though 'collectionOptions' is passed by rvalue reference, it is not safe to move
         // because 'userCreateNS' may throw a WriteConflictException.
-        Status status = autoDb.getDb()->userCreateNS(opCtx, nss, collectionOptions, true, idIndex);
+        Status status = Status::OK();
+        if (idIndex == boost::none || collectionOptions.clusteredIndex) {
+            status = autoDb.getDb()->userCreateNS(
+                opCtx, nss, collectionOptions, /*createIdIndex=*/false);
+        } else {
+            status = autoDb.getDb()->userCreateNS(
+                opCtx, nss, collectionOptions, /*createIdIndex=*/true, *idIndex);
+        }
         if (!status.isOK()) {
             return status;
         }
@@ -334,8 +467,8 @@ Status _createCollection(OperationContext* opCtx,
 Status createCollection(OperationContext* opCtx,
                         const NamespaceString& ns,
                         CollectionOptions&& options,
-                        const BSONObj& idIndex) {
-    auto status = userAllowedCreateNS(ns);
+                        boost::optional<BSONObj> idIndex) {
+    auto status = userAllowedCreateNS(opCtx, ns);
     if (!status.isOK()) {
         return status;
     }
@@ -345,13 +478,16 @@ Status createCollection(OperationContext* opCtx,
                 str::stream() << "Cannot create a view in a multi-document "
                                  "transaction.",
                 !opCtx->inMultiDocumentTransaction());
-        return _createView(opCtx, ns, std::move(options), idIndex);
-    } else if (options.timeseries) {
+        return _createView(opCtx, ns, std::move(options));
+    } else if (options.timeseries && !ns.isTimeseriesBucketsCollection()) {
+        // This helper is designed for user-created time-series collections on primaries. If a
+        // time-series buckets collection is created explicitly or during replication, treat this as
+        // a normal collection creation.
         uassert(ErrorCodes::OperationNotSupportedInTransaction,
                 str::stream()
                     << "Cannot create a time-series collection in a multi-document transaction.",
                 !opCtx->inMultiDocumentTransaction());
-        return _createTimeseries(opCtx, ns, std::move(options));
+        return _createTimeseries(opCtx, ns, options);
     } else {
         uassert(ErrorCodes::OperationNotSupportedInTransaction,
                 str::stream() << "Cannot create system collection " << ns
@@ -368,7 +504,7 @@ Status createCollection(OperationContext* opCtx,
 Status createCollection(OperationContext* opCtx,
                         const NamespaceString& nss,
                         const BSONObj& cmdObj,
-                        const BSONObj& idIndex,
+                        boost::optional<BSONObj> idIndex,
                         CollectionOptions::ParseKind kind) {
     BSONObjIterator it(cmdObj);
 
@@ -431,7 +567,7 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                                    const OptionalCollectionUUID& ui,
                                    const BSONObj& cmdObj,
                                    const bool allowRenameOutOfTheWay,
-                                   const BSONObj& idIndex) {
+                                   boost::optional<BSONObj> idIndex) {
     invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_IX));
 
     const NamespaceString newCollName(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));

@@ -70,6 +70,7 @@
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/speculative_majority_read_info.h"
+#include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
@@ -100,7 +101,7 @@ namespace {
  */
 bool canOptimizeAwayPipeline(const Pipeline* pipeline,
                              const PlanExecutor* exec,
-                             const AggregateCommand& request,
+                             const AggregateCommandRequest& request,
                              bool hasGeoNearStage,
                              bool hasChangeStreamStage) {
     return pipeline && exec && !hasGeoNearStage && !hasChangeStreamStage &&
@@ -120,11 +121,12 @@ bool handleCursorCommand(OperationContext* opCtx,
                          boost::intrusive_ptr<ExpressionContext> expCtx,
                          const NamespaceString& nsForCursor,
                          std::vector<ClientCursor*> cursors,
-                         const AggregateCommand& request,
+                         const AggregateCommandRequest& request,
                          const BSONObj& cmdObj,
                          rpc::ReplyBuilderInterface* result) {
     invariant(!cursors.empty());
-    long long batchSize = request.getBatchSize();
+    long long batchSize =
+        request.getCursor().getBatchSize().value_or(aggregation_request_helper::kDefaultBatchSize);
 
     if (cursors.size() > 1) {
 
@@ -203,6 +205,10 @@ bool handleCursorCommand(OperationContext* opCtx,
         }
 
         if (state == PlanExecutor::IS_EOF) {
+            // If this executor produces a postBatchResumeToken, add it to the cursor response. We
+            // call this on EOF because the PBRT may advance even when there are no further results.
+            responseBuilder.setPostBatchResumeToken(exec->getPostBatchResumeToken());
+
             if (!cursor->isTailable()) {
                 // Make it an obvious error to use cursor or executor after this point.
                 cursor = nullptr;
@@ -260,7 +266,7 @@ bool handleCursorCommand(OperationContext* opCtx,
 }
 
 StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNamespaces(
-    OperationContext* opCtx, const AggregateCommand& request) {
+    OperationContext* opCtx, const AggregateCommandRequest& request) {
     const LiteParsedPipeline liteParsedPipeline(request);
     const auto& pipelineInvolvedNamespaces = liteParsedPipeline.getInvolvedNamespaces();
 
@@ -291,8 +297,9 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
         }
 
         // If 'ns' refers to a view namespace, then we resolve its definition.
-        auto resolveViewDefinition = [&](const NamespaceString& ns) -> Status {
-            auto resolvedView = viewCatalog->resolveView(opCtx, ns);
+        auto resolveViewDefinition = [&](const NamespaceString& ns,
+                                         std::shared_ptr<const ViewCatalog> vcp) -> Status {
+            auto resolvedView = vcp->resolveView(opCtx, ns);
             if (!resolvedView.isOK()) {
                 return resolvedView.getStatus().withContext(
                     str::stream() << "Failed to resolve view '" << involvedNs.ns());
@@ -315,22 +322,40 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
         };
 
         // If the involved namespace is not in the same database as the aggregation, it must be
-        // from an $out or a $merge to a collection in a different database.
+        // from a $lookup/$graphLookup into a tenant migration donor's oplog view or from an
+        // $out/$merge to a collection in a different database.
         if (involvedNs.db() != request.getNamespace().db()) {
-            // SERVER-51886: It is not correct to assume that we are reading from a collection
-            // because the collection targeted by $out/$merge on a given database can have the same
-            // name as a view on the source database. As such, we determine whether the collection
-            // name references a view on the aggregation request's database. Note that the inverse
-            // scenario (mistaking a view for a collection) is not an issue because $merge/$out
-            // cannot target a view.
-            auto nssToCheck = NamespaceString(request.getNamespace().db(), involvedNs.coll());
-            if (viewCatalog && viewCatalog->lookup(opCtx, nssToCheck.ns())) {
-                auto status = resolveViewDefinition(nssToCheck);
+            if (involvedNs == NamespaceString::kTenantMigrationOplogView) {
+                // For tenant migrations, we perform an aggregation on 'config.transactions' but
+                // require a lookup stage involving a view on the 'local' database.
+                // If the involved namespace is 'local.system.tenantMigration.oplogView', resolve
+                // its view definition.
+                auto involvedDbViewCatalog =
+                    DatabaseHolder::get(opCtx)->getViewCatalog(opCtx, involvedNs.db());
+
+                // It is safe to assume that the ViewCatalog for the `local` database always
+                // exists because replica sets forbid dropping the oplog and the `local` database.
+                invariant(involvedDbViewCatalog);
+                auto status = resolveViewDefinition(involvedNs, involvedDbViewCatalog);
                 if (!status.isOK()) {
                     return status;
                 }
             } else {
-                resolvedNamespaces[involvedNs.coll()] = {involvedNs, std::vector<BSONObj>{}};
+                // SERVER-51886: It is not correct to assume that we are reading from a collection
+                // because the collection targeted by $out/$merge on a given database can have the
+                // same name as a view on the source database. As such, we determine whether the
+                // collection name references a view on the aggregation request's database. Note
+                // that the inverse scenario (mistaking a view for a collection) is not an issue
+                // because $merge/$out cannot target a view.
+                auto nssToCheck = NamespaceString(request.getNamespace().db(), involvedNs.coll());
+                if (viewCatalog && viewCatalog->lookup(opCtx, nssToCheck.ns())) {
+                    auto status = resolveViewDefinition(nssToCheck, viewCatalog);
+                    if (!status.isOK()) {
+                        return status;
+                    }
+                } else {
+                    resolvedNamespaces[involvedNs.coll()] = {involvedNs, std::vector<BSONObj>{}};
+                }
             }
         } else if (!viewCatalog ||
                    CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, involvedNs)) {
@@ -341,7 +366,7 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
             // snapshot of the view catalog.
             resolvedNamespaces[involvedNs.coll()] = {involvedNs, std::vector<BSONObj>{}};
         } else if (viewCatalog->lookup(opCtx, involvedNs.ns())) {
-            auto status = resolveViewDefinition(involvedNs);
+            auto status = resolveViewDefinition(involvedNs, viewCatalog);
             if (!status.isOK()) {
                 return status;
             }
@@ -393,7 +418,7 @@ Status collatorCompatibleWithPipeline(OperationContext* opCtx,
 // versioned. This can happen in the case where we are running in a cluster with a 4.4 mongoS, which
 // does not set any shard version on a $mergeCursors pipeline.
 void setIgnoredShardVersionForMergeCursors(OperationContext* opCtx,
-                                           const AggregateCommand& request) {
+                                           const AggregateCommandRequest& request) {
     auto isMergeCursors = request.getFromMongos() && request.getPipeline().size() > 0 &&
         request.getPipeline().front().firstElementFieldNameStringData() == "$mergeCursors"_sd;
     if (isMergeCursors && !OperationShardingState::isOperationVersioned(opCtx)) {
@@ -404,7 +429,7 @@ void setIgnoredShardVersionForMergeCursors(OperationContext* opCtx,
 
 boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
     OperationContext* opCtx,
-    const AggregateCommand& request,
+    const AggregateCommandRequest& request,
     std::unique_ptr<CollatorInterface> collator,
     boost::optional<UUID> uuid) {
     setIgnoredShardVersionForMergeCursors(opCtx, request);
@@ -464,7 +489,7 @@ void _adjustChangeStreamReadConcern(OperationContext* opCtx) {
 std::vector<std::unique_ptr<Pipeline, PipelineDeleter>> createExchangePipelinesIfNeeded(
     OperationContext* opCtx,
     boost::intrusive_ptr<ExpressionContext> expCtx,
-    const AggregateCommand& request,
+    const AggregateCommandRequest& request,
     std::unique_ptr<Pipeline, PipelineDeleter> pipeline,
     boost::optional<UUID> uuid) {
     std::vector<std::unique_ptr<Pipeline, PipelineDeleter>> pipelines;
@@ -496,11 +521,26 @@ std::vector<std::unique_ptr<Pipeline, PipelineDeleter>> createExchangePipelinesI
 
     return pipelines;
 }
+
+/**
+ * Performs validations related to API versioning and time-series stages.
+ * Throws UserAssertion if any of the validations fails
+ *     - validation of API versioning on each stage on the pipeline
+ *     - validation of API versioning on 'AggregateCommandRequest' request
+ *     - validation of time-series related stages
+ */
+void performValidationChecks(const OperationContext* opCtx,
+                             const AggregateCommandRequest& request,
+                             const LiteParsedPipeline& liteParsedPipeline) {
+    liteParsedPipeline.validate(opCtx);
+    aggregation_request_helper::validateRequestForAPIVersion(opCtx, request);
+}
+
 }  // namespace
 
 Status runAggregate(OperationContext* opCtx,
                     const NamespaceString& nss,
-                    const AggregateCommand& request,
+                    const AggregateCommandRequest& request,
                     const BSONObj& cmdObj,
                     const PrivilegeVector& privileges,
                     rpc::ReplyBuilderInterface* result) {
@@ -509,19 +549,14 @@ Status runAggregate(OperationContext* opCtx,
 
 Status runAggregate(OperationContext* opCtx,
                     const NamespaceString& origNss,
-                    const AggregateCommand& request,
+                    const AggregateCommandRequest& request,
                     const LiteParsedPipeline& liteParsedPipeline,
                     const BSONObj& cmdObj,
                     const PrivilegeVector& privileges,
                     rpc::ReplyBuilderInterface* result) {
-    // If 'apiStrict: true', validates that the pipeline does not contain stages which are not in
-    // this API version.
-    auto apiParameters = APIParameters::get(opCtx);
-    if (apiParameters.getAPIStrict().value_or(false)) {
-        auto apiVersion = apiParameters.getAPIVersion();
-        invariant(apiVersion);
-        liteParsedPipeline.validatePipelineStagesIfAPIStrict(*apiVersion);
-    }
+    // Perform some validations on the LiteParsedPipeline and request before continuing with the
+    // aggregation command.
+    performValidationChecks(opCtx, request, liteParsedPipeline);
 
     // For operations on views, this will be the underlying namespace.
     NamespaceString nss = request.getNamespace();
@@ -557,7 +592,7 @@ Status runAggregate(OperationContext* opCtx,
         // If this is a change stream, perform special checks and change the execution namespace.
         if (liteParsedPipeline.hasChangeStream()) {
             uassert(4928900,
-                    str::stream() << AggregateCommand::kCollectionUUIDFieldName
+                    str::stream() << AggregateCommandRequest::kCollectionUUIDFieldName
                                   << " is not supported for a change stream",
                     !request.getCollectionUUID());
 
@@ -571,10 +606,17 @@ Status runAggregate(OperationContext* opCtx,
             // a stream on an entire db or across the cluster.
             if (!origNss.isCollectionlessAggregateNS()) {
                 auto viewCatalog = DatabaseHolder::get(opCtx)->getViewCatalog(opCtx, origNss.db());
-                uassert(ErrorCodes::CommandNotSupportedOnView,
-                        str::stream()
-                            << "Namespace " << origNss.ns() << " is a view, not a collection",
-                        !viewCatalog || !viewCatalog->lookup(opCtx, origNss.ns()));
+                if (viewCatalog) {
+                    auto view = viewCatalog->lookup(opCtx, origNss.ns());
+                    uassert(ErrorCodes::CommandNotSupportedOnView,
+                            str::stream()
+                                << "Namespace " << origNss.ns() << " is a timeseries collection",
+                            !view || !view->timeseries());
+                    uassert(ErrorCodes::CommandNotSupportedOnView,
+                            str::stream()
+                                << "Namespace " << origNss.ns() << " is a view, not a collection",
+                            !view);
+                }
             }
 
             // If the user specified an explicit collation, adopt it; otherwise, use the simple
@@ -587,7 +629,7 @@ Status runAggregate(OperationContext* opCtx,
             ctx.emplace(opCtx, nss, AutoGetCollectionViewMode::kViewsForbidden);
         } else if (nss.isCollectionlessAggregateNS() && pipelineInvolvedNamespaces.empty()) {
             uassert(4928901,
-                    str::stream() << AggregateCommand::kCollectionUUIDFieldName
+                    str::stream() << AggregateCommandRequest::kCollectionUUIDFieldName
                                   << " is not supported for a collectionless aggregation",
                     !request.getCollectionUUID());
 
@@ -620,9 +662,13 @@ Status runAggregate(OperationContext* opCtx,
             invariant(nss != NamespaceString::kRsOplogNamespace);
             invariant(!nss.isCollectionlessAggregateNS());
             uassert(ErrorCodes::OptionNotSupportedOnView,
-                    str::stream() << AggregateCommand::kCollectionUUIDFieldName
+                    str::stream() << AggregateCommandRequest::kCollectionUUIDFieldName
                                   << " is not supported against a view",
                     !request.getCollectionUUID());
+
+            uassert(ErrorCodes::CommandNotSupportedOnView,
+                    "mapReduce on a view is not supported",
+                    !request.getIsMapReduceCommand());
 
             // Check that the default collation of 'view' is compatible with the operation's
             // collation. The check is skipped if the request did not specify a collation.
@@ -639,12 +685,32 @@ Status runAggregate(OperationContext* opCtx,
             auto resolvedView = uassertStatusOK(DatabaseHolder::get(opCtx)
                                                     ->getViewCatalog(opCtx, nss.db())
                                                     ->resolveView(opCtx, nss));
-            uassert(std::move(resolvedView),
-                    "On sharded systems, resolved views must be executed by mongos",
-                    !ShardingState::get(opCtx)->enabled());
 
             // With the view & collation resolved, we can relinquish locks.
             ctx.reset();
+
+            // Set this operation's shard version for the underlying collection to unsharded.
+            // This is prerequisite for future shard versioning checks.
+            OperationShardingState::get(opCtx).initializeClientRoutingVersions(
+                resolvedView.getNamespace(), ChunkVersion::UNSHARDED(), boost::none);
+
+            bool collectionIsSharded = [opCtx, &resolvedView]() {
+                AutoGetCollection autoColl(opCtx,
+                                           resolvedView.getNamespace(),
+                                           MODE_IS,
+                                           AutoGetCollectionViewMode::kViewsPermitted);
+                return CollectionShardingState::get(opCtx, resolvedView.getNamespace())
+                    ->getCollectionDescription(opCtx)
+                    .isSharded();
+            }();
+
+            uassert(std::move(resolvedView),
+                    "Resolved views on sharded collections must be executed by mongos",
+                    !collectionIsSharded);
+
+            uassert(std::move(resolvedView),
+                    "Explain of a resolved view must be executed by mongos",
+                    !ShardingState::get(opCtx)->enabled() || !request.getExplain());
 
             // Parse the resolved view into a new aggregation request.
             auto newRequest = resolvedView.asExpandedViewAggregation(request);
@@ -733,10 +799,12 @@ Status runAggregate(OperationContext* opCtx,
                 // There are separate ExpressionContexts for each exchange pipeline, so make sure to
                 // pass the pipeline's ExpressionContext to the plan executor factory.
                 auto pipelineExpCtx = pipelineIt->getContext();
-                execs.emplace_back(
-                    plan_executor_factory::make(std::move(pipelineExpCtx),
-                                                std::move(pipelineIt),
-                                                liteParsedPipeline.hasChangeStream()));
+
+                execs.emplace_back(plan_executor_factory::make(
+                    std::move(pipelineExpCtx),
+                    std::move(pipelineIt),
+                    aggregation_request_helper::getResumableScanType(
+                        request, liteParsedPipeline.hasChangeStream())));
             }
 
             // With the pipelines created, we can relinquish locks as they will manage the locks
@@ -845,7 +913,6 @@ Status runAggregate(OperationContext* opCtx,
         curOp->setNS_inlock(origNss.ns());
     }
 
-    // Any code that needs the cursor pinned must be inside the try block, above.
     return Status::OK();
 }
 

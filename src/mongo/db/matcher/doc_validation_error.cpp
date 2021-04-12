@@ -465,7 +465,8 @@ void finishLogicalOperatorChildError(const ListOfMatchExpression* expr,
         if (ctx->haveLatestCompleteError()) {
             if (operatorsWithOrderedClauses.find(tag) != operatorsWithOrderedClauses.end()) {
                 BSONObjBuilder subBuilder = ctx->getCurrentArrayBuilder().subobjStart();
-                subBuilder.appendNumber("index", ctx->getCurrentChildIndex());
+                subBuilder.appendNumber("index",
+                                        static_cast<long long>(ctx->getCurrentChildIndex()));
                 ctx->appendLatestCompleteError(&subBuilder);
                 subBuilder.done();
             } else {
@@ -806,6 +807,10 @@ public:
         generatePathError(*expr, kNormalReason, kInvertedReason);
     }
     void visit(const InternalExprEqMatchExpression* expr) final {}
+    void visit(const InternalExprGTMatchExpression* expr) final {}
+    void visit(const InternalExprGTEMatchExpression* expr) final {}
+    void visit(const InternalExprLTMatchExpression* expr) final {}
+    void visit(const InternalExprLTEMatchExpression* expr) final {}
     void visit(const InternalSchemaAllElemMatchFromIndexMatchExpression* expr) final {
         switch (toItemsKeywordType(*expr)) {
             case ItemsKeywordType::kItems: {
@@ -1653,7 +1658,10 @@ private:
             appendErrorDetails(*expr);
             appendErrorReason(normalReason, "");
             auto attributeValueAsArray = BSONArray(attributeValue.embeddedObject());
+            auto arrayLength = attributeValueAsArray.nFields();
             appendConsideredValue(attributeValueAsArray);
+            auto& objBuilder = _context->getCurrentObjBuilder();
+            objBuilder.append("numberOfItems", arrayLength);
         } else {
             _context->setCurrentRuntimeState(RuntimeState::kNoError);
         }
@@ -1794,6 +1802,10 @@ public:
     }
     void visit(const InMatchExpression* expr) final {}
     void visit(const InternalExprEqMatchExpression* expr) final {}
+    void visit(const InternalExprGTMatchExpression* expr) final {}
+    void visit(const InternalExprGTEMatchExpression* expr) final {}
+    void visit(const InternalExprLTMatchExpression* expr) final {}
+    void visit(const InternalExprLTEMatchExpression* expr) final {}
     void visit(const InternalSchemaAllElemMatchFromIndexMatchExpression* expr) final {}
     void visit(const InternalSchemaAllowedPropertiesMatchExpression* expr) final {
         if (_context->shouldGenerateError(*expr)) {
@@ -2002,6 +2014,10 @@ public:
         _context->finishCurrentError(expr);
     }
     void visit(const InternalExprEqMatchExpression* expr) final {}
+    void visit(const InternalExprGTMatchExpression* expr) final {}
+    void visit(const InternalExprGTEMatchExpression* expr) final {}
+    void visit(const InternalExprLTMatchExpression* expr) final {}
+    void visit(const InternalExprLTEMatchExpression* expr) final {}
     void visit(const InternalSchemaAllElemMatchFromIndexMatchExpression* expr) final {
         switch (toItemsKeywordType(*expr)) {
             case ItemsKeywordType::kItems:

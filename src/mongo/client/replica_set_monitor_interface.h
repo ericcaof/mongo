@@ -36,7 +36,7 @@
 
 #include "mongo/client/mongo_uri.h"
 #include "mongo/client/replica_set_change_notifier.h"
-#include "mongo/util/cancelation.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
@@ -69,12 +69,6 @@ public:
      * Returns a host matching the given read preference or an error, if no host matches.
      *
      * @param readPref Read preference to match against
-     * @param maxWait If no host is readily available that matches the specified read preference,
-     *   wait for one to become available for up to the specified time and periodically refresh
-     *   the view of the set. The call may return with an error earlier than the specified value,
-     *   if none of the known hosts for the set are reachable within some number of attempts.
-     *   Note that if a maxWait of 0ms is specified, this method may still attempt to contact
-     *   every host in the replica set up to one time.
      * @param excludedHosts List of hosts that are not eligible to be chosen.
      *
      * Known errors are:
@@ -82,20 +76,20 @@ public:
      */
     virtual SemiFuture<HostAndPort> getHostOrRefresh(const ReadPreferenceSetting& readPref,
                                                      const std::vector<HostAndPort>& excludedHosts,
-                                                     const CancelationToken& cancelToken) = 0;
+                                                     const CancellationToken& cancelToken) = 0;
 
     SemiFuture<HostAndPort> getHostOrRefresh(const ReadPreferenceSetting& readPref,
-                                             const CancelationToken& cancelToken) {
+                                             const CancellationToken& cancelToken) {
         return getHostOrRefresh(readPref, {} /* excludedHosts */, cancelToken);
     }
 
     virtual SemiFuture<std::vector<HostAndPort>> getHostsOrRefresh(
         const ReadPreferenceSetting& readPref,
         const std::vector<HostAndPort>& excludedHosts,
-        const CancelationToken& cancelToken) = 0;
+        const CancellationToken& cancelToken) = 0;
 
     SemiFuture<std::vector<HostAndPort>> getHostsOrRefresh(const ReadPreferenceSetting& readPref,
-                                                           const CancelationToken& cancelToken) {
+                                                           const CancellationToken& cancelToken) {
         return getHostsOrRefresh(readPref, {} /* excludedHosts */, cancelToken);
     }
 

@@ -239,7 +239,7 @@ void StreamableReplicaSetMonitor::init() {
               "StreamableReplicaSetMonitor::init() is invoked when there is no owner");
 
     _eventsPublisher = std::make_shared<sdam::TopologyEventsPublisher>(_executor);
-    _topologyManager = std::make_unique<TopologyManager>(
+    _topologyManager = std::make_unique<TopologyManagerImpl>(
         _sdamConfig, getGlobalServiceContext()->getPreciseClockSource(), _eventsPublisher);
 
     _eventsPublisher->registerListener(weak_from_this());
@@ -254,6 +254,18 @@ void StreamableReplicaSetMonitor::init() {
 
     _isDropped.store(false);
 
+    ReplicaSetMonitorManager::get()->getNotifier().onFoundSet(getName());
+}
+
+void StreamableReplicaSetMonitor::initForTesting(sdam::TopologyManagerPtr topologyManager) {
+    stdx::lock_guard lock(_mutex);
+
+    _eventsPublisher = std::make_shared<sdam::TopologyEventsPublisher>(_executor);
+    _topologyManager = std::move(topologyManager);
+
+    _eventsPublisher->registerListener(weak_from_this());
+
+    _isDropped.store(false);
     ReplicaSetMonitorManager::get()->getNotifier().onFoundSet(getName());
 }
 
@@ -273,8 +285,14 @@ void StreamableReplicaSetMonitor::drop() {
           "Closing Replica Set Monitor",
           "replicaSet"_attr = getName());
     _queryProcessor->shutdown();
-    _pingMonitor->shutdown();
-    _serverDiscoveryMonitor->shutdown();
+
+    if (_pingMonitor) {
+        _pingMonitor->shutdown();
+    }
+
+    if (_serverDiscoveryMonitor) {
+        _serverDiscoveryMonitor->shutdown();
+    }
 
     ReplicaSetMonitorManager::get()->getNotifier().onDroppedSet(getName());
     LOGV2(4333210,
@@ -286,7 +304,7 @@ void StreamableReplicaSetMonitor::drop() {
 SemiFuture<HostAndPort> StreamableReplicaSetMonitor::getHostOrRefresh(
     const ReadPreferenceSetting& criteria,
     const std::vector<HostAndPort>& excludedHosts,
-    const CancelationToken& cancelToken) {
+    const CancellationToken& cancelToken) {
     return getHostsOrRefresh(criteria, excludedHosts, cancelToken)
         .thenRunOn(_executor)
         .then([self = shared_from_this()](const std::vector<HostAndPort>& result) {
@@ -308,7 +326,7 @@ std::vector<HostAndPort> StreamableReplicaSetMonitor::_extractHosts(
 SemiFuture<std::vector<HostAndPort>> StreamableReplicaSetMonitor::getHostsOrRefresh(
     const ReadPreferenceSetting& criteria,
     const std::vector<HostAndPort>& excludedHosts,
-    const CancelationToken& cancelToken) {
+    const CancellationToken& cancelToken) {
     // In the fast case (stable topology), we avoid mutex acquisition.
     if (_isDropped.load()) {
         return makeReplicaSetMonitorRemovedError(getName());
@@ -324,7 +342,10 @@ SemiFuture<std::vector<HostAndPort>> StreamableReplicaSetMonitor::getHostsOrRefr
         return {*immediateResult};
     }
 
-    _serverDiscoveryMonitor->requestImmediateCheck();
+    if (_serverDiscoveryMonitor) {
+        _serverDiscoveryMonitor->requestImmediateCheck();
+    }
+
     LOGV2_DEBUG(4333212,
                 kLowerLogLevel,
                 "RSM {replicaSet} start async getHosts with {readPref}",
@@ -332,7 +353,7 @@ SemiFuture<std::vector<HostAndPort>> StreamableReplicaSetMonitor::getHostsOrRefr
                 "replicaSet"_attr = getName(),
                 "readPref"_attr = readPrefToStringFull(criteria));
 
-    // Fail fast on timeout or cancelation.
+    // Fail fast on timeout or cancellation.
     const Date_t& now = _executor->now();
     if (deadline <= now || cancelToken.isCanceled()) {
         return makeUnsatisfiedReadPrefError(getName(), criteria);
@@ -356,25 +377,27 @@ SemiFuture<std::vector<HostAndPort>> StreamableReplicaSetMonitor::getHostsOrRefr
             return {*immediateResult};
         }
 
-        return _enqueueOutstandingQuery(lk, criteria, cancelToken, deadline);
+        return _enqueueOutstandingQuery(lk, criteria, excludedHosts, cancelToken, deadline);
     });
 }
 
 SemiFuture<std::vector<HostAndPort>> StreamableReplicaSetMonitor::_enqueueOutstandingQuery(
     WithLock,
     const ReadPreferenceSetting& criteria,
-    const CancelationToken& cancelToken,
+    const std::vector<HostAndPort>& excludedHosts,
+    const CancellationToken& cancelToken,
     const Date_t& deadline) {
 
     auto query = std::make_shared<HostQuery>();
     query->criteria = criteria;
+    query->excludedHosts = excludedHosts;
 
     auto pf = makePromiseFuture<std::vector<HostAndPort>>();
     query->promise = std::move(pf.promise);
 
     // Make the deadline task cancelable for when the query is satisfied or when the input
     // cancelToken is canceled.
-    query->deadlineCancelSource = CancelationSource(cancelToken);
+    query->deadlineCancelSource = CancellationSource(cancelToken);
     query->start = _executor->now();
 
     // Add the query to the list of outstanding queries.
@@ -384,11 +407,11 @@ SemiFuture<std::vector<HostAndPort>> StreamableReplicaSetMonitor::_enqueueOutsta
     // It will be removed as a listener when all waiting queries have been satisfied.
     _eventsPublisher->registerListener(_queryProcessor);
 
-    // After a deadline or when the input cancelation token is canceled, cancel this query. If the
+    // After a deadline or when the input cancellation token is canceled, cancel this query. If the
     // query completes first, the deadlineCancelSource will be used to cancel this task.
     _executor->sleepUntil(deadline, query->deadlineCancelSource.token())
         .getAsync([this, query, queryIter, self = shared_from_this(), cancelToken](Status status) {
-            // If the deadline was reached or cancelation occurred on the input cancelation token,
+            // If the deadline was reached or cancellation occurred on the input cancellation token,
             // mark the query as canceled. Otherwise, the deadlineCancelSource must have been
             // canceled due to the query completing successfully.
             if (status.isOK() || cancelToken.isCanceled()) {
@@ -433,7 +456,7 @@ boost::optional<std::vector<HostAndPort>> StreamableReplicaSetMonitor::_getHosts
 
 HostAndPort StreamableReplicaSetMonitor::getPrimaryOrUassert() {
     return ReplicaSetMonitorInterface::getHostOrRefresh(kPrimaryOnlyReadPreference,
-                                                        CancelationToken::uncancelable())
+                                                        CancellationToken::uncancelable())
         .get();
 }
 
@@ -481,7 +504,7 @@ void StreamableReplicaSetMonitor::_doErrorActions(
         if (errorActions.dropConnections)
             _connectionManager->dropConnections(host);
 
-        if (errorActions.requestImmediateCheck)
+        if (errorActions.requestImmediateCheck && _serverDiscoveryMonitor)
             _serverDiscoveryMonitor->requestImmediateCheck();
     }
 
@@ -776,14 +799,14 @@ void StreamableReplicaSetMonitor::_processOutstanding(
 
     // Iterate through the outstanding queries and try to resolve them via calls to _getHosts. If we
     // succeed in resolving a query, the query is removed from the list. If a query has already been
-    // canceled, or there are no results, it will be skipped. Cancelation logic elsewhere will
+    // canceled, or there are no results, it will be skipped. Cancellation logic elsewhere will
     // handle removing the canceled queries from the list.
     while (it != _outstandingQueries.end()) {
         auto& query = *it;
 
         // If query has not been canceled yet, try to satisfy it.
         if (!query->hasBeenResolved()) {
-            auto result = _getHosts(topologyDescription, query->criteria);
+            auto result = _getHosts(topologyDescription, query->criteria, query->excludedHosts);
             if (result) {
                 if (query->tryResolveWithSuccess(std::move(*result))) {
                     const auto latency = _executor->now() - query->start;
@@ -812,7 +835,7 @@ void StreamableReplicaSetMonitor::_processOutstanding(
     }
 
     // If there remain unresolved queries, enable expedited mode.
-    if (hadUnresolvedQuery) {
+    if (hadUnresolvedQuery && _serverDiscoveryMonitor) {
         _serverDiscoveryMonitor->requestImmediateCheck();
     }
 }

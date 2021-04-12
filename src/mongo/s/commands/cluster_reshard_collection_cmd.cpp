@@ -34,8 +34,13 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/logv2/log.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/reshard_collection_gen.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/s/resharding/resharding_feature_flag_gen.h"
 
 namespace mongo {
 namespace {
@@ -49,26 +54,30 @@ public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            const NamespaceString& nss = ns();
-            ConfigsvrReshardCollection configsvrReshardCollection(nss, request().getKey());
-            configsvrReshardCollection.setDbName(request().getDbName());
-            configsvrReshardCollection.setUnique(request().getUnique());
-            configsvrReshardCollection.setCollation(request().getCollation());
-            configsvrReshardCollection.set_presetReshardedChunks(
+            const auto& nss = ns();
+            ShardsvrReshardCollection shardsvrReshardCollection(nss, request().getKey());
+            shardsvrReshardCollection.setDbName(request().getDbName());
+            shardsvrReshardCollection.setUnique(request().getUnique());
+            shardsvrReshardCollection.setCollation(request().getCollation());
+            shardsvrReshardCollection.set_presetReshardedChunks(
                 request().get_presetReshardedChunks());
-            configsvrReshardCollection.setZones(request().getZones());
-            configsvrReshardCollection.setNumInitialChunks(request().getNumInitialChunks());
+            shardsvrReshardCollection.setZones(request().getZones());
+            shardsvrReshardCollection.setNumInitialChunks(request().getNumInitialChunks());
 
-            auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-            auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
+            auto catalogCache = Grid::get(opCtx)->catalogCache();
+            const auto dbInfo = uassertStatusOK(catalogCache->getDatabase(opCtx, nss.db()));
+
+            auto cmdResponse = executeCommandAgainstDatabasePrimary(
                 opCtx,
-                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
                 "admin",
-                CommandHelpers::appendMajorityWriteConcern(configsvrReshardCollection.toBSON({}),
+                dbInfo,
+                CommandHelpers::appendMajorityWriteConcern(shardsvrReshardCollection.toBSON({}),
                                                            opCtx->getWriteConcern()),
-                Shard::RetryPolicy::kIdempotent));
-            uassertStatusOK(cmdResponse.commandStatus);
-            uassertStatusOK(cmdResponse.writeConcernStatus);
+                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                Shard::RetryPolicy::kIdempotent);
+
+            const auto remoteResponse = uassertStatusOK(cmdResponse.swResponse);
+            uassertStatusOK(getStatusFromCommandResult(remoteResponse.data));
         }
 
     private:
@@ -102,7 +111,7 @@ public:
     }
 };
 
-MONGO_REGISTER_TEST_COMMAND(ReshardCollectionCmd);
+MONGO_REGISTER_FEATURE_FLAGGED_COMMAND(ReshardCollectionCmd, resharding::gFeatureFlagResharding);
 
 }  // namespace
 }  // namespace mongo

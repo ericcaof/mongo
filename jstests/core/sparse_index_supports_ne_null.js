@@ -7,7 +7,6 @@
  * but another's is still not multikey, they may need to use different plans for certain queries).
  * @tags: [
  *   assumes_unsharded_collection,
- *   sbe_incompatible,
  * ]
  */
 (function() {
@@ -19,7 +18,7 @@ coll.drop();
 
 function checkQuery({query, shouldUseIndex, nResultsExpected, indexKeyPattern}) {
     const explain = assert.commandWorked(coll.find(query).explain());
-    const ixScans = getPlanStages(explain.queryPlanner.winningPlan, "IXSCAN");
+    const ixScans = getPlanStages(getWinningPlan(explain.queryPlanner), "IXSCAN");
 
     if (shouldUseIndex) {
         assert.gte(ixScans.length, 1, explain);

@@ -1,5 +1,7 @@
 'use strict';
 
+load("jstests/sharding/libs/find_chunks_util.js");
+
 var CheckOrphansAreDeletedHelpers = (function() {
     function runCheck(mongosConn, shardConn, shardId) {
         const configDB = shardConn.getDB('config');
@@ -24,7 +26,8 @@ var CheckOrphansAreDeletedHelpers = (function() {
             5 * 60 * 1000,
             1000);
 
-        mongosConn.getDB('config').collections.find({dropped: false}).forEach(collDoc => {
+        // TODO SERVER-51881: Remove the checking for 'dropped: {$ne: true}' after 5.0 is released
+        mongosConn.getDB('config').collections.find({dropped: {$ne: true}}).forEach(collDoc => {
             const ns = collDoc._id;
             const tempNsArray = ns.split('.');
             const dbName = tempNsArray.shift();
@@ -66,8 +69,7 @@ var CheckOrphansAreDeletedHelpers = (function() {
                 });
 
             const coll = shardConn.getDB(dbName)[collName];
-            mongosConn.getDB('config')
-                .chunks.find({ns: ns, shard: {$ne: shardId}})
+            findChunksUtil.findChunksByNs(mongosConn.getDB('config'), ns, {shard: {$ne: shardId}})
                 .forEach(chunkDoc => {
                     // Use $min/$max so this will also work with hashed and compound shard keys.
                     const orphans = coll.find({})

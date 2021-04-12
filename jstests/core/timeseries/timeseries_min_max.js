@@ -3,13 +3,11 @@
  * maximum values inserted into the bucket.
  *
  * @tags: [
- *     assumes_unsharded_collection,         # TODO(SERVER-53816): remove
- *     does_not_support_causal_consistency,  # TODO(SERVER-53819): remove
+ *     assumes_no_implicit_collection_creation_after_drop,
  *     does_not_support_stepdowns,
  *     requires_fcv_49,
  *     requires_find_command,
  *     requires_getmore,
- *     sbe_incompatible,
  * ]
  */
 (function() {
@@ -22,28 +20,31 @@ if (!TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo())) {
     return;
 }
 
-const testDB = db.getSiblingDB(jsTestName());
-assert.commandWorked(testDB.dropDatabase());
-
-const coll = testDB.getCollection('t');
-const bucketsColl = testDB.getCollection('system.buckets.' + coll.getName());
+const collNamePrefix = 'timeseries_min_max_';
 
 const timeFieldName = 'time';
 const metaFieldName = 'meta';
 
+let collCount = 0;
+let coll;
+let bucketsColl;
+
 const clearColl = function() {
+    coll = db.getCollection(collNamePrefix + collCount++);
+    bucketsColl = db.getCollection('system.buckets.' + coll.getName());
+
     coll.drop();
 
     const timeFieldName = 'time';
-    assert.commandWorked(testDB.createCollection(
+    assert.commandWorked(db.createCollection(
         coll.getName(), {timeseries: {timeField: timeFieldName, metaField: metaFieldName}}));
-    assert.contains(bucketsColl.getName(), testDB.getCollectionNames());
+    assert.contains(bucketsColl.getName(), db.getCollectionNames());
 };
 clearColl();
 
 const insert = function(doc, expectedMin, expectedMax) {
     doc[timeFieldName] = ISODate();
-    assert.commandWorked(coll.insert(doc));
+    assert.commandWorked(coll.insert(doc, {ordered: false}));
 
     const bucketDocs = bucketsColl
                            .find({}, {

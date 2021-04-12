@@ -7,7 +7,10 @@
  * to request more documents from the collection. If the pipeline is wrapped in a $facet stage, all
  * results will be computed in the initial request and buffered in the results array, preventing the
  * pipeline from requesting more documents.
- * @tags: [do_not_wrap_aggregations_in_facets, requires_capped]
+ * @tags: [
+ *   do_not_wrap_aggregations_in_facets,
+ *   requires_capped,
+ * ]
  */
 (function() {
 'use strict';
@@ -92,7 +95,7 @@ sourceCollection.drop();
 let getMoreCollName = res.cursor.ns.substr(res.cursor.ns.indexOf('.') + 1);
 assert.commandFailedWithCode(
     testDB.runCommand({getMore: res.cursor.id, collection: getMoreCollName}),
-    ErrorCodes.QueryPlanKilled,
+    [ErrorCodes.QueryPlanKilled, ErrorCodes.NamespaceNotFound],
     'expected getMore to fail because the source collection was dropped');
 
 // Make sure the cursors were cleaned up.
@@ -182,7 +185,7 @@ foreignCollection.drop();
 getMoreCollName = res.cursor.ns.substr(res.cursor.ns.indexOf('.') + 1);
 assert.commandFailedWithCode(
     testDB.runCommand({getMore: res.cursor.id, collection: getMoreCollName}),
-    ErrorCodes.QueryPlanKilled,
+    [ErrorCodes.QueryPlanKilled, ErrorCodes.NamespaceNotFound],
     'expected getMore to fail because the foreign collection was dropped');
 
 // Make sure the cursors were cleaned up.
@@ -261,7 +264,7 @@ getMoreCollName = res.cursor.ns.substr(res.cursor.ns.indexOf('.') + 1);
 
 assert.commandFailedWithCode(
     testDB.runCommand({getMore: res.cursor.id, collection: getMoreCollName}),
-    ErrorCodes.QueryPlanKilled,
+    [ErrorCodes.QueryPlanKilled, ErrorCodes.NamespaceNotFound],
     'expected getMore to fail because the database was dropped');
 
 assertNoOpenCursorsOnSourceCollection();

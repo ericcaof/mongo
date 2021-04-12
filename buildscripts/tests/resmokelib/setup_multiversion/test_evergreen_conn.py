@@ -2,9 +2,9 @@
 # pylint: disable=missing-docstring,too-many-arguments
 import unittest
 
-from evergreen import RetryingEvergreenApi
 from mock import patch
 from requests import HTTPError
+from evergreen import RetryingEvergreenApi
 
 from buildscripts.resmokelib.setup_multiversion import evergreen_conn
 from buildscripts.resmokelib.setup_multiversion.config import SetupMultiversionConfig
@@ -149,9 +149,14 @@ class TestGetCompileArtifactUrls(unittest.TestCase):
     @patch("evergreen.api.EvergreenApi")
     def test_urls_found(self, mock_evg_api, mock_version, mock_build, mock_compile_task,
                         mock_push_task, mock_artifact):
+
+        mock_compile_task.project_id = "dummy project id"
+
         expected_urls = {
             "Binaries":
-                "https://mciuploads.s3.amazonaws.com/mongodb-mongo-master/ubuntu1804/90f767adbb1901d007ee4dd8714f53402d893669/binaries/mongo-mongodb_mongo_master_ubuntu1804_90f767adbb1901d007ee4dd8714f53402d893669_20_11_30_03_14_30.tgz"
+                "https://mciuploads.s3.amazonaws.com/mongodb-mongo-master/ubuntu1804/90f767adbb1901d007ee4dd8714f53402d893669/binaries/mongo-mongodb_mongo_master_ubuntu1804_90f767adbb1901d007ee4dd8714f53402d893669_20_11_30_03_14_30.tgz",
+            "project_id":
+                "dummy project id"
         }
         mock_evg_api.build_by_id.return_value = mock_build
         mock_artifact.name = "Binaries"

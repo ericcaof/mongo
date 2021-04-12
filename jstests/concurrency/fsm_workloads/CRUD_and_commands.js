@@ -3,6 +3,8 @@
 /**
  * Perform CRUD operations, some of which may implicitly create collections, in parallel with
  * collection-dropping operations.
+ *
+ * @tags: [requires_fcv_49]
  */
 var $config = (function() {
     const data = {numIds: 10};
@@ -122,12 +124,14 @@ var $config = (function() {
                             throw e;
                         }
                     } else {
-                        // dropIndex can cause queries to throw if these queries yield.
+                        // dropIndex or collection drops can cause queries to throw if these queries
+                        // yield.
                         assertAlways.contains(
                             e.code,
                             [
-                                ErrorCodes.QueryPlanKilled,
+                                ErrorCodes.NamespaceNotFound,
                                 ErrorCodes.OperationFailed,
+                                ErrorCodes.QueryPlanKilled,
                             ],
                             'unexpected error code: ' + e.code + ': ' + e.message);
                     }

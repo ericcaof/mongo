@@ -6,7 +6,7 @@
  * Tenant migrations are not expected to be run on servers with ephemeralForTest.
  *
  * @tags: [requires_fcv_49, requires_majority_read_concern, requires_persistence,
- * incompatible_with_eft]
+ * incompatible_with_eft, incompatible_with_windows_tls]
  */
 
 (function() {
@@ -44,16 +44,35 @@ const migrationOpts = {
 
 const recipientPrimary = tenantMigrationTest.getRecipientPrimary();
 
+// Initial inserts to test cloner stats.
+const dbsToClone = ["db0", "db1", "db2"];
+const collsToClone = ["coll0", "coll1"];
+const docs = [...Array(10).keys()].map((i) => ({x: i}));
+for (const db of dbsToClone) {
+    const tenantDB = tenantMigrationTest.tenantDB(kTenantId, db);
+    for (const coll of collsToClone) {
+        tenantMigrationTest.insertDonorDB(tenantDB, coll, docs);
+    }
+}
+
 // Makes sure the fields that are always expected to exist, such as the donorConnectionString, are
 // correct.
 function checkStandardFieldsOK(res) {
-    assert.eq(res.inprog.length, 1, tojson(res));
-    assert.eq(bsonWoCompare(res.inprog[0].instanceID.uuid, kMigrationId), 0, tojson(res));
-    assert.eq(bsonWoCompare(res.inprog[0].tenantId, kTenantId), 0, tojson(res));
-    assert.eq(res.inprog[0].donorConnectionString,
-              tenantMigrationTest.getDonorRst().getURL(),
-              tojson(res));
-    assert.eq(bsonWoCompare(res.inprog[0].readPreference, kReadPreference), 0, tojson(res));
+    assert.eq(res.inprog.length, 1, res);
+    assert.eq(bsonWoCompare(res.inprog[0].instanceID, kMigrationId), 0, res);
+    assert.eq(bsonWoCompare(res.inprog[0].tenantId, kTenantId), 0, res);
+    assert.eq(res.inprog[0].donorConnectionString, tenantMigrationTest.getDonorRst().getURL(), res);
+    assert.eq(bsonWoCompare(res.inprog[0].readPreference, kReadPreference), 0, res);
+    // We don't test failovers in this test so we don't expect these counters to be incremented.
+    assert.eq(res.inprog[0].numRestartsDueToDonorConnectionFailure, 0, res);
+    assert.eq(res.inprog[0].numRestartsDueToRecipientFailure, 0, res);
+}
+
+// Validates the fields of an optime object.
+function checkOptime(optime) {
+    assert(optime.ts instanceof Timestamp);
+    assert(optime.t instanceof NumberLong);
+    return true;
 }
 
 // Set all failPoints up on the recipient's end to block the migration at certain points. The
@@ -85,14 +104,19 @@ fpAfterPersistingStateDoc.wait();
 let res = recipientPrimary.adminCommand({currentOp: true, desc: "tenant recipient migration"});
 checkStandardFieldsOK(res);
 let currOp = res.inprog[0];
-assert.eq(currOp.state, migrationStates.kStarted, tojson(res));
-assert.eq(currOp.migrationCompleted, false, tojson(res));
-assert.eq(currOp.dataSyncCompleted, false, tojson(res));
-assert(!currOp.startFetchingDonorOpTime, tojson(res));
-assert(!currOp.startApplyingDonorOpTime, tojson(res));
-assert(!currOp.dataConsistentStopDonorOpTime, tojson(res));
-assert(!currOp.cloneFinishedRecipientOpTime, tojson(res));
-assert(!currOp.expireAt, tojson(res));
+assert.eq(currOp.state, migrationStates.kStarted, res);
+assert.eq(currOp.migrationCompleted, false, res);
+assert.eq(currOp.dataSyncCompleted, false, res);
+assert(!currOp.hasOwnProperty("startFetchingDonorOpTime"), res);
+assert(!currOp.hasOwnProperty("startApplyingDonorOpTime"), res);
+assert(!currOp.hasOwnProperty("dataConsistentStopDonorOpTime"), res);
+assert(!currOp.hasOwnProperty("cloneFinishedRecipientOpTime"), res);
+assert(!currOp.hasOwnProperty("expireAt"), res);
+assert(!currOp.hasOwnProperty("donorSyncSource"), res);
+assert(!currOp.hasOwnProperty("approxTotalDataSize"), res);
+assert(!currOp.hasOwnProperty("approxTotalBytesCopied"), res);
+assert(!currOp.hasOwnProperty("totalReceiveElapsedMillis"), res);
+assert(!currOp.hasOwnProperty("remainingReceiveEstimatedMillis"), res);
 fpAfterPersistingStateDoc.off();
 
 // Allow the migration to move to the point where the startFetchingDonorOpTime has been obtained.
@@ -102,15 +126,25 @@ fpAfterRetrievingStartOpTime.wait();
 res = recipientPrimary.adminCommand({currentOp: true, desc: "tenant recipient migration"});
 checkStandardFieldsOK(res);
 currOp = res.inprog[0];
-assert.eq(currOp.state, migrationStates.kStarted, tojson(res));
-assert.eq(currOp.migrationCompleted, false, tojson(res));
-assert.eq(currOp.dataSyncCompleted, false, tojson(res));
-assert(!currOp.dataConsistentStopDonorOpTime, tojson(res));
-assert(!currOp.cloneFinishedRecipientOpTime, tojson(res));
-assert(!currOp.expireAt, tojson(res));
+assert.gt(new Date(), currOp.receiveStart, tojson(res));
+assert.eq(currOp.state, migrationStates.kStarted, res);
+assert.eq(currOp.migrationCompleted, false, res);
+assert.eq(currOp.dataSyncCompleted, false, res);
+assert(!currOp.hasOwnProperty("dataConsistentStopDonorOpTime"), res);
+assert(!currOp.hasOwnProperty("cloneFinishedRecipientOpTime"), res);
+assert(!currOp.hasOwnProperty("expireAt"), res);
+assert(!currOp.hasOwnProperty("approxTotalDataSize"), res);
+assert(!currOp.hasOwnProperty("approxTotalBytesCopied"), res);
+assert(!currOp.hasOwnProperty("totalReceiveElapsedMillis"), res);
+assert(!currOp.hasOwnProperty("remainingReceiveEstimatedMillis"), res);
 // Must exist now.
-assert(currOp.startFetchingDonorOpTime, tojson(res));
-assert(currOp.startApplyingDonorOpTime, tojson(res));
+assert(currOp.hasOwnProperty("startFetchingDonorOpTime") &&
+           checkOptime(currOp.startFetchingDonorOpTime),
+       res);
+assert(currOp.hasOwnProperty("startApplyingDonorOpTime") &&
+           checkOptime(currOp.startApplyingDonorOpTime),
+       res);
+assert(currOp.hasOwnProperty("donorSyncSource") && typeof currOp.donorSyncSource === 'string', res);
 fpAfterRetrievingStartOpTime.off();
 
 // Wait until collection cloning is done, and cloneFinishedRecipientOpTime
@@ -121,15 +155,36 @@ fpAfterCollectionCloner.wait();
 res = recipientPrimary.adminCommand({currentOp: true, desc: "tenant recipient migration"});
 checkStandardFieldsOK(res);
 currOp = res.inprog[0];
-assert.eq(currOp.state, migrationStates.kStarted, tojson(res));
-assert.eq(currOp.migrationCompleted, false, tojson(res));
-assert.eq(currOp.dataSyncCompleted, false, tojson(res));
-assert(!currOp.expireAt, tojson(res));
+assert.eq(currOp.state, migrationStates.kStarted, res);
+assert.eq(currOp.migrationCompleted, false, res);
+assert.eq(currOp.dataSyncCompleted, false, res);
+assert(!currOp.hasOwnProperty("expireAt"), res);
 // Must exist now.
-assert(currOp.startFetchingDonorOpTime, tojson(res));
-assert(currOp.startApplyingDonorOpTime, tojson(res));
-assert(currOp.dataConsistentStopDonorOpTime, tojson(res));
-assert(currOp.cloneFinishedRecipientOpTime, tojson(res));
+assert(currOp.hasOwnProperty("startFetchingDonorOpTime") &&
+           checkOptime(currOp.startFetchingDonorOpTime),
+       res);
+assert(currOp.hasOwnProperty("startApplyingDonorOpTime") &&
+           checkOptime(currOp.startApplyingDonorOpTime),
+       res);
+assert(currOp.hasOwnProperty("donorSyncSource") && typeof currOp.donorSyncSource === 'string', res);
+assert(currOp.hasOwnProperty("dataConsistentStopDonorOpTime") &&
+           checkOptime(currOp.dataConsistentStopDonorOpTime),
+       res);
+assert(currOp.hasOwnProperty("cloneFinishedRecipientOpTime") &&
+           checkOptime(currOp.cloneFinishedRecipientOpTime),
+       res);
+assert(currOp.hasOwnProperty("approxTotalDataSize") &&
+           currOp.approxTotalDataSize instanceof NumberLong,
+       res);
+assert(currOp.hasOwnProperty("approxTotalBytesCopied") &&
+           currOp.approxTotalBytesCopied instanceof NumberLong,
+       res);
+assert(currOp.hasOwnProperty("totalReceiveElapsedMillis") &&
+           currOp.totalReceiveElapsedMillis instanceof NumberLong,
+       res);
+assert(currOp.hasOwnProperty("remainingReceiveEstimatedMillis") &&
+           currOp.remainingReceiveEstimatedMillis instanceof NumberLong,
+       res);
 fpAfterCollectionCloner.off();
 
 // Wait for the "kConsistent" state to be reached.
@@ -140,14 +195,36 @@ res = recipientPrimary.adminCommand({currentOp: true, desc: "tenant recipient mi
 checkStandardFieldsOK(res);
 currOp = res.inprog[0];
 // State should have changed.
-assert.eq(currOp.state, migrationStates.kConsistent, tojson(res));
-assert.eq(currOp.migrationCompleted, false, tojson(res));
-assert.eq(currOp.dataSyncCompleted, false, tojson(res));
-assert(currOp.startFetchingDonorOpTime, tojson(res));
-assert(currOp.startApplyingDonorOpTime, tojson(res));
-assert(currOp.dataConsistentStopDonorOpTime, tojson(res));
-assert(currOp.cloneFinishedRecipientOpTime, tojson(res));
-assert(!currOp.expireAt, tojson(res));
+assert.eq(currOp.state, migrationStates.kConsistent, res);
+assert.eq(currOp.migrationCompleted, false, res);
+assert.eq(currOp.dataSyncCompleted, false, res);
+assert(currOp.hasOwnProperty("startFetchingDonorOpTime") &&
+           checkOptime(currOp.startFetchingDonorOpTime),
+       res);
+assert(currOp.hasOwnProperty("startApplyingDonorOpTime") &&
+           checkOptime(currOp.startApplyingDonorOpTime),
+       res);
+assert(currOp.hasOwnProperty("dataConsistentStopDonorOpTime") &&
+           checkOptime(currOp.dataConsistentStopDonorOpTime),
+       res);
+assert(currOp.hasOwnProperty("cloneFinishedRecipientOpTime") &&
+           checkOptime(currOp.cloneFinishedRecipientOpTime),
+       res);
+assert(currOp.hasOwnProperty("approxTotalDataSize") &&
+           currOp.approxTotalDataSize instanceof NumberLong,
+       res);
+assert(currOp.hasOwnProperty("approxTotalBytesCopied") &&
+           currOp.approxTotalBytesCopied instanceof NumberLong,
+       res);
+assert(currOp.hasOwnProperty("totalReceiveElapsedMillis") &&
+           currOp.totalReceiveElapsedMillis instanceof NumberLong,
+       res);
+assert(currOp.hasOwnProperty("remainingReceiveEstimatedMillis") &&
+           currOp.remainingReceiveEstimatedMillis instanceof NumberLong,
+       res);
+assert(!currOp.hasOwnProperty("expireAt"), res);
+// The oplog applier should have applied at least the noop resume token.
+assert.gte(currOp.numOpsApplied, 1, tojson(res));
 fpAfterDataConsistent.off();
 
 jsTestLog("Waiting for migration to complete.");
@@ -167,15 +244,35 @@ fpAfterForgetMigration.wait();
 res = recipientPrimary.adminCommand({currentOp: true, desc: "tenant recipient migration"});
 checkStandardFieldsOK(res);
 currOp = res.inprog[0];
-assert.eq(currOp.state, migrationStates.kConsistent, tojson(res));
-assert.eq(currOp.migrationCompleted, false, tojson(res));
+assert.eq(currOp.state, migrationStates.kConsistent, res);
+assert.eq(currOp.migrationCompleted, false, res);
 // dataSyncCompleted should have changed.
-assert.eq(currOp.dataSyncCompleted, true, tojson(res));
-assert(currOp.startFetchingDonorOpTime, tojson(res));
-assert(currOp.startApplyingDonorOpTime, tojson(res));
-assert(currOp.dataConsistentStopDonorOpTime, tojson(res));
-assert(currOp.cloneFinishedRecipientOpTime, tojson(res));
-assert(!currOp.expireAt, tojson(res));
+assert.eq(currOp.dataSyncCompleted, true, res);
+assert(currOp.hasOwnProperty("startFetchingDonorOpTime") &&
+           checkOptime(currOp.startFetchingDonorOpTime),
+       res);
+assert(currOp.hasOwnProperty("startApplyingDonorOpTime") &&
+           checkOptime(currOp.startApplyingDonorOpTime),
+       res);
+assert(currOp.hasOwnProperty("dataConsistentStopDonorOpTime") &&
+           checkOptime(currOp.dataConsistentStopDonorOpTime),
+       res);
+assert(currOp.hasOwnProperty("cloneFinishedRecipientOpTime") &&
+           checkOptime(currOp.cloneFinishedRecipientOpTime),
+       res);
+assert(currOp.hasOwnProperty("approxTotalDataSize") &&
+           currOp.approxTotalDataSize instanceof NumberLong,
+       res);
+assert(currOp.hasOwnProperty("approxTotalBytesCopied") &&
+           currOp.approxTotalBytesCopied instanceof NumberLong,
+       res);
+assert(currOp.hasOwnProperty("totalReceiveElapsedMillis") &&
+           currOp.totalReceiveElapsedMillis instanceof NumberLong,
+       res);
+assert(currOp.hasOwnProperty("remainingReceiveEstimatedMillis") &&
+           currOp.remainingReceiveEstimatedMillis instanceof NumberLong,
+       res);
+assert(!currOp.hasOwnProperty("expireAt"), res);
 
 jsTestLog("Allow the forgetMigration to complete.");
 fpAfterForgetMigration.off();
@@ -184,15 +281,61 @@ assert.commandWorked(forgetMigrationThread.returnData());
 res = recipientPrimary.adminCommand({currentOp: true, desc: "tenant recipient migration"});
 checkStandardFieldsOK(res);
 currOp = res.inprog[0];
-assert.eq(currOp.dataSyncCompleted, true, tojson(res));
-assert(currOp.startFetchingDonorOpTime, tojson(res));
-assert(currOp.startApplyingDonorOpTime, tojson(res));
-assert(currOp.dataConsistentStopDonorOpTime, tojson(res));
-assert(currOp.cloneFinishedRecipientOpTime, tojson(res));
+assert.eq(currOp.dataSyncCompleted, true, res);
+assert(currOp.hasOwnProperty("startFetchingDonorOpTime") &&
+           checkOptime(currOp.startFetchingDonorOpTime),
+       res);
+assert(currOp.hasOwnProperty("startApplyingDonorOpTime") &&
+           checkOptime(currOp.startApplyingDonorOpTime),
+       res);
+assert(currOp.hasOwnProperty("dataConsistentStopDonorOpTime") &&
+           checkOptime(currOp.dataConsistentStopDonorOpTime),
+       res);
+assert(currOp.hasOwnProperty("cloneFinishedRecipientOpTime") &&
+           checkOptime(currOp.cloneFinishedRecipientOpTime),
+       res);
+assert(currOp.hasOwnProperty("approxTotalDataSize") &&
+           currOp.approxTotalDataSize instanceof NumberLong,
+       res);
+assert(currOp.hasOwnProperty("approxTotalBytesCopied") &&
+           currOp.approxTotalBytesCopied instanceof NumberLong,
+       res);
+assert(currOp.hasOwnProperty("totalReceiveElapsedMillis") &&
+           currOp.totalReceiveElapsedMillis instanceof NumberLong,
+       res);
+assert(currOp.hasOwnProperty("remainingReceiveEstimatedMillis") &&
+           currOp.remainingReceiveEstimatedMillis instanceof NumberLong,
+       res);
 // State, completion status and expireAt should have changed.
-assert.eq(currOp.state, migrationStates.kDone, tojson(res));
-assert.eq(currOp.migrationCompleted, true, tojson(res));
-assert(currOp.expireAt, tojson(res));
+assert.eq(currOp.state, migrationStates.kDone, res);
+assert.eq(currOp.migrationCompleted, true, res);
+assert(currOp.hasOwnProperty("expireAt") && currOp.expireAt instanceof Date, res);
+assert(currOp.hasOwnProperty("databases"));
+assert.eq(0, currOp.databases.databasesClonedBeforeFailover, tojson(res));
+assert.eq(dbsToClone.length, currOp.databases.databasesToClone, tojson(res));
+assert.eq(dbsToClone.length, currOp.databases.databasesCloned, tojson(res));
+for (const db of dbsToClone) {
+    const tenantDB = tenantMigrationTest.tenantDB(kTenantId, db);
+    assert(currOp.databases.hasOwnProperty(tenantDB), tojson(res));
+    const dbStats = currOp.databases[tenantDB];
+    assert.eq(0, dbStats.clonedCollectionsBeforeFailover, tojson(res));
+    assert.eq(collsToClone.length, dbStats.collections, tojson(res));
+    assert.eq(collsToClone.length, dbStats.clonedCollections, tojson(res));
+    assert(dbStats.hasOwnProperty("start"), tojson(res));
+    assert(dbStats.hasOwnProperty("end"), tojson(res));
+    assert.neq(0, dbStats.elapsedMillis, tojson(res));
+    for (const coll of collsToClone) {
+        assert(dbStats.hasOwnProperty(`${tenantDB}.${coll}`), tojson(res));
+        const collStats = dbStats[`${tenantDB}.${coll}`];
+        assert.eq(docs.length, collStats.documentsToCopy, tojson(res));
+        assert.eq(docs.length, collStats.documentsCopied, tojson(res));
+        assert.eq(1, collStats.indexes, tojson(res));
+        assert.eq(collStats.insertedBatches, collStats.receivedBatches, tojson(res));
+        assert(collStats.hasOwnProperty("start"), tojson(res));
+        assert(collStats.hasOwnProperty("end"), tojson(res));
+        assert.neq(0, collStats.elapsedMillis, tojson(res));
+    }
+}
 
 tenantMigrationTest.stop();
 })();

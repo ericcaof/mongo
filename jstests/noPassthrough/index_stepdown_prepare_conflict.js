@@ -1,4 +1,4 @@
-/*
+/**
  * Tests that we don't hit 3 way deadlock between an index builder, prepared transaction, and step
  * down.
  *
@@ -12,8 +12,8 @@
  *    block stepDown.
  *
  * @tags: [
- *     uses_transactions,
- *     uses_prepare_transaction,
+ *   uses_prepare_transaction,
+ *   uses_transactions,
  * ]
  */
 load('jstests/noPassthrough/libs/index_build.js');

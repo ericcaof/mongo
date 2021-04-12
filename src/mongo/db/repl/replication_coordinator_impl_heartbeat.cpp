@@ -57,6 +57,7 @@
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/vote_requester.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/session_catalog.h"
 #include "mongo/db/storage/control/journal_flusher.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/mutex.h"
@@ -279,14 +280,17 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
 
     if (action.getAction() == HeartbeatResponseAction::NoAction && hbStatusResponse.isOK() &&
         hbStatusResponse.getValue().hasState() &&
-        hbStatusResponse.getValue().getState() != MemberState::RS_PRIMARY &&
-        action.getAdvancedOpTimeOrUpdatedConfig()) {
-        // If a member's opTime has moved forward or config is newer, try to update the
-        // lastCommitted. Even if we've only updated the config, this is still safe.
-        _updateLastCommittedOpTimeAndWallTime(lk);
-
-        // Wake up replication waiters on optime changes or updated configs.
-        _wakeReadyWaiters(lk);
+        hbStatusResponse.getValue().getState() != MemberState::RS_PRIMARY) {
+        if (action.getAdvancedOpTimeOrUpdatedConfig()) {
+            // If a member's opTime has moved forward or config is newer, try to update the
+            // lastCommitted. Even if we've only updated the config, this is still safe.
+            _updateLastCommittedOpTimeAndWallTime(lk);
+            // Wake up replication waiters on optime changes or updated configs.
+            _wakeReadyWaiters(lk);
+        } else if (action.getBecameElectable() && _topCoord->isSteppingDown()) {
+            // Try to wake up the stepDown waiter when a new node becomes electable.
+            _wakeReadyWaiters(lk);
+        }
     }
 
     // When receiving a heartbeat response indicating that the remote is in a state past
@@ -496,6 +500,11 @@ void ReplicationCoordinatorImpl::_stepDownFinish(
     }
 
     auto opCtx = cc().makeOperationContext();
+
+    // To prevent a deadlock between session checkout and RSTL lock taking, disallow new sessions
+    // from being checked out. Existing sessions currently checked out will be killed by the
+    // killOpThread.
+    ScopedBlockSessionCheckouts blockSessions(opCtx.get());
 
     // kill all write operations which are no longer safe to run on step down. Also, operations that
     // have taken global lock in S mode and operations blocked on prepare conflict will be killed to
@@ -777,6 +786,11 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigFinish(
     if (_shouldStepDownOnReconfig(lk, newConfig, myIndex)) {
         _topCoord->prepareForUnconditionalStepDown();
         lk.unlock();
+
+        // To prevent a deadlock between session checkout and RSTL lock taking, disallow new
+        // sessions from being checked out. Existing sessions currently checked out will be killed
+        // by the killOpThread.
+        ScopedBlockSessionCheckouts blockSessions(opCtx.get());
 
         // Primary node will be either unelectable or removed after the configuration change.
         // So, finish the reconfig under RSTL, so that the step down occurs safely.

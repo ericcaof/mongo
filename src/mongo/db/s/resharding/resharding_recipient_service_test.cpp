@@ -34,11 +34,15 @@
 #include "mongo/bson/unordered_fields_bsonobj_comparator.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/s/migration_destination_manager.h"
+#include "mongo/db/s/resharding/resharding_oplog_applier_progress_gen.h"
 #include "mongo/db/s/resharding/resharding_recipient_service.h"
+#include "mongo/db/s/resharding_util.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/logv2/log.h"
@@ -133,29 +137,29 @@ public:
                                                         const NamespaceString& origNss,
                                                         const ShardKeyPattern& skey,
                                                         UUID uuid,
-                                                        OID epoch) {
+                                                        OID epoch,
+                                                        const BSONObj& collation = {}) {
         auto future = scheduleRoutingInfoForcedRefresh(tempNss);
 
         expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
             CollectionType coll(tempNss, epoch, Date_t::now(), uuid);
             coll.setKeyPattern(skey.getKeyPattern());
             coll.setUnique(false);
+            coll.setDefaultCollation(collation);
 
             TypeCollectionReshardingFields reshardingFields;
-            reshardingFields.setUuid(uuid);
+            reshardingFields.setReshardingUUID(uuid);
             TypeCollectionRecipientFields recipientFields;
-            recipientFields.setOriginalNamespace(origNss);
-            recipientFields.setExistingUUID(uuid);
+            recipientFields.setSourceNss(origNss);
+            recipientFields.setSourceUUID(uuid);
             // Populating the set of donor shard ids isn't necessary to test the functionality of
             // creating the temporary resharding collection.
-            recipientFields.setDonorShardIds({});
+            recipientFields.setDonorShards({});
+            recipientFields.setMinimumOperationDurationMillis(5000);
 
             reshardingFields.setRecipientFields(recipientFields);
             coll.setReshardingFields(reshardingFields);
 
-            return std::vector<BSONObj>{coll.toBSON()};
-        }());
-        expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
             ChunkVersion version(1, 0, epoch, boost::none /* timestamp */);
 
             ChunkType chunk(tempNss,
@@ -165,7 +169,8 @@ public:
             chunk.setName(OID::gen());
             version.incMinor();
 
-            return std::vector<BSONObj>{chunk.toConfigBSON()};
+            const auto chunkObj = BSON("chunks" << chunk.toConfigBSON());
+            return std::vector<BSONObj>{coll.toBSON(), chunkObj};
         }());
 
         future.default_timed_get();
@@ -179,10 +184,7 @@ public:
             CollectionType coll(origNss, epoch, Date_t::now(), uuid);
             coll.setKeyPattern(skey.getKeyPattern());
             coll.setUnique(false);
-            return std::vector<BSONObj>{coll.toBSON()};
-        }());
 
-        expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
             ChunkVersion version(1, 0, epoch, boost::none /* timestamp */);
 
             ChunkType chunk(origNss,
@@ -192,7 +194,8 @@ public:
             chunk.setName(OID::gen());
             version.incMinor();
 
-            return std::vector<BSONObj>{chunk.toConfigBSON()};
+            const auto chunkObj = BSON("chunks" << chunk.toConfigBSON());
+            return std::vector<BSONObj>{coll.toBSON(), chunkObj};
         }());
     }
 

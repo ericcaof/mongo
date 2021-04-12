@@ -2,7 +2,11 @@
  * Confirms that log output for each operation adheres to the expected, consistent format, including
  * query/write metrics where applicable, on both mongoD and mongoS and under both legacy and command
  * protocols.
- * @tags: [requires_replication, requires_sharding]
+ * @tags: [
+ *   requires_replication,
+ *   requires_sharding,
+ *   sbe_incompatible,
+ * ]
  */
 load("jstests/libs/logv2_helpers.js");
 
@@ -94,6 +98,11 @@ function runLoggingTests({db, readWriteMode, slowMs, logLevel, sampleRate}) {
         {profile: 0, slowms: (slowMs == null) ? 1000000 : slowMs, sampleRate: sampleRate}));
     assert.commandWorked(db.setLogLevel(logLevel, "command"));
     assert.commandWorked(db.setLogLevel(logLevel, "write"));
+
+    const isSBEEnabled = (() => {
+        const getParam = db.adminCommand({getParameter: 1, featureFlagSBE: 1});
+        return getParam.hasOwnProperty("featureFlagSBE") && getParam.featureFlagSBE.value;
+    })();
 
     // Certain fields in the log lines on mongoD are not applicable in their counterparts on
     // mongoS, and vice-versa. Ignore these fields when examining the logs of an instance on
@@ -195,7 +204,8 @@ function runLoggingTests({db, readWriteMode, slowMs, logLevel, sampleRate}) {
                 command: "find",
                 find: coll.getName(),
                 comment: logFormatTestComment,
-                planSummary: "IDHACK",
+                planSummary: isSBEEnabled && readWriteMode == "commands" ? "IXSCAN { _id: 1 }"
+                                                                         : "IDHACK",
                 cursorExhausted: 1,
                 keysExamined: 1,
                 docsExamined: 1,
@@ -385,7 +395,6 @@ function runLoggingTests({db, readWriteMode, slowMs, logLevel, sampleRate}) {
                 comment: logFormatTestComment,
                 collation: {locale: "fr"},
                 cursorExhausted: 1,
-                keysExamined: 4,
                 docsExamined: 2,
                 nreturned: 2,
                 nShards: 1

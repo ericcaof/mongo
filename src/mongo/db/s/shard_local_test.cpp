@@ -33,7 +33,7 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/ops/find_and_modify_command_gen.h"
+#include "mongo/db/ops/write_ops.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
@@ -101,7 +101,7 @@ void ShardLocalTest::tearDown() {
 StatusWith<Shard::CommandResponse> ShardLocalTest::runFindAndModifyRunCommand(NamespaceString nss,
                                                                               BSONObj find,
                                                                               BSONObj set) {
-    auto findAndModifyRequest = write_ops::FindAndModifyCommand(nss);
+    auto findAndModifyRequest = write_ops::FindAndModifyCommandRequest(nss);
     findAndModifyRequest.setQuery(find);
     findAndModifyRequest.setUpdate(write_ops::UpdateModification::parseFromClassicUpdate(set));
     findAndModifyRequest.setUpsert(true);
@@ -267,9 +267,10 @@ TEST_F(ShardLocalTest, CreateIndex) {
     indexes = unittest::assertGet(getIndexes(nss));
     ASSERT_EQ(2U, indexes.size());
 
-    // Trying to make the same index as non-unique should fail.
+    // Trying to make the same index as non-unique should fail as the same index name exists
+    // though unique property is part of the index signature since 4.9.
     status = _shardLocal->createIndexOnConfig(_opCtx.get(), nss, BSON("a" << 1 << "b" << 1), false);
-    ASSERT_EQUALS(ErrorCodes::IndexOptionsConflict, status);
+    ASSERT_EQUALS(ErrorCodes::IndexKeySpecsConflict, status);
     indexes = unittest::assertGet(getIndexes(nss));
     ASSERT_EQ(2U, indexes.size());
 }

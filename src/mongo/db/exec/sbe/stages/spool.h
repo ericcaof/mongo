@@ -181,11 +181,15 @@ public:
     }
 
     void open(bool reOpen) {
+        auto optTimer(getOptTimer(_opCtx));
+
         _commonStats.opens++;
         _bufferIt = _buffer->size();
     }
 
     PlanState getNext() {
+        auto optTimer(getOptTimer(_opCtx));
+
         if constexpr (IsStack) {
             if (_bufferIt != _buffer->size()) {
                 _buffer->erase(_buffer->begin() + _bufferIt);
@@ -211,6 +215,8 @@ public:
     }
 
     void close() {
+        auto optTimer(getOptTimer(_opCtx));
+
         _commonStats.closes++;
     }
 
@@ -219,7 +225,7 @@ public:
 
         if (includeDebugInfo) {
             BSONObjBuilder bob;
-            bob.appendIntOrLL("spoolId", _spoolId);
+            bob.appendNumber("spoolId", static_cast<long long>(_spoolId));
             bob.append("outputSlots", _vals);
             ret->debugInfo = bob.obj();
         }

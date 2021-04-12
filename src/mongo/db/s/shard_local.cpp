@@ -129,8 +129,10 @@ StatusWith<Shard::QueryResponse> ShardLocal::_exhaustiveFindOnConfig(
     const NamespaceString& nss,
     const BSONObj& query,
     const BSONObj& sort,
-    boost::optional<long long> limit) {
-    return _rsLocalClient.queryOnce(opCtx, readPref, readConcernLevel, nss, query, sort, limit);
+    boost::optional<long long> limit,
+    const boost::optional<BSONObj>& hint) {
+    return _rsLocalClient.queryOnce(
+        opCtx, readPref, readConcernLevel, nss, query, sort, limit, hint);
 }
 
 Status ShardLocal::createIndexOnConfig(OperationContext* opCtx,
@@ -212,9 +214,9 @@ void ShardLocal::runFireAndForgetCommand(OperationContext* opCtx,
 }
 
 Status ShardLocal::runAggregation(OperationContext* opCtx,
-                                  const AggregateCommand& aggRequest,
+                                  const AggregateCommandRequest& aggRequest,
                                   std::function<bool(const std::vector<BSONObj>& batch)> callback) {
-    MONGO_UNREACHABLE;
+    return _rsLocalClient.runAggregation(opCtx, aggRequest, callback);
 }
 
 }  // namespace mongo

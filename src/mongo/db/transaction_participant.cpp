@@ -123,7 +123,8 @@ struct ActiveTransactionHistory {
 };
 
 ActiveTransactionHistory fetchActiveTransactionHistory(OperationContext* opCtx,
-                                                       const LogicalSessionId& lsid) {
+                                                       const LogicalSessionId& lsid,
+                                                       bool fetchOplogEntries) {
     // Storage engine operations require at least Global IS.
     Lock::GlobalLock lk(opCtx, MODE_IS);
 
@@ -159,6 +160,10 @@ ActiveTransactionHistory fetchActiveTransactionHistory(OperationContext* opCtx,
         return result;
     }
 
+    if (!fetchOplogEntries) {
+        return result;
+    }
+
     auto it = TransactionHistoryIterator(result.lastTxnRecord->getLastWriteOpTime());
     while (it.hasNext()) {
         try {
@@ -166,9 +171,11 @@ ActiveTransactionHistory fetchActiveTransactionHistory(OperationContext* opCtx,
 
             // Each entry should correspond to a retryable write or a FCV4.0 format transaction.
             // These oplog entries must have statementIds.
-            invariant(entry.getStatementId());
-            if (*entry.getStatementId() == kIncompleteHistoryStmtId) {
+            auto stmtIds = entry.getStatementIds();
+            invariant(!stmtIds.empty());
+            if (stmtIds.front() == kIncompleteHistoryStmtId) {
                 // Only the dead end sentinel can have this id for oplog write history
+                invariant(stmtIds.size() == 1);
                 invariant(entry.getObject2());
                 invariant(entry.getObject2()->woCompare(TransactionParticipant::kDeadEndSentinel) ==
                           0);
@@ -182,15 +189,17 @@ ActiveTransactionHistory fetchActiveTransactionHistory(OperationContext* opCtx,
                 return result;
             }
 
-            const auto insertRes =
-                result.committedStatements.emplace(*entry.getStatementId(), entry.getOpTime());
-            if (!insertRes.second) {
-                const auto& existingOpTime = insertRes.first->second;
-                fassertOnRepeatedExecution(lsid,
-                                           result.lastTxnRecord->getTxnNum(),
-                                           *entry.getStatementId(),
-                                           existingOpTime,
-                                           entry.getOpTime());
+            for (auto stmtId : entry.getStatementIds()) {
+                const auto insertRes =
+                    result.committedStatements.emplace(stmtId, entry.getOpTime());
+                if (!insertRes.second) {
+                    const auto& existingOpTime = insertRes.first->second;
+                    fassertOnRepeatedExecution(lsid,
+                                               result.lastTxnRecord->getTxnNum(),
+                                               stmtId,
+                                               existingOpTime,
+                                               entry.getOpTime());
+                }
             }
         } catch (const DBException& ex) {
             if (ex.code() == ErrorCodes::IncompleteTransactionHistory) {
@@ -268,7 +277,6 @@ void updateSessionEntry(OperationContext* opCtx, const UpdateRequest& updateRequ
     CollectionUpdateArgs args;
     args.update = updateMod;
     args.criteria = toUpdateIdDoc;
-    args.fromMigrate = false;
 
     collection->updateDocument(opCtx,
                                recordId,
@@ -2182,13 +2190,23 @@ void TransactionParticipant::Participant::_setNewTxnNumber(OperationContext* opC
 }
 
 void TransactionParticipant::Participant::refreshFromStorageIfNeeded(OperationContext* opCtx) {
+    return _refreshFromStorageIfNeeded(opCtx, true);
+}
+
+void TransactionParticipant::Participant::refreshFromStorageIfNeededNoOplogEntryFetch(
+    OperationContext* opCtx) {
+    return _refreshFromStorageIfNeeded(opCtx, false);
+}
+
+void TransactionParticipant::Participant::_refreshFromStorageIfNeeded(OperationContext* opCtx,
+                                                                      bool fetchOplogEntries) {
     invariant(!opCtx->getClient()->isInDirectClient());
     invariant(!opCtx->lockState()->isLocked());
 
     if (p().isValid)
         return;
 
-    auto activeTxnHistory = fetchActiveTransactionHistory(opCtx, _sessionId());
+    auto activeTxnHistory = fetchActiveTransactionHistory(opCtx, _sessionId(), fetchOplogEntries);
     const auto& lastTxnRecord = activeTxnHistory.lastTxnRecord;
     if (lastTxnRecord) {
         stdx::lock_guard<Client> lg(*opCtx->getClient());
@@ -2333,8 +2351,9 @@ boost::optional<repl::OplogEntry> TransactionParticipant::Participant::checkStat
     TransactionHistoryIterator txnIter(*stmtTimestamp);
     while (txnIter.hasNext()) {
         const auto entry = txnIter.next(opCtx);
-        invariant(entry.getStatementId());
-        if (*entry.getStatementId() == stmtId)
+        auto stmtIds = entry.getStatementIds();
+        invariant(!stmtIds.empty());
+        if (std::find(stmtIds.begin(), stmtIds.end(), stmtId) != stmtIds.end())
             return entry;
     }
 

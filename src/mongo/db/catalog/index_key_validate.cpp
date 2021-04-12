@@ -60,8 +60,6 @@ namespace index_key_validate {
 
 std::function<void(std::set<StringData>&)> filterAllowedIndexFieldNames;
 
-using std::string;
-
 using IndexVersion = IndexDescriptor::IndexVersion;
 
 namespace {
@@ -107,6 +105,21 @@ static const std::set<StringData> allowedIdIndexFieldNames = {
     IndexDescriptor::kNamespaceFieldName,
     // Index creation under legacy writeMode can result in an index spec with an _id field.
     "_id"};
+
+/**
+ * Returns Status::OK() if indexes of version 'indexVersion' are allowed to be created, and
+ * returns ErrorCodes::CannotCreateIndex otherwise.
+ */
+Status isIndexVersionAllowedForCreation(IndexVersion indexVersion, const BSONObj& indexSpec) {
+    switch (indexVersion) {
+        case IndexVersion::kV1:
+        case IndexVersion::kV2:
+            return Status::OK();
+    }
+    return {ErrorCodes::CannotCreateIndex,
+            str::stream() << "Invalid index specification " << indexSpec
+                          << "; cannot create an index with v=" << static_cast<int>(indexVersion)};
+}
 }  // namespace
 
 Status validateKeyPattern(const BSONObj& key, IndexDescriptor::IndexVersion indexVersion) {
@@ -118,7 +131,7 @@ Status validateKeyPattern(const BSONObj& key, IndexDescriptor::IndexVersion inde
     if (key.isEmpty())
         return Status(code, "Index keys cannot be empty.");
 
-    string pluginName = IndexNames::findPluginName(key);
+    auto pluginName = IndexNames::findPluginName(key);
     if (pluginName.size()) {
         if (!IndexNames::isKnownName(pluginName))
             return Status(code, str::stream() << "Unknown index plugin '" << pluginName << '\'');
@@ -254,15 +267,14 @@ BSONObj removeUnknownFields(const BSONObj& indexSpec) {
     return builder.obj();
 }
 
-StatusWith<BSONObj> validateIndexSpec(
-    OperationContext* opCtx,
-    const BSONObj& indexSpec,
-    const ServerGlobalParams::FeatureCompatibility& featureCompatibility) {
+StatusWith<BSONObj> validateIndexSpec(OperationContext* opCtx, const BSONObj& indexSpec) {
     bool hasKeyPatternField = false;
     bool hasIndexNameField = false;
     bool hasNamespaceField = false;
     bool hasVersionField = false;
     bool hasCollationField = false;
+    bool hasWeightsField = false;
+    bool apiStrict = opCtx && APIParameters::get(opCtx).getAPIStrict().value_or(false);
 
     auto fieldNamesValidStatus = validateIndexSpecFieldNames(indexSpec);
     if (!fieldNamesValidStatus.isOK()) {
@@ -270,6 +282,7 @@ StatusWith<BSONObj> validateIndexSpec(
     }
 
     boost::optional<IndexVersion> resolvedIndexVersion;
+    std::string indexType;
 
     for (auto&& indexSpecElem : indexSpec) {
         auto indexSpecElemFieldName = indexSpecElem.fieldNameStringData();
@@ -297,10 +310,17 @@ StatusWith<BSONObj> validateIndexSpec(
             // 'validateKeyPattern()'. It must currently be done here so that haystack indexes
             // continue to replicate correctly before the upgrade to FCV "4.9" is complete.
             const auto keyPattern = indexSpecElem.Obj();
-            if (IndexNames::findPluginName(keyPattern) == IndexNames::GEO_HAYSTACK) {
+            indexType = IndexNames::findPluginName(keyPattern);
+            if (indexType == IndexNames::GEO_HAYSTACK) {
                 return {ErrorCodes::CannotCreateIndex,
                         str::stream()
                             << "GeoHaystack indexes cannot be created in version 4.9 and above"};
+            }
+
+            if (apiStrict && indexType == IndexNames::TEXT) {
+                return {ErrorCodes::APIStrictError,
+                        str::stream()
+                            << indexType << " indexes cannot be created with apiStrict: true"};
             }
 
             // Here we always validate the key pattern according to the most recent rules, in order
@@ -357,8 +377,8 @@ StatusWith<BSONObj> validateIndexSpec(
 
             const IndexVersion requestedIndexVersion =
                 static_cast<IndexVersion>(*requestedIndexVersionAsInt);
-            auto creationAllowedStatus = IndexDescriptor::isIndexVersionAllowedForCreation(
-                requestedIndexVersion, featureCompatibility, indexSpec);
+            auto creationAllowedStatus =
+                isIndexVersionAllowedForCreation(requestedIndexVersion, indexSpec);
             if (!creationAllowedStatus.isOK()) {
                 return creationAllowedStatus;
             }
@@ -444,17 +464,47 @@ StatusWith<BSONObj> validateIndexSpec(
                 return ex.toStatus(str::stream() << "Failed to parse: "
                                                  << IndexDescriptor::kPathProjectionFieldName);
             }
+        } else if (IndexDescriptor::kWeightsFieldName == indexSpecElemFieldName) {
+            if (!indexSpecElem.isABSONObj() && indexSpecElem.type() != String) {
+                return {ErrorCodes::TypeMismatch,
+                        str::stream()
+                            << "The field '" << indexSpecElemFieldName
+                            << "' must be an object, but got " << typeName(indexSpecElem.type())};
+            }
+            hasWeightsField = true;
         } else if (IndexDescriptor::kGeoHaystackBucketSize == indexSpecElemFieldName) {
             return {ErrorCodes::CannotCreateIndex,
                     str::stream()
                         << "The 'bucketSize' parameter is disallowed because "
                            "geoHaystack indexes are no longer supported in version 4.9 and above"};
-        } else if (IndexDescriptor::kBackgroundFieldName == indexSpecElemFieldName &&
+        } else if ((IndexDescriptor::kBackgroundFieldName == indexSpecElemFieldName ||
+                    IndexDescriptor::kUniqueFieldName == indexSpecElemFieldName ||
+                    IndexDescriptor::kSparseFieldName == indexSpecElemFieldName ||
+                    IndexDescriptor::k2dsphereCoarsestIndexedLevel == indexSpecElemFieldName ||
+                    IndexDescriptor::k2dsphereFinestIndexedLevel == indexSpecElemFieldName ||
+                    IndexDescriptor::kDropDuplicatesFieldName == indexSpecElemFieldName) &&
                    !indexSpecElem.isNumber() && !indexSpecElem.isBoolean()) {
-            return {ErrorCodes::BadValue,
-                    str::stream() << "The field '" << IndexDescriptor::kBackgroundFieldName
-                                  << " has value " << indexSpecElem.toString()
+            return {ErrorCodes::TypeMismatch,
+                    str::stream() << "The field '" << indexSpecElemFieldName << " has value "
+                                  << indexSpecElem.toString()
                                   << ", which is not convertible to bool"};
+        } else if ((IndexDescriptor::kDefaultLanguageFieldName == indexSpecElemFieldName ||
+                    IndexDescriptor::kLanguageOverrideFieldName == indexSpecElemFieldName) &&
+                   indexSpecElem.type() != BSONType::String) {
+            return {ErrorCodes::TypeMismatch,
+                    str::stream() << "The field '" << indexSpecElemFieldName
+                                  << "' must be a string, but got "
+                                  << typeName(indexSpecElem.type())};
+        } else if ((IndexDescriptor::k2dsphereVersionFieldName == indexSpecElemFieldName ||
+                    IndexDescriptor::kTextVersionFieldName == indexSpecElemFieldName ||
+                    IndexDescriptor::k2dIndexBitsFieldName == indexSpecElemFieldName ||
+                    IndexDescriptor::k2dIndexMinFieldName == indexSpecElemFieldName ||
+                    IndexDescriptor::k2dIndexMaxFieldName == indexSpecElemFieldName) &&
+                   !indexSpecElem.isNumber()) {
+            return {ErrorCodes::TypeMismatch,
+                    str::stream() << "The field '" << indexSpecElemFieldName
+                                  << "' must be a number, but got "
+                                  << typeName(indexSpecElem.type())};
         } else {
             // We can assume field name is valid at this point. Validation of fieldname is handled
             // prior to this in validateIndexSpecFieldNames().
@@ -485,6 +535,13 @@ StatusWith<BSONObj> validateIndexSpec(
                               << IndexDescriptor::kCollationFieldName << "' option and "
                               << IndexDescriptor::kIndexVersionFieldName << "="
                               << static_cast<int>(*resolvedIndexVersion)};
+    }
+
+    if (indexType != IndexNames::TEXT && hasWeightsField) {
+        return {ErrorCodes::CannotCreateIndex,
+                str::stream() << "Invalid index specification " << indexSpec << "; the field '"
+                              << IndexDescriptor::kWeightsFieldName
+                              << "' can only be specified with text indexes"};
     }
 
     BSONObj modifiedSpec = indexSpec;
@@ -616,6 +673,31 @@ StatusWith<BSONObj> validateIndexSpecCollation(OperationContext* opCtx,
     return indexSpec;
 }
 
+Status validateExpireAfterSeconds(std::int64_t expireAfterSeconds) {
+    if (expireAfterSeconds < 0) {
+        return {ErrorCodes::InvalidOptions,
+                str::stream() << "TTL index '" << IndexDescriptor::kExpireAfterSecondsFieldName
+                              << "' option cannot be less than 0"};
+    }
+
+    const std::string tooLargeErr = str::stream()
+        << "TTL index '" << IndexDescriptor::kExpireAfterSecondsFieldName
+        << "' option must be within an acceptable range, try a lower number";
+
+    // There are two cases where we can encounter an issue here.
+    // The first case is when we try to cast to millseconds from seconds, which could cause an
+    // overflow. The second case is where 'expireAfterSeconds' is larger than the current epoch
+    // time.
+    if (expireAfterSeconds > std::numeric_limits<std::int64_t>::max() / 1000) {
+        return {ErrorCodes::InvalidOptions, tooLargeErr};
+    }
+    auto expireAfterMillis = duration_cast<Milliseconds>(Seconds(expireAfterSeconds));
+    if (expireAfterMillis > Date_t::now().toDurationSinceEpoch()) {
+        return {ErrorCodes::InvalidOptions, tooLargeErr};
+    }
+    return Status::OK();
+}
+
 Status validateIndexSpecTTL(const BSONObj& indexSpec) {
     if (!indexSpec.hasField(IndexDescriptor::kExpireAfterSecondsFieldName)) {
         return Status::OK();
@@ -631,29 +713,10 @@ Status validateIndexSpecTTL(const BSONObj& indexSpec) {
                               << "'. Index spec: " << indexSpec};
     }
 
-    if (expireAfterSecondsElt.safeNumberLong() < 0) {
+    if (auto status = validateExpireAfterSeconds(expireAfterSecondsElt.safeNumberLong());
+        !status.isOK()) {
         return {ErrorCodes::CannotCreateIndex,
-                str::stream() << "TTL index '" << IndexDescriptor::kExpireAfterSecondsFieldName
-                              << "' option cannot be less than 0. Index spec: " << indexSpec};
-    }
-
-    const std::string tooLargeErr = str::stream()
-        << "TTL index '" << IndexDescriptor::kExpireAfterSecondsFieldName
-        << "' option must be within an acceptable range, try a lower number. Index spec: "
-        << indexSpec;
-
-    // There are two cases where we can encounter an issue here.
-    // The first case is when we try to cast to millseconds from seconds, which could cause an
-    // overflow. The second case is where 'expireAfterSeconds' is larger than the current epoch
-    // time.
-    try {
-        auto expireAfterMillis =
-            duration_cast<Milliseconds>(Seconds(expireAfterSecondsElt.safeNumberLong()));
-        if (expireAfterMillis > Date_t::now().toDurationSinceEpoch()) {
-            return {ErrorCodes::CannotCreateIndex, tooLargeErr};
-        }
-    } catch (const AssertionException&) {
-        return {ErrorCodes::CannotCreateIndex, tooLargeErr};
+                str::stream() << status.reason() << "index spec: " << indexSpec};
     }
 
     const BSONObj key = indexSpec["key"].Obj();
@@ -665,6 +728,12 @@ Status validateIndexSpecTTL(const BSONObj& indexSpec) {
     }
 
     return Status::OK();
+}
+
+bool isIndexAllowedInAPIVersion1(const IndexDescriptor& indexDesc) {
+    const auto indexName = IndexNames::findPluginName(indexDesc.keyPattern());
+    return indexName != IndexNames::TEXT && indexName != IndexNames::GEO_HAYSTACK &&
+        !indexDesc.isSparse();
 }
 
 GlobalInitializerRegisterer filterAllowedIndexFieldNamesInitializer(

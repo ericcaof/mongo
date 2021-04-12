@@ -688,7 +688,14 @@ assert = (function() {
 
         // Keep this as a function so we don't call tojson if not necessary.
         const makeFailMsg = () => {
-            return _buildAssertionMessage(msg, "command failed: " + tojson(res));
+            let prefix = "command failed: " + tojson(res);
+            if (typeof res._commandObj === "object" && res._commandObj !== null) {
+                prefix += " with original command request: " + tojson(res._commandObj);
+            }
+            if (typeof res._mongo === "object" && res._mongo !== null) {
+                prefix += " on connection: " + res._mongo;
+            }
+            return _buildAssertionMessage(msg, prefix);
         };
 
         if (_isWriteResultType(res)) {
@@ -722,12 +729,13 @@ assert = (function() {
         return res;
     }
 
-    const kAnyErrorCode = Object.create(null);
+    assert._kAnyErrorCode = Object.create(null);
+
     function _assertCommandFailed(res, expectedCode, msg) {
         _validateAssertionMessage(msg);
         _validateCommandResponse(res, "commandFailed");
 
-        if (expectedCode !== kAnyErrorCode && !Array.isArray(expectedCode)) {
+        if (expectedCode !== assert._kAnyErrorCode && !Array.isArray(expectedCode)) {
             expectedCode = [expectedCode];
         }
 
@@ -738,7 +746,7 @@ assert = (function() {
         };
 
         const makeFailCodeMsg = () => {
-            return (expectedCode !== kAnyErrorCode)
+            return (expectedCode !== assert._kAnyErrorCode)
                 ? _buildAssertionMessage(msg,
                                          "command did not fail with any of the following codes " +
                                              tojson(expectedCode) + " " + tojson(res))
@@ -752,7 +760,7 @@ assert = (function() {
             // A WriteCommandError implies ok:0.
             // Error objects may have a `code` property added (e.g.
             // DBCollection.prototype.mapReduce) without a `ok` property.
-            if (expectedCode !== kAnyErrorCode) {
+            if (expectedCode !== assert._kAnyErrorCode) {
                 if (!res.hasOwnProperty("code") || !expectedCode.includes(res.code)) {
                     doassert(makeFailCodeMsg(), res);
                 }
@@ -764,7 +772,7 @@ assert = (function() {
                 doassert(makeFailMsg(), res);
             }
 
-            if (expectedCode !== kAnyErrorCode) {
+            if (expectedCode !== assert._kAnyErrorCode) {
                 let foundCode = false;
                 if (res.hasOwnProperty("code") && expectedCode.includes(res.code)) {
                     foundCode = true;
@@ -817,7 +825,7 @@ assert = (function() {
     };
 
     assert.commandFailed = function(res, msg) {
-        return _assertCommandFailed(res, kAnyErrorCode, msg);
+        return _assertCommandFailed(res, assert._kAnyErrorCode, msg);
     };
 
     // expectedCode can be an array of possible codes.
@@ -859,7 +867,7 @@ assert = (function() {
     };
 
     assert.writeError = function(res, msg) {
-        return assert.writeErrorWithCode(res, kAnyErrorCode, msg);
+        return assert.writeErrorWithCode(res, assert._kAnyErrorCode, msg);
     };
 
     // If expectedCode is an array then this asserts that the found code is one of the codes in
@@ -901,7 +909,7 @@ assert = (function() {
             }
         }
 
-        if (!errMsg && expectedCode !== kAnyErrorCode) {
+        if (!errMsg && expectedCode !== assert._kAnyErrorCode) {
             if (!Array.isArray(expectedCode)) {
                 expectedCode = [expectedCode];
             }

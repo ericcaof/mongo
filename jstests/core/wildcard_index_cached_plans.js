@@ -12,7 +12,6 @@
  *   # false when the test assumes they are true because the query has already been run many times.
  *   assumes_balancer_off,
  *   inspects_whether_plan_cache_entry_is_active,
- *   sbe_incompatible,
  * ]
  */
 (function() {
@@ -83,7 +82,19 @@ assert.neq(cacheEntry, null);
 assert.eq(cacheEntry.isActive, true);
 // Should be at least two plans: one using the {a: 1} index and the other using the b.$** index.
 assert.gte(cacheEntry.creationExecStats.length, 2, tojson(cacheEntry.plans));
-const plan = cacheEntry.creationExecStats[0].executionStages;
+
+// Note that the "getParameter" command is expected to fail in versions of mongod that do not
+// yet include the slot-based execution engine. When that happens, however, 'isSBEEnabled' still
+// correctly evaluates to false.
+const isSBEEnabled = (() => {
+    const getParam = db.adminCommand({getParameter: 1, featureFlagSBE: 1});
+    return getParam.hasOwnProperty("featureFlagSBE") && getParam.featureFlagSBE.value;
+})();
+
+// In SBE index scan stage does not serialize key pattern in execution stats, so we use IXSCAN from
+// the query plan instead.
+const plan = isSBEEnabled ? cacheEntry.cachedPlan.queryPlan
+                          : cacheEntry.creationExecStats[0].executionStages;
 const ixScanStage = getPlanStage(plan, "IXSCAN");
 assert.neq(ixScanStage, null, () => tojson(plan));
 assert.eq(ixScanStage.keyPattern, {"$_path": 1, "b": 1}, () => tojson(plan));
@@ -116,7 +127,7 @@ assert.commandWorked(coll.createIndex({"b.$**": 1}));
 // string bounds.
 const queryWithoutStringExplain =
     coll.explain().find({a: 5, b: 5}).collation({locale: "fr"}).finish();
-let ixScans = getPlanStages(queryWithoutStringExplain.queryPlanner.winningPlan, "IXSCAN");
+let ixScans = getPlanStages(getWinningPlan(queryWithoutStringExplain.queryPlanner), "IXSCAN");
 assert.eq(ixScans.length, FixtureHelpers.numberOfShardsForCollection(coll));
 assert.eq(ixScans[0].keyPattern, {$_path: 1, b: 1});
 
@@ -124,7 +135,7 @@ assert.eq(ixScans[0].keyPattern, {$_path: 1, b: 1});
 // bounds.
 const queryWithStringExplain =
     coll.explain().find({a: 5, b: "a string"}).collation({locale: "fr"}).finish();
-ixScans = getPlanStages(queryWithStringExplain.queryPlanner.winningPlan, "IXSCAN");
+ixScans = getPlanStages(getWinningPlan(queryWithStringExplain.queryPlanner), "IXSCAN");
 assert.eq(ixScans.length, 0);
 
 // Check that the shapes are different since the query which matches on a string will not
@@ -140,13 +151,13 @@ assert.commandWorked(coll.createIndex({"$**": 1}, {partialFilterExpression: {a: 
 
 // Run a query for a value included by the partial filter expression.
 const queryIndexedExplain = coll.find({a: 4}).explain();
-let ixScans = getPlanStages(queryIndexedExplain.queryPlanner.winningPlan, "IXSCAN");
+let ixScans = getPlanStages(getWinningPlan(queryIndexedExplain.queryPlanner), "IXSCAN");
 assert.eq(ixScans.length, FixtureHelpers.numberOfShardsForCollection(coll));
 assert.eq(ixScans[0].keyPattern, {$_path: 1, a: 1});
 
 // Run a query which tries to get a value not included by the partial filter expression.
 const queryUnindexedExplain = coll.find({a: 100}).explain();
-ixScans = getPlanStages(queryUnindexedExplain.queryPlanner.winningPlan, "IXSCAN");
+ixScans = getPlanStages(getWinningPlan(queryUnindexedExplain.queryPlanner), "IXSCAN");
 assert.eq(ixScans.length, 0);
 
 // Check that the shapes are different since the query which searches for a value not

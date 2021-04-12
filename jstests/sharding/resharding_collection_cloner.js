@@ -12,7 +12,18 @@
 load("jstests/libs/uuid_util.js");
 load("jstests/sharding/libs/create_sharded_collection_util.js");
 
-const st = new ShardingTest({mongos: 1, config: 1, shards: 2, rs: {nodes: 3}});
+const st = new ShardingTest({
+    mongos: 1,
+    config: 1,
+    shards: 2,
+    rs: {nodes: 3},
+    rsOptions: {
+        setParameter: {
+            "failpoint.WTPreserveSnapshotHistoryIndefinitely": tojson({mode: "alwaysOn"}),
+            logComponentVerbosity: tojson({sharding: {reshard: 2}}),
+        }
+    },
+});
 
 const inputCollection = st.s.getCollection("reshardingDb.coll");
 
@@ -57,14 +68,16 @@ st.shard0.rs.awaitLastOpCommitted();
 st.shard1.rs.awaitLastOpCommitted();
 
 function testReshardCloneCollection(shard, expectedDocs) {
-    assert.commandWorked(shard.rs.getPrimary().adminCommand({
+    const reshardCmd = {
         testReshardCloneCollection: inputCollection.getFullName(),
         shardKey: {newKey: 1},
         uuid: inputCollectionUUID,
         shardId: shard.shardName,
         atClusterTime: atClusterTime,
         outputNs: temporaryReshardingCollection.getFullName(),
-    }));
+    };
+    jsTestLog({"Node": shard.rs.getPrimary(), "ReshardingCmd": reshardCmd});
+    assert.commandWorked(shard.rs.getPrimary().adminCommand(reshardCmd));
 
     // We sort by oldKey so the order of `expectedDocs` can be deterministic.
     assert.eq(expectedDocs,

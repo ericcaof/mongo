@@ -2,7 +2,9 @@
  * Verifies that an initial syncing node can abort in-progress two phase index builds during the
  * oplog replay phase.
  *
- * @tags: [requires_replication]
+ * @tags: [
+ *   requires_replication,
+ * ]
  */
 (function() {
 "use strict";

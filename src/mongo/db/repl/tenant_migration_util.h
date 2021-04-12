@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2020-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -26,6 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+
 #pragma once
 
 #include <set>
@@ -34,7 +35,11 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/client/mongo_uri.h"
 #include "mongo/config.h"
+#include "mongo/db/catalog/database.h"
+#include "mongo/db/keys_collection_document_gen.h"
+#include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/executor/scoped_task_executor.h"
 #include "mongo/util/net/ssl_util.h"
 #include "mongo/util/str.h"
 
@@ -45,6 +50,8 @@ namespace {
 const std::set<std::string> kUnsupportedTenantIds{"", "admin", "local", "config"};
 
 }  // namespace
+
+namespace tenant_migration_util {
 
 inline Status validateDatabasePrefix(const std::string& tenantId) {
     const bool isPrefixSupported =
@@ -121,5 +128,63 @@ inline Status validatePrivateKeyPEMPayload(const StringData& payload) {
     return swBlob.getStatus().withContext("Invalid private key field");
 #endif
 }
+
+/*
+ * Creates an ExternalKeysCollectionDocument representing an config.external_validation_keys
+ * document from the given the admin.system.keys document BSONObj.
+ */
+ExternalKeysCollectionDocument makeExternalClusterTimeKeyDoc(UUID migrationId, BSONObj keyDoc);
+
+/*
+ * For each given ExternalKeysCollectionDocument, inserts it if there is not an existing document in
+ * config.external_validation_keys for it with the same keyId and replicaSetName. Otherwise,
+ * updates the ttlExpiresAt of the existing document if it is less than the new ttlExpiresAt.
+ */
+repl::OpTime storeExternalClusterTimeKeyDocs(std::vector<ExternalKeysCollectionDocument> keyDocs);
+
+/**
+ * Sets the "ttlExpiresAt" field for the external keys so they can be garbage collected by the ttl
+ * monitor.
+ */
+ExecutorFuture<void> markExternalKeysAsGarbageCollectable(
+    ServiceContext* serviceContext,
+    std::shared_ptr<executor::ScopedTaskExecutor> executor,
+    std::shared_ptr<executor::TaskExecutor> parentExecutor,
+    UUID migrationId,
+    const CancellationToken& token);
+
+/**
+ * Creates a view on the oplog that allows a tenant migration recipient to fetch retryable writes
+ * and transactions from a tenant migration donor.
+ */
+void createOplogViewForTenantMigrations(OperationContext* opCtx, Database* db);
+
+/**
+ * Creates a pipeline for fetching committed transactions on the donor before
+ * 'startFetchingTimestamp'. We use 'tenantId' to fetch transaction entries specific to a particular
+ * set of tenant databases.
+ */
+std::unique_ptr<Pipeline, PipelineDeleter> createCommittedTransactionsPipelineForTenantMigrations(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const Timestamp& startFetchingTimestamp,
+    const std::string& tenantId);
+
+/**
+ * Creates a pipeline that can be serialized into a query for fetching retryable writes oplog
+ * entries before `startFetchingTimestamp`. We use `tenantId` to fetch entries specific to a
+ * particular set of tenant databases.
+ */
+std::unique_ptr<Pipeline, PipelineDeleter>
+createRetryableWritesOplogFetchingPipelineForTenantMigrations(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const Timestamp& startFetchingTimestamp,
+    const std::string& tenantId);
+
+/**
+ * Returns a new BSONObj created from 'stateDoc' with sensitive fields redacted.
+ */
+BSONObj redactStateDoc(BSONObj stateDoc);
+
+}  // namespace tenant_migration_util
 
 }  // namespace mongo

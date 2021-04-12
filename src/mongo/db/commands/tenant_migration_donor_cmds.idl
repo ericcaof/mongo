@@ -57,6 +57,7 @@ commands:
     command_name: donorStartMigration
     strict: true
     namespace: ignored
+    api_version: ""
     fields:
       migrationId:
         description: "Unique identifier for the tenant migration."
@@ -65,12 +66,12 @@ commands:
         description: "The URI string that the donor will utilize to create a connection with the recipient."
         type: string
         validator:
-          callback: "validateConnectionString"
+          callback: "tenant_migration_util::validateConnectionString"
       tenantId:
         description: "The prefix from which the migrating database will be matched. The prefixes 'admin', 'local', 'config', the empty string, are not allowed."
         type: string
         validator:
-          callback: "validateDatabasePrefix"
+          callback: "tenant_migration_util::validateDatabasePrefix"
       readPreference:
         description: "The read preference settings that the donor will pass on to the recipient."
         type: readPreference
@@ -79,17 +80,33 @@ commands:
           The SSL certificate and private key that the donor should use to authenticate to the
           recipient.
         type: TenantMigrationPEMPayload
+        # TODO (SERVER-54085): Remove server parameter tenantMigrationDisableX509Auth.
+        optional: true
       recipientCertificateForDonor:
         description: >-
           The SSL certificate and private key that the recipient should use to authenticate to the
           donor.
         type: TenantMigrationPEMPayload
+        # TODO (SERVER-54085): Remove server parameter tenantMigrationDisableX509Auth.
+        optional: true
 
   donorForgetMigration:
     description: "Parser for the 'donorForgetMigration' command."
     command_name: donorForgetMigration
     strict: true
     namespace: ignored
+    api_version: ""
+    fields:
+      migrationId:
+        description: "Unique identifier for the tenant migration."
+        type: uuid
+
+  donorAbortMigration:
+    description: "Parser for the 'donorAbortMigration' command."
+    command_name: donorAbortMigration
+    strict: true
+    namespace: ignored
+    api_version: ""
     fields:
       migrationId:
         description: "Unique identifier for the tenant migration."

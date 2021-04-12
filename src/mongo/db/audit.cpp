@@ -29,166 +29,268 @@
 
 #include "mongo/db/audit.h"
 
+namespace mongo {
+namespace audit {
+
 #if !MONGO_ENTERPRISE_AUDIT
 
-void mongo::audit::logAuthentication(Client* client,
-                                     StringData mechanism,
-                                     const UserName& user,
-                                     ErrorCodes::Error result) {}
+ImpersonatedClientAttrs::ImpersonatedClientAttrs(Client* client) {}
 
-void mongo::audit::logCommandAuthzCheck(Client* client,
-                                        const OpMsgRequest& cmdObj,
-                                        const CommandInterface& command,
-                                        ErrorCodes::Error result) {}
+void logClientMetadata(Client* client) {
+    invariant(client);
+}
 
-void mongo::audit::logDeleteAuthzCheck(Client* client,
-                                       const NamespaceString& ns,
-                                       const BSONObj& pattern,
-                                       ErrorCodes::Error result) {}
+void logAuthentication(Client* client, const AuthenticateEvent&) {
+    invariant(client);
+}
 
-void mongo::audit::logGetMoreAuthzCheck(Client* client,
-                                        const NamespaceString& ns,
-                                        long long cursorId,
-                                        ErrorCodes::Error result) {}
+void logCommandAuthzCheck(Client* client,
+                          const OpMsgRequest& cmdObj,
+                          const CommandInterface& command,
+                          ErrorCodes::Error result) {
+    invariant(client);
+}
 
-void mongo::audit::logInsertAuthzCheck(Client* client,
-                                       const NamespaceString& ns,
-                                       const BSONObj& insertedObj,
-                                       ErrorCodes::Error result) {}
+void logDeleteAuthzCheck(Client* client,
+                         const NamespaceString& ns,
+                         const BSONObj& pattern,
+                         ErrorCodes::Error result) {
+    invariant(client);
+}
 
-void mongo::audit::logKillCursorsAuthzCheck(Client* client,
-                                            const NamespaceString& ns,
-                                            long long cursorId,
-                                            ErrorCodes::Error result) {}
+void logGetMoreAuthzCheck(Client* client,
+                          const NamespaceString& ns,
+                          long long cursorId,
+                          ErrorCodes::Error result) {
+    invariant(client);
+}
 
-void mongo::audit::logQueryAuthzCheck(Client* client,
-                                      const NamespaceString& ns,
-                                      const BSONObj& query,
-                                      ErrorCodes::Error result) {}
+void logInsertAuthzCheck(Client* client,
+                         const NamespaceString& ns,
+                         const BSONObj& insertedObj,
+                         ErrorCodes::Error result) {
+    invariant(client);
+}
 
-void mongo::audit::logUpdateAuthzCheck(Client* client,
-                                       const NamespaceString& ns,
-                                       const BSONObj& query,
-                                       const write_ops::UpdateModification& update,
-                                       bool isUpsert,
-                                       bool isMulti,
-                                       ErrorCodes::Error result) {}
+void logKillCursorsAuthzCheck(Client* client,
+                              const NamespaceString& ns,
+                              long long cursorId,
+                              ErrorCodes::Error result) {
+    invariant(client);
+}
 
-void mongo::audit::logCreateUser(Client* client,
-                                 const UserName& username,
-                                 bool password,
-                                 const BSONObj* customData,
-                                 const std::vector<RoleName>& roles,
-                                 const boost::optional<BSONArray>& restrictions) {}
+void logQueryAuthzCheck(Client* client,
+                        const NamespaceString& ns,
+                        const BSONObj& query,
+                        ErrorCodes::Error result) {
+    invariant(client);
+}
 
-void mongo::audit::logDropUser(Client* client, const UserName& username) {}
+void logUpdateAuthzCheck(Client* client,
+                         const NamespaceString& ns,
+                         const BSONObj& query,
+                         const write_ops::UpdateModification& update,
+                         bool isUpsert,
+                         bool isMulti,
+                         ErrorCodes::Error result) {
+    invariant(client);
+}
 
-void mongo::audit::logDropAllUsersFromDatabase(Client* client, StringData dbname) {}
+void logCreateUser(Client* client,
+                   const UserName& username,
+                   bool password,
+                   const BSONObj* customData,
+                   const std::vector<RoleName>& roles,
+                   const boost::optional<BSONArray>& restrictions) {
+    invariant(client);
+}
 
-void mongo::audit::logUpdateUser(Client* client,
-                                 const UserName& username,
-                                 bool password,
-                                 const BSONObj* customData,
-                                 const std::vector<RoleName>* roles,
-                                 const boost::optional<BSONArray>& restrictions) {}
+void logDropUser(Client* client, const UserName& username) {
+    invariant(client);
+}
 
-void mongo::audit::logGrantRolesToUser(Client* client,
-                                       const UserName& username,
-                                       const std::vector<RoleName>& roles) {}
+void logDropAllUsersFromDatabase(Client* client, StringData dbname) {
+    invariant(client);
+}
 
-void mongo::audit::logRevokeRolesFromUser(Client* client,
-                                          const UserName& username,
-                                          const std::vector<RoleName>& roles) {}
+void logUpdateUser(Client* client,
+                   const UserName& username,
+                   bool password,
+                   const BSONObj* customData,
+                   const std::vector<RoleName>* roles,
+                   const boost::optional<BSONArray>& restrictions) {
+    invariant(client);
+}
 
-void mongo::audit::logCreateRole(Client* client,
+void logGrantRolesToUser(Client* client,
+                         const UserName& username,
+                         const std::vector<RoleName>& roles) {
+    invariant(client);
+}
+
+void logRevokeRolesFromUser(Client* client,
+                            const UserName& username,
+                            const std::vector<RoleName>& roles) {
+    invariant(client);
+}
+
+void logCreateRole(Client* client,
+                   const RoleName& role,
+                   const std::vector<RoleName>& roles,
+                   const PrivilegeVector& privileges,
+                   const boost::optional<BSONArray>& restrictions) {
+    invariant(client);
+}
+
+void logUpdateRole(Client* client,
+                   const RoleName& role,
+                   const std::vector<RoleName>* roles,
+                   const PrivilegeVector* privileges,
+                   const boost::optional<BSONArray>& restrictions) {
+    invariant(client);
+}
+
+void logDropRole(Client* client, const RoleName& role) {
+    invariant(client);
+}
+
+void logDropAllRolesFromDatabase(Client* client, StringData dbname) {
+    invariant(client);
+}
+
+void logGrantRolesToRole(Client* client, const RoleName& role, const std::vector<RoleName>& roles) {
+}
+
+void logRevokeRolesFromRole(Client* client,
+                            const RoleName& role,
+                            const std::vector<RoleName>& roles) {
+    invariant(client);
+}
+
+void logGrantPrivilegesToRole(Client* client,
+                              const RoleName& role,
+                              const PrivilegeVector& privileges) {
+    invariant(client);
+}
+
+void logRevokePrivilegesFromRole(Client* client,
                                  const RoleName& role,
-                                 const std::vector<RoleName>& roles,
-                                 const PrivilegeVector& privileges,
-                                 const boost::optional<BSONArray>& restrictions) {}
+                                 const PrivilegeVector& privileges) {
+    invariant(client);
+}
 
-void mongo::audit::logUpdateRole(Client* client,
-                                 const RoleName& role,
-                                 const std::vector<RoleName>* roles,
-                                 const PrivilegeVector* privileges,
-                                 const boost::optional<BSONArray>& restrictions) {}
+void logReplSetReconfig(Client* client, const BSONObj* oldConfig, const BSONObj* newConfig) {
+    invariant(client);
+}
 
-void mongo::audit::logDropRole(Client* client, const RoleName& role) {}
+void logApplicationMessage(Client* client, StringData msg) {
+    invariant(client);
+}
 
-void mongo::audit::logDropAllRolesFromDatabase(Client* client, StringData dbname) {}
+void logStartupOptions(Client* client, const BSONObj& startupOptions) {
+    invariant(client);
+}
 
-void mongo::audit::logGrantRolesToRole(Client* client,
-                                       const RoleName& role,
-                                       const std::vector<RoleName>& roles) {}
+void logShutdown(Client* client) {
+    invariant(client);
+}
 
-void mongo::audit::logRevokeRolesFromRole(Client* client,
-                                          const RoleName& role,
-                                          const std::vector<RoleName>& roles) {}
+void logLogout(Client* client,
+               StringData reason,
+               const BSONArray& initialUsers,
+               const BSONArray& updatedUsers) {
+    invariant(client);
+}
 
-void mongo::audit::logGrantPrivilegesToRole(Client* client,
-                                            const RoleName& role,
-                                            const PrivilegeVector& privileges) {}
+void logCreateIndex(Client* client,
+                    const BSONObj* indexSpec,
+                    StringData indexname,
+                    const NamespaceString& nsname,
+                    StringData indexBuildState,
+                    ErrorCodes::Error result) {
+    invariant(client);
+}
 
-void mongo::audit::logRevokePrivilegesFromRole(Client* client,
-                                               const RoleName& role,
-                                               const PrivilegeVector& privileges) {}
+void logCreateCollection(Client* client, const NamespaceString& nsname) {
+    invariant(client);
+}
 
-void mongo::audit::logReplSetReconfig(Client* client,
-                                      const BSONObj* oldConfig,
-                                      const BSONObj* newConfig) {}
+void logCreateView(Client* client,
+                   const NamespaceString& nsname,
+                   StringData viewOn,
+                   BSONArray pipeline,
+                   ErrorCodes::Error code) {
+    invariant(client);
+}
 
-void mongo::audit::logApplicationMessage(Client* client, StringData msg) {}
+void logImportCollection(Client* client, const NamespaceString& nsname) {
+    invariant(client);
+}
 
-void mongo::audit::logStartupOptions(Client* client, const BSONObj& startupOptions) {}
-
-void mongo::audit::logShutdown(Client* client) {}
-
-void mongo::audit::logLogout(Client* client,
-                             StringData reason,
-                             const BSONArray& initialUsers,
-                             const BSONArray& updatedUsers) {}
-
-void mongo::audit::logCreateIndex(Client* client,
-                                  const BSONObj* indexSpec,
-                                  StringData indexname,
-                                  StringData nsname) {}
-
-void mongo::audit::logCreateCollection(Client* client, StringData nsname) {}
-
-void mongo::audit::logCreateView(Client* client,
-                                 StringData nsname,
-                                 StringData viewOn,
-                                 BSONArray pipeline,
-                                 ErrorCodes::Error code) {}
-
-void mongo::audit::logImportCollection(Client* client, StringData nsname) {}
-
-void mongo::audit::logCreateDatabase(Client* client, StringData dbname) {}
+void logCreateDatabase(Client* client, StringData dbname) {
+    invariant(client);
+}
 
 
-void mongo::audit::logDropIndex(Client* client, StringData indexname, StringData nsname) {}
+void logDropIndex(Client* client, StringData indexname, const NamespaceString& nsname) {
+    invariant(client);
+}
 
-void mongo::audit::logDropCollection(Client* client, StringData nsname) {}
+void logDropCollection(Client* client, const NamespaceString& nsname) {
+    invariant(client);
+}
 
-void mongo::audit::logDropDatabase(Client* client, StringData dbname) {}
+void logDropView(Client* client,
+                 const NamespaceString& nsname,
+                 StringData viewOn,
+                 const std::vector<BSONObj>& pipeline,
+                 ErrorCodes::Error code) {
+    invariant(client);
+}
 
-void mongo::audit::logRenameCollection(Client* client, StringData source, StringData target) {}
+void logDropDatabase(Client* client, StringData dbname) {
+    invariant(client);
+}
 
-void mongo::audit::logEnableSharding(Client* client, StringData dbname) {}
+void logRenameCollection(Client* client,
+                         const NamespaceString& source,
+                         const NamespaceString& target) {
+    invariant(client);
+}
 
-void mongo::audit::logAddShard(Client* client,
-                               StringData name,
-                               const std::string& servers,
-                               long long maxSize) {}
+void logEnableSharding(Client* client, StringData dbname) {
+    invariant(client);
+}
 
-void mongo::audit::logRemoveShard(Client* client, StringData shardname) {}
+void logAddShard(Client* client, StringData name, const std::string& servers, long long maxSize) {
+    invariant(client);
+}
 
-void mongo::audit::logShardCollection(Client* client,
-                                      StringData ns,
-                                      const BSONObj& keyPattern,
-                                      bool unique) {}
+void logRemoveShard(Client* client, StringData shardname) {
+    invariant(client);
+}
 
-void mongo::audit::logRefineCollectionShardKey(Client* client,
-                                               StringData ns,
-                                               const BSONObj& keyPattern) {}
+void logShardCollection(Client* client, StringData ns, const BSONObj& keyPattern, bool unique) {
+    invariant(client);
+}
+
+void logRefineCollectionShardKey(Client* client, StringData ns, const BSONObj& keyPattern) {
+    invariant(client);
+}
+
+void logInsertOperation(Client* client, const NamespaceString& nss, const BSONObj& doc) {
+    invariant(client);
+}
+
+void logUpdateOperation(Client* client, const NamespaceString& nss, const BSONObj& doc) {
+    invariant(client);
+}
+
+void logRemoveOperation(Client* client, const NamespaceString& nss, const BSONObj& doc) {
+    invariant(client);
+}
 
 #endif
+
+}  // namespace audit
+}  // namespace mongo

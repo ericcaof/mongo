@@ -7,7 +7,7 @@
  * entire replica set.
  *
  * @tags: [
- *     requires_replication,
+ *   requires_replication,
  * ]
  */
 (function() {

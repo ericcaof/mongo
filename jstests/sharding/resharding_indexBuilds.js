@@ -12,6 +12,7 @@
 
 load("jstests/libs/discover_topology.js");
 load("jstests/sharding/libs/resharding_test_fixture.js");
+load("jstests/sharding/libs/resharding_test_util.js");
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallelTester.js");
 
@@ -36,6 +37,7 @@ const recipientShardNames = reshardingTest.recipientShardNames;
 const topology = DiscoverTopology.findConnectedNodes(mongos);
 const donor_host = topology.shards[donorShardNames[0]].primary;
 const donor0 = new Mongo(donor_host);
+const configsvr = new Mongo(topology.configsvr.nodes[0]);
 
 // Create an inProgress index build.
 const createIndexThread = new Thread(function(host) {
@@ -46,37 +48,28 @@ let createIndexFailpoint = configureFailPoint(donor0, "hangIndexBuildBeforeCommi
 createIndexThread.start();
 createIndexFailpoint.wait();
 
-function assertEventuallyErrorsLocally(shardConn, shardName) {
-    const localDonorOpsCollection =
-        shardConn.getCollection("config.localReshardingOperations.donor");
-
-    assert.soon(
-        () => {
-            return localDonorOpsCollection.findOne({state: "error"}) !== null;
-        },
-        () => {
-            return "donor shard " + shardName + " never transitioned to the error state: " +
-                tojson(localDonorOpsCollection.findOne());
-        });
-}
-
-// In the current implementation, the reshardCollection command won't ever complete if one of the
-// donor or recipient shards encounters an unrecoverable error. To work around this limitation, we
-// verify the recipient shard transitioned itself into the "error" state as a result of the
-// duplicate key error during resharding's collection cloning.
-//
-// TODO SERVER-50584: Remove the call to interruptReshardingThread() from this test and instead
-// directly assert that the reshardCollection command fails with an error.
-reshardingTest.withReshardingInBackground(  //
+let removeDonorDocFailpoint = configureFailPoint(donor0, "removeDonorDocFailpoint");
+reshardingTest.withReshardingInBackground(
     {
         newShardKeyPattern: {newKey: 1},
         newChunks: [{min: {newKey: MinKey}, max: {newKey: MaxKey}, shard: recipientShardNames[0]}],
     },
     () => {
-        assertEventuallyErrorsLocally(donor0, donorShardNames[0]);
-        reshardingTest.interruptReshardingThread();
+        // TODO SERVER-51696: Review if these checks can be made in a cpp unittest instead.
+        ReshardingTestUtil.assertDonorAbortsLocally(
+            donor0,
+            donorShardNames[0],
+            inputCollection.getFullName(),
+            ErrorCodes.BackgroundOperationInProgressForNamespace);
+
+        removeDonorDocFailpoint.off();
+
+        // Note: even though the recipient state machine does not exist by the time the donor
+        // errors, recipients should still acknowledge they saw the coordinator's abort.
+        ReshardingTestUtil.assertAllParticipantsReportDoneToCoordinator(
+            configsvr, inputCollection.getFullName());
     },
-    ErrorCodes.Interrupted);
+    {expectedErrorCode: ErrorCodes.BackgroundOperationInProgressForNamespace});
 
 // Resume index build.
 createIndexFailpoint.off();

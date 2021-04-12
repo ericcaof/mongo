@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2019 MongoDB, Inc.
+ *    Copyright (C) 2019-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -112,6 +112,9 @@ public:
                                                                const OpTime&,
                                                                const WriteConcernOptions&) final;
 
+    SharedSemiFuture<void> awaitReplicationAsyncNoWTimeout(
+        const OpTime& opTime, const WriteConcernOptions& writeConcern) final;
+
     void stepDown(OperationContext*, bool, const Milliseconds&, const Milliseconds&) final;
 
     Status checkIfWriteConcernCanBeSatisfied(const WriteConcernOptions&) const final;
@@ -195,6 +198,8 @@ public:
     Status doReplSetReconfig(OperationContext* opCtx,
                              GetNewConfigFn getNewConfig,
                              bool force) final;
+
+    Status doOptimizedReconfig(OperationContext* opCtx, GetNewConfigFn) final;
 
     Status awaitConfigCommitment(OperationContext* opCtx, bool waitForOplogCommitment) final;
 

@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+import shlex
 import yaml
 
 VERSION_JSON = "version.json"
@@ -94,8 +95,8 @@ def generate_scons_cache_expansions():
                 scons_cache_mode = "nolinked"
 
             if os.getenv("USE_SCONS_CACHE") not in (None, False, "false", ""):
-                expansions["scons_cache_args"] = "--cache={0} --cache-dir='{1}'".format(
-                    scons_cache_mode, default_cache_path)
+                expansions["scons_cache_args"] = "--cache={0} --cache-dir={1}".format(
+                    scons_cache_mode, shlex.quote(default_cache_path))
     return expansions
 
 
@@ -109,7 +110,7 @@ def match_verstr(verstr):
     r2.3.4-git234, r2.3.4-rc0-234-githash If the version is invalid (i.e.
     doesn't start with "2.3.4" or "2.3.4-rc0", this will return False.
     """
-    res = re.match(r'^r?(?:\d+\.\d+\.\d+(?:-rc\d+)?)(-.*)?', verstr)
+    res = re.match(r'^r?(?:\d+\.\d+\.\d+(?:-rc\d+|-alpha\d+)?)(-.*)?', verstr)
     if not res:
         return False
     return res.groups()

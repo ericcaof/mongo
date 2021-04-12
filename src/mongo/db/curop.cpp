@@ -584,6 +584,8 @@ bool CurOp::completeAndLogOperation(OperationContext* opCtx,
             opCtx, (lockerInfo ? &lockerInfo->stats : nullptr), operationMetricsPtr, &attr);
 
         LOGV2_OPTIONS(51803, {component}, "Slow query", attr);
+
+        _checkForFailpointsAfterCommandLogged();
     }
 
     // Return 'true' if this operation should also be added to the profiler.
@@ -592,6 +594,35 @@ bool CurOp::completeAndLogOperation(OperationContext* opCtx,
     if (_dbprofile <= 0)
         return false;
     return shouldProfileAtLevel1;
+}
+
+// Failpoints after commands are logged.
+constexpr auto kPrepareTransactionCmdName = "prepareTransaction"_sd;
+MONGO_FAIL_POINT_DEFINE(waitForPrepareTransactionCommandLogged);
+constexpr auto kHelloCmdName = "hello"_sd;
+MONGO_FAIL_POINT_DEFINE(waitForHelloCommandLogged);
+constexpr auto kIsMasterCmdName = "isMaster"_sd;
+MONGO_FAIL_POINT_DEFINE(waitForIsMasterCommandLogged);
+
+void CurOp::_checkForFailpointsAfterCommandLogged() {
+    if (!isCommand() || !getCommand()) {
+        return;
+    }
+
+    auto cmdName = getCommand()->getName();
+    if (cmdName == kPrepareTransactionCmdName) {
+        if (MONGO_unlikely(waitForPrepareTransactionCommandLogged.shouldFail())) {
+            LOGV2(31481, "waitForPrepareTransactionCommandLogged failpoint enabled");
+        }
+    } else if (cmdName == kHelloCmdName) {
+        if (MONGO_unlikely(waitForHelloCommandLogged.shouldFail())) {
+            LOGV2(31482, "waitForHelloCommandLogged failpoint enabled");
+        }
+    } else if (cmdName == kIsMasterCmdName) {
+        if (MONGO_unlikely(waitForIsMasterCommandLogged.shouldFail())) {
+            LOGV2(31483, "waitForIsMasterCommandLogged failpoint enabled");
+        }
+    }
 }
 
 Command::ReadWriteType CurOp::getReadWriteType() const {
@@ -1238,7 +1269,7 @@ void OpDebug::append(OperationContext* opCtx,
         b.append("remoteOpWaitMillis", durationCount<Milliseconds>(*remoteOpWaitTime));
     }
 
-    b.appendIntOrLL("millis", durationCount<Milliseconds>(executionTime));
+    b.appendNumber("millis", durationCount<Milliseconds>(executionTime));
 
     if (!curop.getPlanSummary().empty()) {
         b.append("planSummary", curop.getPlanSummary());
@@ -1515,10 +1546,10 @@ std::function<BSONObj(ProfileFilter::Args)> OpDebug::appendStaged(StringSet requ
     // the profiler (OpDebug::append) and the log file (OpDebug::report), so for the profile filter
     // we support both names.
     addIfNeeded("millis", [](auto field, auto args, auto& b) {
-        b.appendIntOrLL(field, durationCount<Milliseconds>(args.op.executionTime));
+        b.appendNumber(field, durationCount<Milliseconds>(args.op.executionTime));
     });
     addIfNeeded("durationMillis", [](auto field, auto args, auto& b) {
-        b.appendIntOrLL(field, durationCount<Milliseconds>(args.op.executionTime));
+        b.appendNumber(field, durationCount<Milliseconds>(args.op.executionTime));
     });
 
     addIfNeeded("planSummary", [](auto field, auto args, auto& b) {

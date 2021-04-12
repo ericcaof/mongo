@@ -41,15 +41,44 @@ namespace mongo::stage_builder {
  * parameter specifies the input slot the filter should use. The 'relevantSlotsIn' parameter
  * specifies the slots produced by the 'stage' subtree that must remain visible to consumers of
  * the tree returned by this function.
+ * Optional slot returned by this function stores index of array element that matches the 'root'
+ * match expression. The role of this slot is to be a replacement of 'MatchDetails::elemMatchKey()'.
+ * If 'trackIndex' is true and 'root' contains match expression with array semantics (there are
+ * certain predicates that do not, such as '{}'), valid slot id is returned. This slot is pointing
+ * to an optional value of type int32. Otherwise, 'boost::none' is returned.
+ * If match expression found matching array element, value behind slot id is an int32 array index.
+ * Otherwise, it is Nothing.
  */
-std::unique_ptr<sbe::PlanStage> generateFilter(OperationContext* opCtx,
-                                               const MatchExpression* root,
-                                               std::unique_ptr<sbe::PlanStage> stage,
-                                               sbe::value::SlotIdGenerator* slotIdGenerator,
-                                               sbe::value::FrameIdGenerator* frameIdGenerator,
-                                               sbe::value::SlotId inputSlotIn,
-                                               sbe::RuntimeEnvironment* env,
-                                               sbe::value::SlotVector relevantSlotsIn,
-                                               PlanNodeId planNodeId);
+std::pair<boost::optional<sbe::value::SlotId>, std::unique_ptr<sbe::PlanStage>> generateFilter(
+    OperationContext* opCtx,
+    const MatchExpression* root,
+    std::unique_ptr<sbe::PlanStage> stage,
+    sbe::value::SlotIdGenerator* slotIdGenerator,
+    sbe::value::FrameIdGenerator* frameIdGenerator,
+    sbe::value::SlotId inputSlotIn,
+    sbe::RuntimeEnvironment* env,
+    sbe::value::SlotVector relevantSlotsIn,
+    PlanNodeId planNodeId,
+    bool trackIndex = false);
 
+/**
+ * Similar to 'generateFilter' but used to generate a PlanStage sub-tree implementing a filter
+ * attached to an 'IndexScan' QSN. It differs from 'generateFilter' in the following way:
+ *  - Instead of a single input slot it takes 'keyFields' and 'keySlots' vectors representing a
+ *    subset of the fields of the index key pattern that are depended on to evaluate the predicate,
+ *    and corresponding slots for each of the fields.
+ *  - It cannot track and returned an index of a matching element within an array, because index
+ *    keys cannot contain an array. As such, this function doesn't take a 'trackIndex' parameter
+ *    and doesn't return an optional SLotId holding the index of a matching array element.
+ */
+std::unique_ptr<sbe::PlanStage> generateIndexFilter(OperationContext* opCtx,
+                                                    const MatchExpression* root,
+                                                    std::unique_ptr<sbe::PlanStage> stage,
+                                                    sbe::value::SlotIdGenerator* slotIdGenerator,
+                                                    sbe::value::FrameIdGenerator* frameIdGenerator,
+                                                    sbe::value::SlotVector keySlots,
+                                                    std::vector<std::string> keyFields,
+                                                    sbe::RuntimeEnvironment* env,
+                                                    sbe::value::SlotVector relevantSlots,
+                                                    PlanNodeId planNodeId);
 }  // namespace mongo::stage_builder

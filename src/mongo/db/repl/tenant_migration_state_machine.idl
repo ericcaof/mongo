@@ -29,6 +29,7 @@ global:
     cpp_namespace: "mongo"
     cpp_includes:
         - "mongo/client/read_preference.h"
+        - "mongo/db/commands/feature_compatibility_version_parser.h"
         - "mongo/db/repl/tenant_migration_util.h"
 
 imports:
@@ -43,6 +44,7 @@ enums:
         type: string
         values:
             kUninitialized: "uninitialized"
+            kAbortingIndexBuilds: "aborting index builds"
             kDataSync: "data sync"
             kBlocking: "blocking"
             kCommitted: "committed"
@@ -72,7 +74,7 @@ structs:
                     The URI string that the donor will utilize to create a connection with
                     the recipient.
                 validator:
-                    callback: "validateConnectionString"
+                    callback: "tenant_migration_util::validateConnectionString"
             readPreference:
                 type: readPreference
                 description: >-
@@ -98,7 +100,7 @@ structs:
                     or 'aborted'.
                 optional: true
             abortReason:
-                type: object
+                type: object_owned
                 description: "The error that caused the migration to abort."
                 optional: true
             expireAt:
@@ -112,11 +114,29 @@ structs:
                     The SSL certificate and private key that the donor should use to authenticate
                     to the recipient.
                 type: TenantMigrationPEMPayload
+                # TODO (SERVER-54085): Remove server parameter tenantMigrationDisableX509Auth.
+                optional: true
             recipientCertificateForDonor:
                 description: >-
                     The SSL certificate and private key that the recipient should use to
                     authenticate to the donor.
                 type: TenantMigrationPEMPayload
+                # TODO (SERVER-54085): Remove server parameter tenantMigrationDisableX509Auth.
+                optional: true
+            startMigrationDonorTimestamp:
+                type: timestamp
+                optional: true
+                description: >-
+                    Timestamp after all index builds for tenant are complete or aborted.  Recipient
+                    must not start cloning/fetching oplog entries from the donor until this
+                    timestamp is majority committed.
+                validator:
+                    callback: "tenant_migration_util::validateTimestampNotNull"
+            migrationStart:
+                type: date
+                description: >-
+                    The wall-clock time at which the migration has started.
+                optional: true
 
     tenantMigrationRecipientDocument:
         description: "Represents an in-progress tenant migration on the migration recipient."
@@ -132,12 +152,20 @@ structs:
                     The URI string that the recipient will utilize to create a connection
                     with the donor.
                 validator:
-                    callback: "validateConnectionString"
+                    callback: "tenant_migration_util::validateConnectionString"
             tenantId:
                 type: string
                 description: "The tenantId for the migration."
                 validator:
-                    callback: "validateDatabasePrefix"
+                    callback: "tenant_migration_util::validateDatabasePrefix"
+            startMigrationDonorTimestamp:
+                type: timestamp
+                description: >-
+                    Timestamp after all index builds for tenant are complete or aborted.  Recipient
+                    must not start cloning/fetching oplog entries from the donor until this
+                    timestamp is majority committed.
+                validator:
+                    callback: "tenant_migration_util::validateTimestampNotNull"
             readPreference:
                 type: readPreference
                 description: >-
@@ -171,6 +199,14 @@ structs:
                     cloning finishes.
                 type: optime
                 optional: true
+            rejectReadsBeforeTimestamp:
+                description: >-
+                    Populated during data sync when the recipientSyncData with the
+                    returnAfterReachingTimestamp is received after data is consistent; the earliest
+                    timestamp at which reads are allowed on the recipient (corresponds to the
+                    donor's blockTimestamp).
+                type: timestamp
+                optional: true
             cloneFinishedRecipientOpTime:
                 description: >-
                     Populated during data sync; the recipient operation time when the data
@@ -182,3 +218,41 @@ structs:
                     The SSL certificate and private key that the recipient should use to
                     authenticate to the donor.
                 type: TenantMigrationPEMPayload
+                # TODO (SERVER-54085): Remove server parameter tenantMigrationDisableX509Auth.
+                optional: true
+            recipientPrimaryStartingFCV:
+                description: >-
+                    The featureCompatibilityVersion of the recipient as recorded at the beginning
+                    of a migration attempt. Implicitly includes information on current upgrade or
+                    downgrade state.
+                type: fcv_string
+                optional: true
+            numRestartsDueToDonorConnectionFailure:
+                description: >-
+                    A counter that is incremented on each restart due to a donor connection failure.
+                type: long
+                default: 0
+            numRestartsDueToRecipientFailure:
+                description: >-
+                    A counter that is incremented on each restart due to a recipient failure.
+                type: long
+                default: 0
+            completedUpdatingTransactionsBeforeStartOpTime:
+                description: >-
+                    Indicates if the recipient has finished updating transaction entries that were
+                    committed before 'startFetchingDonorOpTime'. If true, the recipient can skip
+                    the fetching transactions stage.
+                type: bool
+                default: false
+            completedFetchingRetryableWritesBeforeStartOpTime:
+                description: >-
+                    Indicates if the recipient has finished fetching retryable writes oplog entries
+                    before 'startFetchingDonorOpTime' for each retryable writes entry in
+                    'config.transactions'
+                type: bool
+                default: false
+            startAt:
+                type: date
+                description: >-
+                    The wall-clock time at which the state machine document is initialized.
+                optional: true

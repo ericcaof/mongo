@@ -1,8 +1,5 @@
 // Test that we correct return results for compound 2d and 2dsphere indices in
 // both the multikey and non-multikey cases.
-// @tags: [
-//   sbe_incompatible,
-// ]
 
 var t = db.jstests_multikey_geonear;
 t.drop();
@@ -72,4 +69,14 @@ t.insert({_id: 1, a: [{b: [1, 1]}, {c: 1}]});
 t.insert({_id: 2, a: [{b: [2, 2]}, {c: 2}]});
 
 cursor = t.find({"a.b": {$near: [2, 2]}, "a.c": {$gte: 0}});
+checkResults(cursor);
+
+// Check the case where we create a geo index on a specific array index.
+t.drop();
+t.createIndex({"a.0": "2dsphere"});
+t.insert({_id: 0, a: [{type: "Point", coordinates: [0, 0]}]});
+t.insert({_id: 1, a: [{type: "Point", coordinates: [1, 1]}]});
+t.insert({_id: 2, a: {0: {type: "Point", coordinates: [2, 2]}}});
+
+cursor = t.find({"a.0": {$near: {$geometry: {type: "Point", coordinates: [2, 2]}}}});
 checkResults(cursor);

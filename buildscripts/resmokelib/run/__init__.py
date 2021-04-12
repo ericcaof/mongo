@@ -7,13 +7,12 @@ import os
 import os.path
 import random
 import shlex
-import subprocess
 import sys
-import tarfile
 import time
+import shutil
 
+import curatorbin
 import pkg_resources
-import requests
 
 try:
     import grpc_tools.protoc
@@ -33,10 +32,10 @@ from buildscripts.resmokelib import testing
 from buildscripts.resmokelib import utils
 from buildscripts.resmokelib.core import process
 from buildscripts.resmokelib.core import jasper_process
-from buildscripts.resmokelib.core import redirect as redirect_lib
 from buildscripts.resmokelib.plugin import PluginInterface, Subcommand
 
 _INTERNAL_OPTIONS_TITLE = "Internal Options"
+_MONGODB_SERVER_OPTIONS_TITLE = "MongoDB Server Options"
 _BENCHMARK_ARGUMENT_TITLE = "Benchmark/Benchrun test options"
 _EVERGREEN_ARGUMENT_TITLE = "Evergreen options"
 _CEDAR_ARGUMENT_TITLE = "Cedar options"
@@ -123,6 +122,8 @@ class TestRunner(Subcommand):  # pylint: disable=too-many-instance-attributes
             # self._exit_logging() may never return when the log output is incomplete.
             # Our workaround is to call os._exit().
             self._exit_logging()
+            if config.SPAWN_USING == "jasper":
+                self._exit_jasper()
 
     def list_suites(self):
         """List the suites that are available to execute."""
@@ -168,6 +169,18 @@ class TestRunner(Subcommand):  # pylint: disable=too-many-instance-attributes
         self._resmoke_logger.info("verbatim resmoke.py invocation: %s",
                                   " ".join([shlex.quote(arg) for arg in sys.argv]))
 
+        if config.EVERGREEN_TASK_DOC:
+            self._resmoke_logger.info("Evergreen task documentation:\n%s",
+                                      config.EVERGREEN_TASK_DOC)
+        elif config.EVERGREEN_TASK_NAME:
+            self._resmoke_logger.info("Evergreen task documentation is absent for this task.")
+            task_name = utils.get_task_name_without_suffix(config.EVERGREEN_TASK_NAME,
+                                                           config.EVERGREEN_VARIANT_NAME)
+            self._resmoke_logger.info(
+                "If you are familiar with the functionality of %s task, "
+                "please consider adding documentation for it in %s", task_name,
+                os.path.join(config.CONFIG_DIR, "evg_task_doc", "evg_task_doc.yml"))
+
         if config.FUZZ_MONGOD_CONFIGS:
             local_args = to_local_args()
             local_args = strip_fuzz_config_params(local_args)
@@ -205,8 +218,6 @@ class TestRunner(Subcommand):  # pylint: disable=too-many-instance-attributes
             exit_code = max(suite.return_code for suite in suites)
             self.exit(exit_code)
         finally:
-            if config.SPAWN_USING == "jasper":
-                self._exit_jasper()
             self._exit_archival()
             if suites:
                 reportfile.write(suites)
@@ -268,6 +279,7 @@ class TestRunner(Subcommand):  # pylint: disable=too-many-instance-attributes
                                suite.test_kind, suite.get_display_name(), config.RANDOM_SEED)
         random.shuffle(suite.tests)
 
+    # pylint: disable=inconsistent-return-statements
     def _get_suites(self):
         """Return the list of suites for this resmoke invocation."""
         try:
@@ -310,94 +322,17 @@ class TestRunner(Subcommand):  # pylint: disable=too-many-instance-attributes
         if self._archive and not self._interrupted:
             self._archive.exit()
 
-    # pylint: disable=too-many-instance-attributes,too-many-statements,too-many-locals
-    def _get_jasper_reqs(self):
-        """Ensure that we have all requirements for running jasper."""
-        root_dir = os.getcwd()
-        proto_file = os.path.join(root_dir, "buildscripts", "resmokelib", "core", "jasper.proto")
-        if not os.path.exists(proto_file):
-            raise RuntimeError("Resmoke must be run from the root of the mongo repo.")
-
-        try:
-            well_known_protos_include = pkg_resources.resource_filename("grpc_tools", "_proto")
-        except ImportError:
-            raise ImportError("You must run: sys.executable + '-m pip install grpcio grpcio-tools "
-                              "googleapis-common-protos' to use --spawnUsing=jasper.")
-
-        # We use the build/ directory as the output directory because the generated files aren't
-        # meant to because tracked by git or linted.
-        proto_out = os.path.join(root_dir, "build", "jasper")
-
-        utils.rmtree(proto_out, ignore_errors=True)
-        os.makedirs(proto_out)
-
-        # We make 'proto_out' into a Python package so we can add it to 'sys.path' and import the
-        # *pb2*.py modules from it.
-        with open(os.path.join(proto_out, "__init__.py"), "w"):
-            pass
-
-        ret = grpc_tools.protoc.main([
-            grpc_tools.protoc.__file__,
-            "--grpc_python_out",
-            proto_out,
-            "--python_out",
-            proto_out,
-            "--proto_path",
-            os.path.dirname(proto_file),
-            "--proto_path",
-            well_known_protos_include,
-            os.path.basename(proto_file),
-        ])
-
-        if ret != 0:
-            raise RuntimeError("Failed to generated gRPC files from the jasper.proto file")
-
-        sys.path.extend([os.path.dirname(proto_out), proto_out])
-
-        curator_path = "build/curator"
-        if sys.platform == "win32":
-            curator_path += ".exe"
-        git_hash = "d11f83290729dc42138af106fe01bc0714c24a8b"
-        curator_exists = os.path.isfile(curator_path)
-        curator_same_version = False
-        if curator_exists:
-            curator_version = subprocess.check_output([curator_path,
-                                                       "--version"]).decode('utf-8').split()
-            curator_same_version = git_hash in curator_version
-
-        if curator_exists and not curator_same_version:
-            os.remove(curator_path)
-            self._resmoke_logger.info(
-                "Found a different version of curator. Downloading version %s of curator to enable"
-                "process management using jasper.", git_hash)
-
-        if not curator_exists or not curator_same_version:
-            if sys.platform == "darwin":
-                os_platform = "macos"
-            elif sys.platform == "win32":
-                os_platform = "windows-64"
-            elif sys.platform.startswith("linux"):
-                os_platform = "ubuntu1604"
-            else:
-                raise OSError("Unrecognized platform. "
-                              "This program is meant to be run on MacOS, Windows, or Linux.")
-            url = ("https://s3.amazonaws.com/boxes.10gen.com/build/curator/"
-                   "curator-dist-%s-%s.tar.gz") % (os_platform, git_hash)
-            response = requests.get(url, stream=True)
-            with tarfile.open(mode="r|gz", fileobj=response.raw) as tf:
-                tf.extractall(path="./build/")
-
-        return curator_path
-
     def _setup_jasper(self):
         """Start up the jasper process manager."""
-        curator_path = self._get_jasper_reqs()
+        curator_path = _get_jasper_reqs()
 
         from jasper import jasper_pb2
         from jasper import jasper_pb2_grpc
 
         jasper_process.Process.pb = jasper_pb2
         jasper_process.Process.rpc = jasper_pb2_grpc
+        logging.jasper_logger.JasperHandler.pb = jasper_pb2
+        logging.jasper_logger.JasperHandler.rpc = jasper_pb2_grpc
 
         jasper_port = config.BASE_PORT - 1
         jasper_conn_str = "localhost:%d" % jasper_port
@@ -421,6 +356,55 @@ class TestRunner(Subcommand):  # pylint: disable=too-many-instance-attributes
         self._exit_code = exit_code
         self._resmoke_logger.info("Exiting with code: %d", exit_code)
         sys.exit(exit_code)
+
+
+# pylint: disable=too-many-instance-attributes,too-many-statements,too-many-locals
+def _get_jasper_reqs():
+    """Ensure that we have all requirements for running jasper."""
+    root_dir = os.getcwd()
+    proto_file = os.path.join(root_dir, "buildscripts", "resmokelib", "core", "jasper.proto")
+    if not os.path.exists(proto_file):
+        raise RuntimeError("Resmoke must be run from the root of the mongo repo.")
+
+    try:
+        well_known_protos_include = pkg_resources.resource_filename("grpc_tools", "_proto")
+    except ImportError:
+        raise ImportError("You must run: sys.executable + '-m pip install grpcio grpcio-tools "
+                          "googleapis-common-protos' to use --spawnUsing=jasper.")
+
+    # We use the build/ directory as the output directory because the generated files aren't
+    # meant to because tracked by git or linted.
+    proto_out = os.path.join(root_dir, "build", "jasper")
+
+    shutil.rmtree(proto_out, ignore_errors=True)
+    os.makedirs(proto_out)
+
+    # We make 'proto_out' into a Python package so we can add it to 'sys.path' and import the
+    # *pb2*.py modules from it.
+    with open(os.path.join(proto_out, "__init__.py"), "w"):
+        pass
+
+    ret = grpc_tools.protoc.main([
+        grpc_tools.protoc.__file__,
+        "--grpc_python_out",
+        proto_out,
+        "--python_out",
+        proto_out,
+        "--proto_path",
+        os.path.dirname(proto_file),
+        "--proto_path",
+        well_known_protos_include,
+        os.path.basename(proto_file),
+    ])
+
+    if ret != 0:
+        raise RuntimeError("Failed to generated gRPC files from the jasper.proto file")
+
+    sys.path.extend([os.path.dirname(proto_out), proto_out])
+
+    curator_path = curatorbin.get_curator_path()
+
+    return curator_path
 
 
 _TagInfo = collections.namedtuple("_TagInfo", ["tag_name", "evergreen_aware", "suite_options"])
@@ -627,11 +611,6 @@ class RunPlugin(PluginInterface):
         parser.add_argument("--continueOnFailure", action="store_true", dest="continue_on_failure",
                             help="Executes all tests in all suites, even if some of them fail.")
 
-        parser.add_argument(
-            "--dbpathPrefix", dest="dbpath_prefix", metavar="PATH",
-            help=("The directory which will contain the dbpaths of any mongod's started"
-                  " by resmoke.py or the tests themselves."))
-
         parser.add_argument("--dbtest", dest="dbtest_executable", metavar="PATH",
                             help="The path to the dbtest executable for resmoke to use.")
 
@@ -677,35 +656,6 @@ class RunPlugin(PluginInterface):
                   " own MongoDB deployment to dispatch tests to."))
 
         parser.set_defaults(logger_file="console")
-
-        parser.add_argument("--mongo", dest="mongo_executable", metavar="PATH",
-                            help="The path to the mongo shell executable for resmoke.py to use.")
-
-        parser.add_argument("--mongod", dest="mongod_executable", metavar="PATH",
-                            help="The path to the mongod executable for resmoke.py to use.")
-
-        parser.add_argument("--fuzzMongodConfigs", dest="fuzz_mongod_configs", action="store_true",
-                            help="Will randomly choose storage configs that were not specified.")
-
-        parser.add_argument("--configFuzzSeed", dest="config_fuzz_seed", metavar="PATH",
-                            help="Sets the seed used by storage config fuzzer")
-
-        parser.add_argument(
-            "--mongodSetParameters", dest="mongod_set_parameters", action="append",
-            metavar="{key1: value1, key2: value2, ..., keyN: valueN}",
-            help=("Passes one or more --setParameter options to all mongod processes"
-                  " started by resmoke.py. The argument is specified as bracketed YAML -"
-                  " i.e. JSON with support for single quoted and unquoted keys."))
-
-        parser.add_argument("--mongos", dest="mongos_executable", metavar="PATH",
-                            help="The path to the mongos executable for resmoke.py to use.")
-
-        parser.add_argument(
-            "--mongosSetParameters", dest="mongos_set_parameters", action="append",
-            metavar="{key1: value1, key2: value2, ..., keyN: valueN}",
-            help=("Passes one or more --setParameter options to all mongos processes"
-                  " started by resmoke.py. The argument is specified as bracketed YAML -"
-                  " i.e. JSON with support for single quoted and unquoted keys."))
 
         parser.add_argument(
             "--mongocryptdSetParameters", dest="mongocryptd_set_parameters", action="append",
@@ -767,8 +717,8 @@ class RunPlugin(PluginInterface):
             help=("Seed for the random number generator. Useful in combination with the"
                   " --shuffle option for producing a consistent test execution order."))
 
-        parser.add_argument("--transportLayer", dest="transport_layer", metavar="TRANSPORT",
-                            help="The transport layer used by jstests")
+        parser.add_argument("--mongo", dest="mongo_executable", metavar="PATH",
+                            help="The path to the mongo shell executable for resmoke.py to use.")
 
         parser.add_argument("--shellReadMode", action="store", dest="shell_read_mode",
                             choices=("commands", "compatibility", "legacy"), metavar="READ_MODE",
@@ -789,49 +739,6 @@ class RunPlugin(PluginInterface):
             help=("Controls whether to randomize the order in which tests are executed."
                   " Defaults to auto when not supplied. auto enables randomization in"
                   " all cases except when the number of jobs requested is 1."))
-
-        parser.add_argument(
-            "--majorityReadConcern", action="store", dest="majority_read_concern", choices=("on",
-                                                                                            "off"),
-            metavar="ON|OFF", help=("Enable or disable majority read concern support."
-                                    " Defaults to %%default."))
-
-        parser.add_argument("--flowControl", action="store", dest="flow_control", choices=("on",
-                                                                                           "off"),
-                            metavar="ON|OFF", help=("Enable or disable flow control."))
-
-        parser.add_argument("--flowControlTicketOverride", type=int, action="store",
-                            dest="flow_control_tickets", metavar="TICKET_OVERRIDE",
-                            help=("Number of tickets available for flow control."))
-
-        parser.add_argument("--storageEngine", dest="storage_engine", metavar="ENGINE",
-                            help="The storage engine used by dbtests and jstests.")
-
-        parser.add_argument(
-            "--storageEngineCacheSizeGB", dest="storage_engine_cache_size_gb", metavar="CONFIG",
-            help="Sets the storage engine cache size configuration"
-            " setting for all mongod's.")
-
-        parser.add_argument(
-            "--numReplSetNodes", type=int, dest="num_replset_nodes", metavar="N",
-            help="The number of nodes to initialize per ReplicaSetFixture. This is also "
-            "used to indicate the number of replica set members per shard in a "
-            "ShardedClusterFixture.")
-
-        parser.add_argument("--numShards", type=int, dest="num_shards", metavar="N",
-                            help="The number of shards to use in a ShardedClusterFixture.")
-
-        parser.add_argument(
-            "--wiredTigerCollectionConfigString", dest="wt_coll_config", metavar="CONFIG",
-            help="Sets the WiredTiger collection configuration setting for all mongod's.")
-
-        parser.add_argument(
-            "--wiredTigerEngineConfigString", dest="wt_engine_config", metavar="CONFIG",
-            help="Sets the WiredTiger engine configuration setting for all mongod's.")
-
-        parser.add_argument(
-            "--wiredTigerIndexConfigString", dest="wt_index_config", metavar="CONFIG",
-            help="Sets the WiredTiger index configuration setting for all mongod's.")
 
         parser.add_argument(
             "--executor", dest="executor_file",
@@ -872,6 +779,105 @@ class RunPlugin(PluginInterface):
             metavar="FILE", help=
             "Have resmoke redirect all output to FILE. Additionally, stdout will contain lines that typically indicate that the test is making progress, or an error has happened. If `mrlog` is in the path it will be used. `tee` and `egrep` must be in the path."
         )
+
+        parser.add_argument(
+            "--runAllFeatureFlagTests", dest="run_all_feature_flag_tests", action="store_true",
+            help=
+            "Run MongoDB servers with all feature flags enabled and only run tests tags with these feature flags"
+        )
+
+        parser.add_argument("--additionalFeatureFlags", dest="additional_feature_flags",
+                            action="append", metavar="featureFlag1, featureFlag2, ...",
+                            help="Additional feature flags")
+
+        mongodb_server_options = parser.add_argument_group(
+            title=_MONGODB_SERVER_OPTIONS_TITLE,
+            description=("Options related to starting a MongoDB cluster that are forwarded from"
+                         " resmoke.py to the fixture."))
+
+        mongodb_server_options.add_argument(
+            "--mongod", dest="mongod_executable", metavar="PATH",
+            help="The path to the mongod executable for resmoke.py to use.")
+
+        mongodb_server_options.add_argument(
+            "--mongos", dest="mongos_executable", metavar="PATH",
+            help="The path to the mongos executable for resmoke.py to use.")
+
+        mongodb_server_options.add_argument(
+            "--mongodSetParameters", dest="mongod_set_parameters", action="append",
+            metavar="{key1: value1, key2: value2, ..., keyN: valueN}",
+            help=("Passes one or more --setParameter options to all mongod processes"
+                  " started by resmoke.py. The argument is specified as bracketed YAML -"
+                  " i.e. JSON with support for single quoted and unquoted keys."))
+
+        mongodb_server_options.add_argument(
+            "--mongosSetParameters", dest="mongos_set_parameters", action="append",
+            metavar="{key1: value1, key2: value2, ..., keyN: valueN}",
+            help=("Passes one or more --setParameter options to all mongos processes"
+                  " started by resmoke.py. The argument is specified as bracketed YAML -"
+                  " i.e. JSON with support for single quoted and unquoted keys."))
+
+        mongodb_server_options.add_argument(
+            "--dbpathPrefix", dest="dbpath_prefix", metavar="PATH",
+            help=("The directory which will contain the dbpaths of any mongod's started"
+                  " by resmoke.py or the tests themselves."))
+
+        mongodb_server_options.add_argument(
+            "--majorityReadConcern", action="store", dest="majority_read_concern", choices=("on",
+                                                                                            "off"),
+            metavar="ON|OFF", help=("Enable or disable majority read concern support."
+                                    " Defaults to %%default."))
+
+        mongodb_server_options.add_argument("--flowControl", action="store", dest="flow_control",
+                                            choices=("on", "off"), metavar="ON|OFF",
+                                            help=("Enable or disable flow control."))
+
+        mongodb_server_options.add_argument("--flowControlTicketOverride", type=int, action="store",
+                                            dest="flow_control_tickets", metavar="TICKET_OVERRIDE",
+                                            help=("Number of tickets available for flow control."))
+
+        mongodb_server_options.add_argument("--storageEngine", dest="storage_engine",
+                                            metavar="ENGINE",
+                                            help="The storage engine used by dbtests and jstests.")
+
+        mongodb_server_options.add_argument(
+            "--storageEngineCacheSizeGB", dest="storage_engine_cache_size_gb", metavar="CONFIG",
+            help="Sets the storage engine cache size configuration"
+            " setting for all mongod's.")
+
+        mongodb_server_options.add_argument(
+            "--numReplSetNodes", type=int, dest="num_replset_nodes", metavar="N",
+            help="The number of nodes to initialize per ReplicaSetFixture. This is also "
+            "used to indicate the number of replica set members per shard in a "
+            "ShardedClusterFixture.")
+
+        mongodb_server_options.add_argument(
+            "--numShards", type=int, dest="num_shards", metavar="N",
+            help="The number of shards to use in a ShardedClusterFixture.")
+
+        mongodb_server_options.add_argument(
+            "--wiredTigerCollectionConfigString", dest="wt_coll_config", metavar="CONFIG",
+            help="Sets the WiredTiger collection configuration setting for all mongod's.")
+
+        mongodb_server_options.add_argument(
+            "--wiredTigerEngineConfigString", dest="wt_engine_config", metavar="CONFIG",
+            help="Sets the WiredTiger engine configuration setting for all mongod's.")
+
+        mongodb_server_options.add_argument(
+            "--wiredTigerIndexConfigString", dest="wt_index_config", metavar="CONFIG",
+            help="Sets the WiredTiger index configuration setting for all mongod's.")
+
+        mongodb_server_options.add_argument("--transportLayer", dest="transport_layer",
+                                            metavar="TRANSPORT",
+                                            help="The transport layer used by jstests")
+
+        mongodb_server_options.add_argument(
+            "--fuzzMongodConfigs", dest="fuzz_mongod_configs", action="store_true",
+            help="Will randomly choose storage configs that were not specified.")
+
+        mongodb_server_options.add_argument("--configFuzzSeed", dest="config_fuzz_seed",
+                                            metavar="PATH",
+                                            help="Sets the seed used by storage config fuzzer")
 
         internal_options = parser.add_argument_group(
             title=_INTERNAL_OPTIONS_TITLE,
@@ -922,10 +928,21 @@ class RunPlugin(PluginInterface):
             metavar="ON|OFF", help=("Enables or disables the stagger of launching resmoke jobs."
                                     " Defaults to %%default."))
 
+        internal_options.add_argument(
+            "--exportMongodConfig", dest="export_mongod_config", choices=("off", "regular",
+                                                                          "detailed"),
+            help=("Exports a yaml containing the history of each mongod config option to"
+                  " {nodeName}_config.yml."
+                  " Defaults to 'off'. A 'detailed' export will include locations of accesses."))
+
         evergreen_options = parser.add_argument_group(
             title=_EVERGREEN_ARGUMENT_TITLE, description=(
                 "Options used to propagate information about the Evergreen task running this"
                 " script."))
+
+        evergreen_options.add_argument("--evergreenURL", dest="evergreen_url",
+                                       metavar="EVERGREEN_URL",
+                                       help=("The URL of the Evergreen service."))
 
         evergreen_options.add_argument(
             "--archiveLimitMb", type=int, dest="archive_limit_mb", metavar="ARCHIVE_LIMIT_MB",
@@ -1136,10 +1153,14 @@ def to_local_args(input_args=None):  # pylint: disable=too-many-branches,too-man
             if not hasattr(parsed_args, arg_dest):
                 continue
             # Skip any evergreen centric args.
-            elif group.title in [_INTERNAL_OPTIONS_TITLE, _EVERGREEN_ARGUMENT_TITLE]:
+            elif group.title in [
+                    _INTERNAL_OPTIONS_TITLE, _EVERGREEN_ARGUMENT_TITLE, _CEDAR_ARGUMENT_TITLE
+            ]:
                 continue
-            # Keep these args.
-            elif group.title == 'optional arguments':
+            elif group.title == 'positional arguments':
+                positional_args.extend(arg_value)
+            # Keep all remaining args.
+            else:
                 arg_name = action.option_strings[-1]
 
                 # If an option has the same value as the default, we don't need to specify it.
@@ -1162,8 +1183,6 @@ def to_local_args(input_args=None):  # pylint: disable=too-many-branches,too-man
                         storage_engine_arg = arg
                     else:
                         other_local_args.append(arg)
-            elif group.title == 'positional arguments':
-                positional_args.extend(arg_value)
 
     return ["run"] + [arg for arg in (suites_arg, storage_engine_arg) if arg is not None
                       ] + other_local_args + positional_args

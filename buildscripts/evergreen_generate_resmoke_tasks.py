@@ -23,10 +23,10 @@ import requests
 import structlog
 import yaml
 
-from evergreen.api import EvergreenApi, RetryingEvergreenApi
 from pydantic.main import BaseModel
 
 from shrub.v2 import Task, TaskDependency, BuildVariant, ExistingTask, ShrubProject
+from evergreen.api import EvergreenApi, RetryingEvergreenApi
 
 # Get relative imports to work when the package is not installed on the PYTHONPATH.
 if __name__ == "__main__" and __package__ is None:
@@ -754,7 +754,7 @@ class EvergreenConfigGenerator(object):
 
     def _get_dependencies(self) -> Set[TaskDependency]:
         """Get the set of dependency tasks for these suites."""
-        dependencies = {TaskDependency("compile")}
+        dependencies = {TaskDependency("archive_dist_test_debug")}
         if not self.options.is_patch:
             # Don"t worry about task dependencies in patch builds, only mainline.
             if self.options.depends_on:
@@ -1008,7 +1008,16 @@ class GenerateSubSuites(object):
 
     def list_tests(self) -> List[str]:
         """List the test files that are part of the suite being split."""
-        return suitesconfig.get_suite(self.config_options.suite).tests
+        suite_config = suitesconfig.get_suite(self.config_options.suite)
+        test_list = []
+        for tests in suite_config.tests:
+            # `tests` could return individual tests or lists of tests, we need to handle both.
+            if isinstance(tests, list):
+                test_list.extend(tests)
+            else:
+                test_list.append(tests)
+
+        return test_list
 
     def add_suites_to_build_variant(self, suites: List[Suite], build_variant: BuildVariant) -> None:
         """

@@ -1,7 +1,10 @@
 /**
  * Test that applying DDL operation on secondary does not take a global X lock.
  *
- * @tags: [requires_replication, requires_snapshot_read]
+ * @tags: [
+ *   requires_replication,
+ *   requires_snapshot_read,
+ * ]
  */
 
 (function() {

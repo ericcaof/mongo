@@ -33,7 +33,7 @@
 
 #include "mongo/db/matcher/rewrite_expr.h"
 
-#include "mongo/db/matcher/expression_internal_expr_eq.h"
+#include "mongo/db/matcher/expression_internal_expr_comparison.h"
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/expression_tree.h"
 #include "mongo/logv2/log.h"
@@ -85,15 +85,12 @@ std::unique_ptr<MatchExpression> RewriteExpr::_rewriteAndExpression(
 
     auto andMatch = std::make_unique<AndMatchExpression>();
 
-    for (auto&& child : currExprNode->getOperandList()) {
-        if (auto childMatch = _rewriteExpression(child)) {
-            andMatch->add(childMatch.release());
-        }
-    }
+    for (auto&& child : currExprNode->getOperandList())
+        if (auto childMatch = _rewriteExpression(child))
+            andMatch->add(std::move(childMatch));
 
-    if (andMatch->numChildren() > 0) {
+    if (andMatch->numChildren() > 0)
         return andMatch;
-    }
 
     return nullptr;
 }
@@ -102,19 +99,16 @@ std::unique_ptr<MatchExpression> RewriteExpr::_rewriteOrExpression(
     const boost::intrusive_ptr<ExpressionOr>& currExprNode) {
 
     auto orMatch = std::make_unique<OrMatchExpression>();
-    for (auto&& child : currExprNode->getOperandList()) {
-        if (auto childExpr = _rewriteExpression(child)) {
-            orMatch->add(childExpr.release());
-        } else {
+    for (auto&& child : currExprNode->getOperandList())
+        if (auto childExpr = _rewriteExpression(child))
+            orMatch->add(std::move(childExpr));
+        else
             // If any child cannot be rewritten to a MatchExpression then we must abandon adding
             // this $or clause.
             return nullptr;
-        }
-    }
 
-    if (orMatch->numChildren() > 0) {
+    if (orMatch->numChildren() > 0)
         return orMatch;
-    }
 
     return nullptr;
 }
@@ -141,6 +135,32 @@ std::unique_ptr<MatchExpression> RewriteExpr::_rewriteComparisonExpression(
         lhs = dynamic_cast<ExpressionFieldPath*>(operandList[1].get());
         rhs = dynamic_cast<ExpressionConstant*>(operandList[0].get());
         invariant(lhs && rhs);
+
+        // The MatchExpression is normalized so that the field path expression is on the left. For
+        // cases like {$gt: [1, "$x"]} where the order of the child expressions matter, we also
+        // change the comparison operator.
+        switch (cmpOperator) {
+            case ExpressionCompare::GT: {
+                cmpOperator = ExpressionCompare::LT;
+                break;
+            }
+            case ExpressionCompare::GTE: {
+                cmpOperator = ExpressionCompare::LTE;
+                break;
+            }
+            case ExpressionCompare::LT: {
+                cmpOperator = ExpressionCompare::GT;
+                break;
+            }
+            case ExpressionCompare::LTE: {
+                cmpOperator = ExpressionCompare::GTE;
+                break;
+            }
+            case ExpressionCompare::EQ:
+                break;
+            default:
+                MONGO_UNREACHABLE_TASSERT(3994306);
+        }
     }
 
     // Build argument for ComparisonMatchExpression.
@@ -155,20 +175,56 @@ std::unique_ptr<MatchExpression> RewriteExpr::_rewriteComparisonExpression(
 
 std::unique_ptr<MatchExpression> RewriteExpr::_buildComparisonMatchExpression(
     ExpressionCompare::CmpOp comparisonOp, BSONElement fieldAndValue) {
-    invariant(comparisonOp == ExpressionCompare::EQ);
+    tassert(3994301,
+            "comparisonOp must be one of the following: $eq, $gt, $gte, $lt, $lte",
+            comparisonOp == ExpressionCompare::EQ || comparisonOp == ExpressionCompare::GT ||
+                comparisonOp == ExpressionCompare::GTE || comparisonOp == ExpressionCompare::LT ||
+                comparisonOp == ExpressionCompare::LTE);
 
-    auto eqMatchExpr =
-        std::make_unique<InternalExprEqMatchExpression>(fieldAndValue.fieldName(), fieldAndValue);
-    eqMatchExpr->setCollator(_collator);
+    std::unique_ptr<MatchExpression> matchExpr;
 
-    return eqMatchExpr;
+    switch (comparisonOp) {
+        case ExpressionCompare::EQ: {
+            matchExpr = std::make_unique<InternalExprEqMatchExpression>(fieldAndValue.fieldName(),
+                                                                        fieldAndValue);
+            break;
+        }
+        case ExpressionCompare::GT: {
+            matchExpr = std::make_unique<InternalExprGTMatchExpression>(fieldAndValue.fieldName(),
+                                                                        fieldAndValue);
+            break;
+        }
+        case ExpressionCompare::GTE: {
+            matchExpr = std::make_unique<InternalExprGTEMatchExpression>(fieldAndValue.fieldName(),
+                                                                         fieldAndValue);
+            break;
+        }
+        case ExpressionCompare::LT: {
+            matchExpr = std::make_unique<InternalExprLTMatchExpression>(fieldAndValue.fieldName(),
+                                                                        fieldAndValue);
+            break;
+        }
+        case ExpressionCompare::LTE: {
+            matchExpr = std::make_unique<InternalExprLTEMatchExpression>(fieldAndValue.fieldName(),
+                                                                         fieldAndValue);
+            break;
+        }
+        default:
+            MONGO_UNREACHABLE_TASSERT(3994307);
+    }
+    matchExpr->setCollator(_collator);
+
+    return matchExpr;
 }
 
 bool RewriteExpr::_canRewriteComparison(
     const boost::intrusive_ptr<ExpressionCompare>& expression) const {
 
-    // Currently we only rewrite $eq expressions.
-    if (expression->getOp() != ExpressionCompare::EQ) {
+    // Currently we only rewrite $eq, $gt, $gte, $lt and $lte expressions.
+    auto op = expression->getOp();
+    if (op != ExpressionCompare::EQ && op != ExpressionCompare::GT &&
+        op != ExpressionCompare::GTE && op != ExpressionCompare::LT &&
+        op != ExpressionCompare::LTE) {
         return false;
     }
 
@@ -177,7 +233,7 @@ bool RewriteExpr::_canRewriteComparison(
 
     for (auto operand : operandList) {
         if (auto exprFieldPath = dynamic_cast<ExpressionFieldPath*>(operand.get())) {
-            if (!exprFieldPath->isRootFieldPath()) {
+            if (exprFieldPath->isVariableReference()) {
                 // This field path refers to a variable rather than a local document field path.
                 return false;
             }

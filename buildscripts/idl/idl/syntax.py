@@ -34,7 +34,7 @@ it follows the rules of the IDL, etc.
 """
 
 import itertools
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union, cast
 
 from . import common
 from . import errors
@@ -131,7 +131,7 @@ class SymbolTable(object):
                 ctxt.add_duplicate_symbol_error(location, name, duplicate_class_name, entity_type)
                 return True
             if entity_type == "command":
-                if item.command_name == name:
+                if name in [item.command_name, item.command_alias if item.command_alias else '']:
                     ctxt.add_duplicate_symbol_error(location, name, duplicate_class_name,
                                                     entity_type)
                     return True
@@ -159,7 +159,8 @@ class SymbolTable(object):
     def add_command(self, ctxt, command):
         # type: (errors.ParserContext, Command) -> None
         """Add an IDL command to the symbol table and check for duplicates."""
-        if not self._is_duplicate(ctxt, command, command.name, "command"):
+        if (not self._is_duplicate(ctxt, command, command.name, "command")
+                and not self._is_duplicate(ctxt, command, command.command_alias, "command")):
             self.commands.append(command)
 
     def add_generic_argument_list(self, ctxt, field_list):
@@ -199,7 +200,31 @@ class SymbolTable(object):
         for idltype in imported_symbols.types:
             self.add_type(ctxt, idltype)
 
-    def resolve_field_from_type_name(self, ctxt, location, field_name, field_type_name):
+    def get_struct(self, name):
+        # type: (str) -> Struct
+        """Get the struct from the SymbolTable's struct list based on the struct name."""
+        for struct in self.structs:
+            if struct.name == name:
+                return struct
+        return None
+
+    def get_generic_argument_list(self, name):
+        # type: (str) -> GenericArgumentList
+        """Get a generic argument list from the SymbolTable based on the list name."""
+        for gen_arg_list in self.generic_argument_lists:
+            if gen_arg_list.name == name:
+                return gen_arg_list
+        return None
+
+    def get_generic_reply_field_list(self, name):
+        # type: (str) -> GenericReplyFieldList
+        """Get a generic reply field list from the SymbolTable based on the list name."""
+        for gen_reply_field_list in self.generic_reply_field_lists:
+            if gen_reply_field_list.name == name:
+                return gen_reply_field_list
+        return None
+
+    def resolve_type_from_name(self, ctxt, location, field_name, field_type_name):
         # type: (errors.ParserContext, common.SourceLocation, str, str) -> Optional[Union[Enum, Struct, Type]]
         """Find the type or struct a field refers to or log an error."""
         field_type = FieldTypeSingle(location.file_name, location.line, location.column)
@@ -220,13 +245,30 @@ class SymbolTable(object):
                     # There was an error.
                     return None
 
-                # TODO (SERVER-51369): proper error, and test it
-                assert isinstance(alternative_type, Type)
-                variant.variant_types.append(alternative_type)
-                if alternative_type.bson_serialization_type:
-                    variant.bson_serialization_type = list(
-                        set(variant.bson_serialization_type).union(
-                            set(alternative_type.bson_serialization_type)))
+                if isinstance(alternative_type, Enum):
+                    ctxt.add_variant_enum_error(location, field_name, alternative_type.name)
+                    return None
+
+                if isinstance(alternative_type, Struct):
+                    if variant.variant_struct_type:
+                        ctxt.add_variant_structs_error(location, field_name)
+                        continue
+
+                    variant.variant_struct_type = alternative_type
+                    bson_serialization_type = ["object"]
+                else:
+                    variant.variant_types.append(alternative_type)
+                    if isinstance(alternative_type, ArrayType):
+                        base_type = cast(Type, alternative_type.element_type)
+                    else:
+                        base_type = cast(Type, alternative_type)
+
+                    bson_serialization_type = []
+                    # If alternative_type is an array, element type could be Struct or Type.
+                    if isinstance(base_type, Type):
+                        bson_serialization_type = cast(Type, base_type).bson_serialization_type
+
+                variant.bson_serialization_type.extend(bson_serialization_type)
 
             return variant
 
@@ -245,6 +287,12 @@ class SymbolTable(object):
 
         assert isinstance(field_type, FieldTypeSingle)
         type_name = field_type.type_name
+        if type_name.startswith('array<'):
+            # The caller should've already stripped "array<...>" from type_name, this may be an
+            # illegal nested array like "array<array<...>>".
+            ctxt.add_bad_array_type_name_error(location, field_name, type_name)
+            return None
+
         for command in self.commands:
             if command.name == type_name:
                 return command
@@ -260,14 +308,6 @@ class SymbolTable(object):
         for idltype in self.types:
             if idltype.name == type_name:
                 return idltype
-
-        if type_name.startswith('array<'):
-            array_type_name = parse_array_type(type_name)
-            if not array_type_name:
-                ctxt.add_bad_array_type_name_error(location, field_name, type_name)
-                return None
-
-            return self.resolve_field_type(ctxt, location, field_name, field_type)
 
         ctxt.add_unknown_type_error(location, field_name, type_name)
 
@@ -359,6 +399,9 @@ class VariantType(Type):
         super(VariantType, self).__init__(file_name, line, column)
         self.name = 'variant'
         self.variant_types = []  # type: List[Type]
+        # A variant can have at most one alternative type which is a struct. Otherwise, if we see
+        # a sub-object while parsing BSON, we don't know which struct to interpret it as.
+        self.variant_struct_type = None  # type: Struct
 
 
 class Validator(common.SourceLocation):
@@ -383,6 +426,17 @@ class Validator(common.SourceLocation):
         self.callback = None  # type: str
 
         super(Validator, self).__init__(file_name, line, column)
+
+    def __eq__(self, other):
+        return (isinstance(other, Validator) and self.gt == other.gt and self.lt == other.lt
+                and self.gte == other.gte and self.lte == other.lte
+                and self.callback == other.callback)
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        return hash((self.gt, self.lt, self.gte, self.lte, self.callback))
 
 
 class Field(common.SourceLocation):
@@ -489,6 +543,59 @@ class Struct(common.SourceLocation):
         super(Struct, self).__init__(file_name, line, column)
 
 
+class Privilege(common.SourceLocation):
+    """IDL privilege information."""
+
+    def __init__(self, file_name, line, column):
+        # type: (str, int, int) -> None
+        """Construct an Privilege."""
+
+        self.resource_pattern = None  # type: str
+        self.action_type = None  # type: List[str]
+
+        super(Privilege, self).__init__(file_name, line, column)
+
+
+class AccessCheck(common.SourceLocation):
+    """IDL access check information."""
+
+    def __init__(self, file_name, line, column):
+        # type: (str, int, int) -> None
+        """Construct an AccessCheck."""
+
+        self.check = None  # type: str
+        self.privilege = None  # type: Privilege
+
+        super(AccessCheck, self).__init__(file_name, line, column)
+
+
+class AccessChecks(common.SourceLocation):
+    """IDL access checks information."""
+
+    def __init__(self, file_name, line, column):
+        # type: (str, int, int) -> None
+        """Construct an AccessChecks."""
+
+        self.ignore = None  # type: bool
+        self.none = None  # type: bool
+        self.simple = None  # type: AccessCheck
+        self.complex = None  # type: List[AccessCheck]
+
+        super(AccessChecks, self).__init__(file_name, line, column)
+
+    def get_access_check_type(self) -> str:
+        """Get type of AccessChecks."""
+        if self.ignore:
+            return "ignore"
+        if self.none:
+            return "none"
+        if self.simple:
+            return "simple"
+        if self.complex:
+            return "complex"
+        return "undefined"
+
+
 class Command(Struct):
     """
     IDL command information, a subtype of Struct.
@@ -503,10 +610,12 @@ class Command(Struct):
         """Construct a Command."""
         self.namespace = None  # type: str
         self.command_name = None  # type: str
+        self.command_alias = None  # type: str
         self.type = None  # type: FieldType
         self.reply_type = None  # type: str
-        self.api_version = ""  # type: str
+        self.api_version = None  # type: str
         self.is_deprecated = False  # type: bool
+        self.access_check = None  # type: AccessChecks
         super(Command, self).__init__(file_name, line, column)
 
 
@@ -557,6 +666,16 @@ class EnumValue(common.SourceLocation):
         self.value = None  # type: str
 
         super(EnumValue, self).__init__(file_name, line, column)
+
+    def __eq__(self, other):
+        return (isinstance(other, EnumValue) and self.name == other.name
+                and self.value == other.value)
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        return hash((self.name, self.value))
 
 
 class Enum(common.SourceLocation):
@@ -648,7 +767,7 @@ class FieldTypeVariant(FieldType):
 
     def debug_string(self):
         """Display this field type in error messages."""
-        return 'VariantType(%s)' % (', '.join(v.debug_string() for v in self.variant))
+        return 'variant<%s>' % (', '.join(v.debug_string() for v in self.variant))
 
 
 class Expression(common.SourceLocation):
@@ -663,6 +782,16 @@ class Expression(common.SourceLocation):
         self.is_constexpr = True  # type: bool
 
         super(Expression, self).__init__(file_name, line, column)
+
+    def __eq__(self, other):
+        return (isinstance(other, Expression) and self.literal == other.literal
+                and self.expr == other.expr and self.is_constexpr == other.is_constexpr)
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        return hash((self.literal, self.expr, self.is_constexpr))
 
 
 class ServerParameterClass(common.SourceLocation):

@@ -1,7 +1,8 @@
 /**
  * Tests tenant migration timeout scenarios.
  *
- * @tags: [requires_fcv_47, incompatible_with_eft, requires_majority_read_concern]
+ * @tags: [requires_fcv_47, incompatible_with_eft, requires_majority_read_concern,
+ * incompatible_with_windows_tls]
  */
 
 (function() {
@@ -43,7 +44,8 @@ function testTimeoutBlockingState() {
     const donorRstArgs = TenantMigrationUtil.createRstArgs(donorRst);
 
     // Fail point to pause right before entering the blocking mode.
-    let afterDataSyncFp = configureFailPoint(donorPrimary, "pauseTenantMigrationAfterDataSync");
+    let afterDataSyncFp =
+        configureFailPoint(donorPrimary, "pauseTenantMigrationBeforeLeavingDataSyncState");
 
     // Run the migration in its own thread, since the initial 'donorStartMigration' command will
     // hang due to the fail point.
@@ -58,11 +60,11 @@ function testTimeoutBlockingState() {
         configureFailPoint(donorPrimary, "pauseScheduleCallWithCancelTokenUntilCanceled");
     afterDataSyncFp.off();
 
-    tenantMigrationTest.waitForNodesToReachState(
-        donorRst.nodes, migrationId, tenantId, TenantMigrationTest.State.kAborted);
+    tenantMigrationTest.waitForDonorNodesToReachState(
+        donorRst.nodes, migrationId, tenantId, TenantMigrationTest.DonorState.kAborted);
 
     const stateRes = assert.commandWorked(migrationThread.returnData());
-    assert.eq(stateRes.state, TenantMigrationTest.State.kAborted);
+    assert.eq(stateRes.state, TenantMigrationTest.DonorState.kAborted);
     assert.eq(stateRes.abortReason.code, ErrorCodes.ExceededTimeLimit);
 
     // This fail point is pausing all calls to recipient, so it has to be disabled to make

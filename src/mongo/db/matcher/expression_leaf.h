@@ -78,8 +78,8 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    boost::optional<std::vector<MatchExpression*>&> getChildVector() final {
-        return boost::none;
+    std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
+        return nullptr;
     }
 
     MatchCategory getCategory() const override {
@@ -98,6 +98,19 @@ public:
         switch (matchType) {
             case MatchExpression::EQ:
             case MatchExpression::INTERNAL_EXPR_EQ:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    static bool isInternalExprComparison(MatchType matchType) {
+        switch (matchType) {
+            case MatchExpression::INTERNAL_EXPR_EQ:
+            case MatchExpression::INTERNAL_EXPR_GT:
+            case MatchExpression::INTERNAL_EXPR_GTE:
+            case MatchExpression::INTERNAL_EXPR_LT:
+            case MatchExpression::INTERNAL_EXPR_LTE:
                 return true;
             default:
                 return false;

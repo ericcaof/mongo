@@ -125,10 +125,6 @@ bool DBDirectClient::lazySupported() const {
     return false;
 }
 
-void DBDirectClient::setOpCtx(OperationContext* opCtx) {
-    _opCtx = opCtx;
-}
-
 QueryOptions DBDirectClient::_lookupAvailableOptions() {
     // Exhaust mode is not available in DBDirectClient.
     return QueryOptions(DBClientBase::_lookupAvailableOptions() & ~QueryOption_Exhaust);
@@ -176,6 +172,12 @@ unique_ptr<DBClientCursor> DBDirectClient::query(const NamespaceStringOrUUID& ns
     invariant(!readConcernObj, "passing readConcern to DBDirectClient functions is not supported");
     return DBClientBase::query(
         nsOrUuid, query, nToReturn, nToSkip, fieldsToReturn, queryOptions, batchSize);
+}
+
+write_ops::FindAndModifyCommandReply DBDirectClient::findAndModify(
+    const write_ops::FindAndModifyCommandRequest& findAndModify) {
+    auto response = runCommand(findAndModify.serialize({}));
+    return FindAndModifyOp::parseResponse(response->getCommandReply());
 }
 
 long long DBDirectClient::count(const NamespaceStringOrUUID nsOrUuid,

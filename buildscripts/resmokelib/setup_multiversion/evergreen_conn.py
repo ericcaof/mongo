@@ -2,8 +2,9 @@
 import os
 
 import structlog
-from evergreen import RetryingEvergreenApi
 from requests import HTTPError
+
+from evergreen import RetryingEvergreenApi
 
 EVERGREEN_HOST = "https://evergreen.mongodb.com"
 EVERGREEN_CONFIG_LOCATIONS = (
@@ -118,9 +119,11 @@ def get_compile_artifact_urls(evg_api, evg_version, buildvariant_name):
         push_task = None
 
         for evg_task in evg_tasks:
-            if evg_task.display_name == "compile":
+            # Only set the compile task if there isn't one already, otherwise
+            # newer tasks like "archive_dist_test_debug" take precedence.
+            if evg_task.display_name in ("compile", "archive_dist_test") and compile_task is None:
                 compile_task = evg_task
-            if evg_task.display_name == "push":
+            elif evg_task.display_name == "push":
                 push_task = evg_task
             if compile_task and push_task:
                 break
@@ -132,6 +135,10 @@ def get_compile_artifact_urls(evg_api, evg_version, buildvariant_name):
             evg_artifacts = compile_task.artifacts
             for artifact in evg_artifacts:
                 compile_artifact_urls[artifact.name] = artifact.url
+
+            # Tack on the project id for generating a friendly decompressed name for the artifacts.
+            compile_artifact_urls["project_id"] = compile_task.project_id
+
         elif compile_task and push_task:
             LOGGER.warning("Found evergreen tasks, but they are not both successful.",
                            compile_task=f"{EVERGREEN_HOST}/task/{compile_task.task_id}",

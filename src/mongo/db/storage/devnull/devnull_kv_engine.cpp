@@ -47,6 +47,9 @@ public:
     boost::optional<Record> seekExact(const RecordId& id) final {
         return {};
     }
+    boost::optional<Record> seekNear(const RecordId& id) final {
+        return {};
+    }
     void save() final {}
     bool restore() final {
         return true;
@@ -79,6 +82,10 @@ public:
 
     virtual bool isCapped() const {
         return _options.capped;
+    }
+
+    virtual KeyFormat keyFormat() const {
+        return KeyFormat::Long;
     }
 
     virtual int64_t storageSize(OperationContext* opCtx,
@@ -240,7 +247,10 @@ std::unique_ptr<RecordStore> DevNullKVEngine::makeTemporaryRecordStore(Operation
 }
 
 std::unique_ptr<SortedDataInterface> DevNullKVEngine::getSortedDataInterface(
-    OperationContext* opCtx, StringData ident, const IndexDescriptor* desc) {
+    OperationContext* opCtx,
+    const CollectionOptions& collOptions,
+    StringData ident,
+    const IndexDescriptor* desc) {
     return std::make_unique<DevNullSortedDataInterface>(ident);
 }
 

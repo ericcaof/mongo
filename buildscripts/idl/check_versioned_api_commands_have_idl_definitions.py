@@ -42,37 +42,29 @@ from pymongo import MongoClient
 # Permit imports from "buildscripts".
 sys.path.append(os.path.normpath(os.path.join(os.path.abspath(__file__), '../../..')))
 
-# pylint: disable=wrong-import-position
+# pylint: disable=wrong-import-position,wrong-import-order
+from buildscripts.idl.lib import list_idls, parse_idl
 from buildscripts.resmokelib import configure_resmoke
 from buildscripts.resmokelib.logging import loggers
 from buildscripts.resmokelib.testing.fixtures import interface
+from buildscripts.resmokelib.testing.fixtures.fixturelib import FixtureLib
 from buildscripts.resmokelib.testing.fixtures.shardedcluster import ShardedClusterFixture
 from buildscripts.resmokelib.testing.fixtures.standalone import MongoDFixture
-from idl import parser, syntax
-from idl.compiler import CompilerImportResolver
+from idl import syntax
 
 LOGGER_NAME = 'check-idl-definitions'
 LOGGER = logging.getLogger(LOGGER_NAME)
 
 
-def list_idls(directory: str) -> Set[str]:
-    """Find all IDL files in the current directory."""
-    return {
-        os.path.join(dirpath, filename)
-        for dirpath, dirnames, filenames in os.walk(directory) for filename in filenames
-        if filename.endswith('.idl')
-    }
+def is_test_idl(idl_path: str) -> bool:
+    """Check if an IDL file is a test file."""
+    test_idls_subpaths = ["/idl/tests/", "unittest.idl"]
 
+    for file_name in test_idls_subpaths:
+        if idl_path.find(file_name) != -1:
+            return True
 
-def parse_idl(idl_path: str, import_directories: List[str]) -> syntax.IDLParsedSpec:
-    """Parse an IDL file or throw an error."""
-    parsed_doc = parser.parse(open(idl_path), idl_path, CompilerImportResolver(import_directories))
-
-    if parsed_doc.errors:
-        parsed_doc.errors.dump_errors()
-        raise ValueError(f"Cannot parse {idl_path}")
-
-    return parsed_doc
+    return False
 
 
 def get_command_definitions(api_version: str, directory: str,
@@ -83,9 +75,10 @@ def get_command_definitions(api_version: str, directory: str,
 
     def gen():
         for idl_path in sorted(list_idls(directory)):
-            for command in parse_idl(idl_path, import_directories).spec.symbols.commands:
-                if command.api_version == api_version:
-                    yield command.name, command
+            if not is_test_idl(idl_path):
+                for command in parse_idl(idl_path, import_directories).spec.symbols.commands:
+                    if command.api_version == api_version:
+                        yield command.command_name, command
 
     idl_commands = dict(gen())
     LOGGER.debug("Found %s IDL commands in API Version %s", len(idl_commands), api_version)
@@ -97,17 +90,18 @@ def list_commands_for_api(api_version: str, mongod_or_mongos: str, install_dir: 
     assert mongod_or_mongos in ("mongod", "mongos")
     logging.info("Calling listCommands on %s", mongod_or_mongos)
     dbpath = TemporaryDirectory()
+    fixturelib = FixtureLib()
     mongod_executable = os.path.join(install_dir, "mongod")
     mongos_executable = os.path.join(install_dir, "mongos")
     if mongod_or_mongos == "mongod":
         logger = loggers.new_fixture_logger("MongoDFixture", 0)
         logger.parent = LOGGER
-        fixture: interface.Fixture = MongoDFixture(logger, 0, dbpath_prefix=dbpath.name,
+        fixture: interface.Fixture = MongoDFixture(logger, 0, fixturelib, dbpath_prefix=dbpath.name,
                                                    mongod_executable=mongod_executable)
     else:
         logger = loggers.new_fixture_logger("ShardedClusterFixture", 0)
         logger.parent = LOGGER
-        fixture = ShardedClusterFixture(logger, 0, dbpath_prefix=dbpath.name,
+        fixture = ShardedClusterFixture(logger, 0, fixturelib, dbpath_prefix=dbpath.name,
                                         mongos_executable=mongos_executable,
                                         mongod_executable=mongod_executable, mongod_options={})
 
@@ -147,9 +141,23 @@ def assert_command_sets_equal(api_version: str, command_sets: Dict[str, Set[str]
             if other_commands - commands:
                 LOGGER.error("%s has commands not in %s: %s", other_name, name,
                              other_commands - commands)
-            # TODO(SERVER-51878): Enable this assertion.
-            # raise AssertionError(
-            #     f"{name} and {other_name} have different commands in API Version {api_version}")
+            raise AssertionError(
+                f"{name} and {other_name} have different commands in API Version {api_version}")
+
+
+def remove_skipped_commands(command_sets: Dict[str, Set[str]]):
+    """Remove skipped commands from command_sets."""
+    skipped_commands = {
+        "testDeprecation",
+        "testVersions1And2",
+        "testRemoval",
+        "testDeprecationInVersion2",
+        # Idl specifies the command_name as hello.
+        "isMaster",
+    }
+
+    for key in command_sets.keys():
+        command_sets[key].difference_update(skipped_commands)
 
 
 def main():
@@ -177,6 +185,7 @@ def main():
     command_sets["mongod"] = list_commands_for_api(args.api_version, "mongod", args.install_dir)
     command_sets["mongos"] = list_commands_for_api(args.api_version, "mongos", args.install_dir)
     command_sets["idl"] = set(get_command_definitions(args.api_version, os.getcwd(), args.include))
+    remove_skipped_commands(command_sets)
     assert_command_sets_equal(args.api_version, command_sets)
 
 

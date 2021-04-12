@@ -110,6 +110,9 @@ class Type(common.SourceLocation):
         self.is_variant = False  # type: bool
         self.is_struct = False  # type: bool
         self.variant_types = []  # type: List[Type]
+        # A variant can have at most one alternative type which is a struct. Otherwise, if we saw
+        # a sub-object while parsing BSON, we wouldn't know which struct to interpret it as.
+        self.variant_struct_type = None  # type: Type
         super(Type, self).__init__(file_name, line, column)
 
 
@@ -118,6 +121,10 @@ class Struct(common.SourceLocation):
     IDL struct information.
 
     All fields are either required or have a non-None default.
+
+    NOTE: We use this class to generate a struct's C++ class and method definitions. When a field
+    has a struct type (or a field is an array of structs or a variant that can be a struct), we
+    represent that struct type using ast.Type with is_struct=True.
     """
 
     # pylint: disable=too-many-instance-attributes
@@ -127,6 +134,7 @@ class Struct(common.SourceLocation):
         """Construct a struct."""
         self.name = None  # type: str
         self.cpp_name = None  # type: str
+        self.qualified_cpp_name = None  # type: str
         self.description = None  # type: str
         self.strict = True  # type: bool
         self.immutable = False  # type: bool
@@ -180,7 +188,6 @@ class Field(common.SourceLocation):
     An instance of a field in a struct.
 
     Name is always populated.
-    A field will either have a struct_type or a cpp_type, but not both.
     Not all fields are set, it depends on the input document.
     """
 
@@ -202,9 +209,6 @@ class Field(common.SourceLocation):
         self.type = None  # type: Type
         self.always_serialize = False  # type: bool
 
-        # Properties specific to fields which are structs.
-        self.struct_type = None  # type: str
-
         # Properties specific to fields which are arrays.
         self.supports_doc_sequence = False  # type: bool
 
@@ -221,6 +225,32 @@ class Field(common.SourceLocation):
         super(Field, self).__init__(file_name, line, column)
 
 
+class Privilege(common.SourceLocation):
+    """IDL privilege information."""
+
+    def __init__(self, file_name, line, column):
+        # type: (str, int, int) -> None
+        """Construct an Privilege."""
+
+        self.resource_pattern = None  # type: str
+        self.action_type = None  # type: List[str]
+
+        super(Privilege, self).__init__(file_name, line, column)
+
+
+class AccessCheck(common.SourceLocation):
+    """IDL commmand access check information."""
+
+    def __init__(self, file_name, line, column):
+        # type: (str, int, int) -> None
+        """Construct an AccessCheck."""
+
+        self.check = None  # type: str
+        self.privilege = None  # type: Privilege
+
+        super(AccessCheck, self).__init__(file_name, line, column)
+
+
 class Command(Struct):
     """
     IDL commmand information.
@@ -235,10 +265,12 @@ class Command(Struct):
         """Construct a command."""
         self.namespace = None  # type: str
         self.command_name = None  # type: str
+        self.command_alias = None  # type: str
         self.command_field = None  # type: Field
         self.reply_type = None  # type: Field
         self.api_version = ""  # type: str
         self.is_deprecated = False  # type: bool
+        self.access_checks = None  # type: List[AccessCheck]
         super(Command, self).__init__(file_name, line, column)
 
 

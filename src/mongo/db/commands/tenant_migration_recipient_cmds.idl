@@ -62,14 +62,14 @@ structs:
             donor.
           type: string
           validator:
-            callback: "validateConnectionString"
+            callback: "tenant_migration_util::validateConnectionString"
         tenantId:
           description: >-
             The prefix from which the migrating database will be matched. The prefixes 'admin',
             'local', 'config', the empty string, are not allowed.
           type: string
           validator:
-            callback: "validateDatabasePrefix"
+            callback: "tenant_migration_util::validateDatabasePrefix"
         readPreference:
           description: >-
             The read preference settings that the donor will pass on to the recipient.
@@ -79,6 +79,8 @@ structs:
             The SSL certificate and private key that the recipient should use to authenticate to the
             donor.
           type: TenantMigrationPEMPayload
+          # TODO (SERVER-54085): Remove server parameter tenantMigrationDisableX509Auth.
+          optional: true
 
 commands:
   recipientSyncData:
@@ -86,6 +88,7 @@ commands:
     command_name: recipientSyncData
     strict: true
     namespace: ignored
+    api_version: ""
     inline_chained_structs: true
     chained_structs:
       MigrationRecipientCommonData: MigrationRecipientCommonData
@@ -97,13 +100,21 @@ commands:
         type: timestamp
         optional: true
         validator:
-          callback: "validateTimestampNotNull"
+          callback: "tenant_migration_util::validateTimestampNotNull"
+      startMigrationDonorTimestamp:
+        type: timestamp
+        description: >-
+          Recipient must not start cloning/fetching oplog entries from the donor until this
+          timestamp is majority committed.
+        validator:
+          callback: "tenant_migration_util::validateTimestampNotNull"
 
   recipientForgetMigration:
     description: "Parser for the 'recipientForgetMigration' command."
     command_name: recipientForgetMigration
     strict: true
     namespace: ignored
+    api_version: ""
     inline_chained_structs: true
     chained_structs:
       MigrationRecipientCommonData: MigrationRecipientCommonData

@@ -32,7 +32,6 @@
 #include <functional>
 
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/server_options.h"
 
 namespace mongo {
 class BSONObj;
@@ -55,10 +54,7 @@ Status validateKeyPattern(const BSONObj& key, IndexDescriptor::IndexVersion inde
  * has any missing attributes filled in. If the index specification is malformed, then an error
  * status is returned.
  */
-StatusWith<BSONObj> validateIndexSpec(
-    OperationContext* opCtx,
-    const BSONObj& indexSpec,
-    const ServerGlobalParams::FeatureCompatibility& featureCompatibility);
+StatusWith<BSONObj> validateIndexSpec(OperationContext* opCtx, const BSONObj& indexSpec);
 
 /**
  * Returns a new index spec with any unknown field names removed from 'indexSpec'.
@@ -87,10 +83,20 @@ StatusWith<BSONObj> validateIndexSpecCollation(OperationContext* opCtx,
                                                const CollatorInterface* defaultCollator);
 
 /**
+ * Validates the the 'expireAfterSeconds' value for a TTL index..
+ */
+Status validateExpireAfterSeconds(std::int64_t expireAfterSeconds);
+
+/**
  * Validates the key pattern and the 'expireAfterSeconds' duration in the index specification
  * 'indexSpec' for a TTL index. Returns success if 'indexSpec' does not refer to a TTL index.
  */
 Status validateIndexSpecTTL(const BSONObj& indexSpec);
+
+/**
+ * Returns whether an index is allowed in API version 1.
+ */
+bool isIndexAllowedInAPIVersion1(const IndexDescriptor& indexDesc);
 
 /**
  * Optional filtering function to adjust allowed index field names at startup.

@@ -38,6 +38,7 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/repl/tenant_migration_recipient_entry_helpers.h"
@@ -79,8 +80,9 @@ Status insertStateDoc(OperationContext* opCtx, const TenantMigrationRecipientDoc
             invariant(!updateResult.numDocsModified);
             if (updateResult.upsertedId.isEmpty()) {
                 return {ErrorCodes::ConflictingOperationInProgress,
-                        str::stream() << "Failed to insert the state doc: " << stateDoc.toBSON()
-                                      << "; Active tenant migration found for tenantId: "
+                        str::stream() << "Failed to insert the state doc: "
+                                      << tenant_migration_util::redactStateDoc(stateDoc.toBSON())
+                                      << "; Found active tenant migration for tenantId: "
                                       << stateDoc.getTenantId()};
             }
             return Status::OK();
@@ -103,10 +105,31 @@ Status updateStateDoc(OperationContext* opCtx, const TenantMigrationRecipientDoc
             if (updateResult.numMatched == 0) {
                 return {ErrorCodes::NoSuchKey,
                         str::stream()
-                            << "Existing Tenant Migration State Document not found for id: "
+                            << "Existing tenant migration state document not found for id: "
                             << stateDoc.getId()};
             }
             return Status::OK();
+        });
+}
+
+StatusWith<bool> deleteStateDocIfMarkedAsGarbageCollectable(OperationContext* opCtx,
+                                                            StringData tenantId) {
+    const auto nss = NamespaceString::kTenantMigrationRecipientsNamespace;
+    AutoGetCollection collection(opCtx, nss, MODE_IX);
+
+    if (!collection) {
+        return Status(ErrorCodes::NamespaceNotFound,
+                      str::stream() << nss.ns() << " does not exist");
+    }
+
+    auto query = BSON(TenantMigrationRecipientDocument::kTenantIdFieldName
+                      << tenantId << TenantMigrationRecipientDocument::kExpireAtFieldName
+                      << BSON("$exists" << 1));
+    return writeConflictRetry(
+        opCtx, "deleteTenantMigrationRecipientStateDoc", nss.ns(), [&]() -> bool {
+            auto nDeleted =
+                deleteObjects(opCtx, collection.getCollection(), nss, query, true /* justOne */);
+            return nDeleted > 0;
         });
 }
 

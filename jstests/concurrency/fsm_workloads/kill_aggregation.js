@@ -32,7 +32,11 @@ var $config = extendWorkload($config, function($config, $super) {
             // We expect to see errors caused by the plan executor being killed, because of the
             // collection getting dropped on another thread.
             assertAlways.contains(aggResult.code,
-                                  [ErrorCodes.OperationFailed, ErrorCodes.QueryPlanKilled],
+                                  [
+                                      ErrorCodes.NamespaceNotFound,
+                                      ErrorCodes.OperationFailed,
+                                      ErrorCodes.QueryPlanKilled
+                                  ],
                                   aggResult);
             return;
         }
@@ -41,9 +45,10 @@ var $config = extendWorkload($config, function($config, $super) {
         try {
             cursor.itcount();
         } catch (e) {
+            const kAllowedErrorCodes = [ErrorCodes.QueryPlanKilled, ErrorCodes.NamespaceNotFound];
             // We expect to see errors caused by the plan executor being killed, because of the
             // collection getting dropped on another thread.
-            if (ErrorCodes.QueryPlanKilled != e.code) {
+            if (!kAllowedErrorCodes.includes(e.code)) {
                 throw e;
             }
         }

@@ -1,4 +1,5 @@
 load("jstests/sharding/libs/chunk_bounds_util.js");
+load("jstests/sharding/libs/find_chunks_util.js");
 
 /**
  * Asserts that the given shards have the given chunks.
@@ -12,7 +13,8 @@ function assertChunksOnShards(configDB, ns, shardChunkBounds) {
         for (let bounds of chunkBounds) {
             assert.eq(
                 shardName,
-                configDB.chunks.findOne({ns: ns, min: bounds[0], max: bounds[1]}).shard,
+                findChunksUtil.findOneChunkByNs(configDB, ns, {min: bounds[0], max: bounds[1]})
+                    .shard,
                 "expected to find chunk " + tojson(bounds) + " on shard \"" + shardName + "\"");
         }
     }
@@ -66,14 +68,17 @@ function moveZoneToShard(st, zoneName, fromShard, toShard) {
 }
 
 /**
- * Starts the balancer, lets it run for the given number of rounds, then stops the
- * balancer.
+ * Starts the balancer, lets it run for at least the given number of rounds,
+ * then stops the balancer.
  */
-function runBalancer(st, numRounds) {
+function runBalancer(st, minNumRounds) {
     st.startBalancer();
-    for (let i = 0; i < numRounds; i++) {
+
+    // We add 1 to the number of rounds to avoid a race condition
+    // where the first round is a no-op round
+    for (let i = 0; i < minNumRounds + 1; ++i)
         st.awaitBalancerRound();
-    }
+
     st.stopBalancer();
 }
 

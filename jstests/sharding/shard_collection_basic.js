@@ -1,13 +1,13 @@
-//
-// Basic tests for shardCollection.
-//
-
 (function() {
 'use strict';
 
-var st = new ShardingTest({mongos: 1, shards: 2});
+load("jstests/sharding/libs/find_chunks_util.js");
+
+var st = new ShardingTest({shards: 2});
 var kDbName = 'db';
 var mongos = st.s0;
+var config = st.s0.getDB('config');
+var admin = st.s0.getDB('admin');
 
 function testAndClenaupWithKeyNoIndexFailed(keyDoc) {
     assert.commandWorked(mongos.adminCommand({enableSharding: kDbName}));
@@ -346,7 +346,7 @@ assert.commandWorked(mongos.getDB(kDbName).createCollection('foo'));
 assert.commandWorked(
     sh.shardCollection(kDbName + '.foo', {a: "hashed"}, false, {numInitialChunks: 5}));
 st.printShardingStatus();
-var numChunks = st.config.chunks.find({ns: kDbName + '.foo'}).count();
+var numChunks = findChunksUtil.findChunksByNs(st.config, kDbName + '.foo').count();
 assert.eq(numChunks, 5, "unexpected number of chunks");
 
 st.stop();

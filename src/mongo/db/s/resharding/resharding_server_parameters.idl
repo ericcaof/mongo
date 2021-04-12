@@ -58,14 +58,13 @@ server_parameters:
         validator:
             gte: 1
 
-    reshardingWriterThreadCount:
+    reshardingOplogBatchTaskCount:
         description: >-
-            The number of threads in the thread pool used by *each* ReshardingOplogApplier to apply
-            oplog entries from the corresponding donor shard. There is one ReshardingOplogApplier
-            instance per donor shard.
+            The number of subtasks to divide a single oplog batch into so that it may be applied
+            concurrently by different threads.
         set_at: startup
         cpp_vartype: int
-        cpp_varname: gReshardingWriterThreadCount
+        cpp_varname: gReshardingOplogBatchTaskCount
         default: 4
         validator:
             gte: 1
@@ -106,3 +105,28 @@ server_parameters:
         cpp_vartype: AtomicWord<int>
         cpp_varname: gReshardingOplogApplierMaxLockRequestTimeoutMillis
         default: 5
+
+    reshardingMinimumOperationDurationMillis:
+        description: >-
+            Controls the minimum duration of resharding operations, and allows transactions and 
+            retryable writes started after the current resharding operation to complete within the 
+            period defined by the parameter.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int>
+        cpp_varname: gReshardingMinimumOperationDurationMillis
+        default:
+            expr: 5 * 60 * 1000
+        validator:
+            gte: 0
+    
+    reshardingCriticalSectionTimeoutMillis:
+        description: >-
+            The upper limit on how long to wait to hear back from recipient shards reaching strict
+            consistency after engaging the critical section.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int>
+        cpp_varname: gReshardingCriticalSectionTimeoutMillis
+        default:
+            expr: 5 * 1000
+        validator:
+            gte: 0

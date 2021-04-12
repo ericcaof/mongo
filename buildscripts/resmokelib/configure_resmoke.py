@@ -12,6 +12,8 @@ import random
 
 import pymongo.uri_parser
 
+from buildscripts.idl.lib import ALL_FEATURE_FLAG_FILE
+
 from buildscripts.resmokelib import config as _config
 from buildscripts.resmokelib import utils
 from buildscripts.resmokelib import mongod_fuzzer_configs
@@ -44,6 +46,15 @@ def _validate_options(parser, args):
         parser.error(
             "Cannot use --replayFile with additional test files listed on the command line invocation."
         )
+
+    if args.run_all_feature_flag_tests:
+        if not os.path.isfile(ALL_FEATURE_FLAG_FILE):
+            parser.error(
+                "To run tests with all feature flags, the %s file must exist and be placed in"
+                " your working directory. The file can be downloaded from the artifacts tarball"
+                " in Evergreen. Alternatively, if you know which feature flags you want to enable,"
+                " you can use the --additionalFeatureFlags command line argument" %
+                ALL_FEATURE_FLAG_FILE)
 
     def get_set_param_errors(process_params):
         agg_set_params = collections.defaultdict(list)
@@ -142,20 +153,56 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
             user_config = dict(config_parser["resmoke"])
             config.update(user_config)
 
+    def setup_feature_flags():
+        _config.RUN_ALL_FEATURE_FLAG_TESTS = config.pop("run_all_feature_flag_tests")
+        feature_flags = []
+        try:
+            feature_flags = open(ALL_FEATURE_FLAG_FILE).read().split()
+        except FileNotFoundError:
+            # If we ask resmoke to run with all feature flags, the feature flags file
+            # needs to exist.
+            if _config.RUN_ALL_FEATURE_FLAG_TESTS:
+                raise
+
+        # Specify additional feature flags from the command line.
+        # Set running all feature flag tests to True if this options is specified.
+        additional_feature_flags = config.pop("additional_feature_flags")
+        if additional_feature_flags is not None:
+            if _config.RUN_ALL_FEATURE_FLAG_TESTS:
+                feature_flags.extend(additional_feature_flags)
+            else:
+                feature_flags = additional_feature_flags
+
+            # `additional_feature_flags` only determines the universal set of feature flags,
+            # resmoke.py is set to run with "all" feature flags regardless.
+            _config.RUN_ALL_FEATURE_FLAG_TESTS = True
+
+        return feature_flags
+
+    all_feature_flags = setup_feature_flags()
+
     _config.ALWAYS_USE_LOG_FILES = config.pop("always_use_log_files")
     _config.BASE_PORT = int(config.pop("base_port"))
     _config.BACKUP_ON_RESTART_DIR = config.pop("backup_on_restart_dir")
     _config.BUILDLOGGER_URL = config.pop("buildlogger_url")
     _config.DBPATH_PREFIX = _expand_user(config.pop("dbpath_prefix"))
     _config.DRY_RUN = config.pop("dry_run")
+
     # EXCLUDE_WITH_ANY_TAGS will always contain the implicitly defined EXCLUDED_TAG.
     _config.EXCLUDE_WITH_ANY_TAGS = [_config.EXCLUDED_TAG]
     _config.EXCLUDE_WITH_ANY_TAGS.extend(
         utils.default_if_none(_tags_from_list(config.pop("exclude_with_any_tags")), []))
+
+    # Don't run tests with feature flags if the `run_all_feature_flag_tests` is not specified.
+    if not _config.RUN_ALL_FEATURE_FLAG_TESTS and all_feature_flags:
+        _config.EXCLUDE_WITH_ANY_TAGS.extend(all_feature_flags)
+
     _config.FAIL_FAST = not config.pop("continue_on_failure")
     _config.FLOW_CONTROL = config.pop("flow_control")
     _config.FLOW_CONTROL_TICKETS = config.pop("flow_control_tickets")
+
     _config.INCLUDE_WITH_ANY_TAGS = _tags_from_list(config.pop("include_with_any_tags"))
+
     _config.GENNY_EXECUTABLE = _expand_user(config.pop("genny_executable"))
     _config.JOBS = config.pop("jobs")
     _config.LINEAR_CHAIN = config.pop("linear_chain") == "on"
@@ -186,7 +233,13 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
         return utils.dump_yaml(ret)
 
     _config.MONGOD_EXECUTABLE = _expand_user(config.pop("mongod_executable"))
-    _config.MONGOD_SET_PARAMETERS = _merge_set_params(config.pop("mongod_set_parameters"))
+
+    mongod_set_parameters = config.pop("mongod_set_parameters")
+    if _config.RUN_ALL_FEATURE_FLAG_TESTS:
+        feature_flag_dict = {ff: "true" for ff in all_feature_flags}
+        mongod_set_parameters.append(str(feature_flag_dict))
+
+    _config.MONGOD_SET_PARAMETERS = _merge_set_params(mongod_set_parameters)
     _config.FUZZ_MONGOD_CONFIGS = config.pop("fuzz_mongod_configs")
     _config.CONFIG_FUZZ_SEED = config.pop("config_fuzz_seed")
 
@@ -199,7 +252,13 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
             .fuzz_set_parameters(_config.CONFIG_FUZZ_SEED, _config.MONGOD_SET_PARAMETERS)
 
     _config.MONGOS_EXECUTABLE = _expand_user(config.pop("mongos_executable"))
-    _config.MONGOS_SET_PARAMETERS = _merge_set_params(config.pop("mongos_set_parameters"))
+
+    mongos_set_parameters = config.pop("mongos_set_parameters")
+    if _config.RUN_ALL_FEATURE_FLAG_TESTS:
+        feature_flag_dict = {ff: "true" for ff in all_feature_flags}
+        mongos_set_parameters.append(str(feature_flag_dict))
+
+    _config.MONGOS_SET_PARAMETERS = _merge_set_params(mongos_set_parameters)
 
     _config.MONGOCRYPTD_SET_PARAMETERS = _merge_set_params(config.pop("mongocryptd_set_parameters"))
 
@@ -221,6 +280,7 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     _config.SHELL_READ_MODE = config.pop("shell_read_mode")
     _config.SHELL_WRITE_MODE = config.pop("shell_write_mode")
     _config.SPAWN_USING = config.pop("spawn_using")
+    _config.EXPORT_MONGOD_CONFIG = config.pop("export_mongod_config")
     _config.STAGGER_JOBS = config.pop("stagger_jobs") == "on"
     _config.STORAGE_ENGINE = config.pop("storage_engine")
     _config.STORAGE_ENGINE_CACHE_SIZE = config.pop("storage_engine_cache_size_gb")
@@ -235,6 +295,7 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     _config.INTERNAL_PARAMS = config.pop("internal_params")
 
     # Evergreen options.
+    _config.EVERGREEN_URL = config.pop("evergreen_url")
     _config.EVERGREEN_BUILD_ID = config.pop("build_id")
     _config.EVERGREEN_DISTRO_ID = config.pop("distro_id")
     _config.EVERGREEN_EXECUTION = config.pop("execution_number")
@@ -244,6 +305,7 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     _config.EVERGREEN_REVISION_ORDER_ID = config.pop("revision_order_id")
     _config.EVERGREEN_TASK_ID = config.pop("task_id")
     _config.EVERGREEN_TASK_NAME = config.pop("task_name")
+    _config.EVERGREEN_TASK_DOC = config.pop("task_doc")
     _config.EVERGREEN_VARIANT_NAME = config.pop("variant_name")
     _config.EVERGREEN_VERSION_ID = config.pop("version_id")
 
@@ -254,6 +316,13 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     # Archival options. Archival is enabled only when running on evergreen.
     if not _config.EVERGREEN_TASK_ID:
         _config.ARCHIVE_FILE = None
+    else:
+        # Enable archival globally for all required mainline builders.
+        if (_config.EVERGREEN_VARIANT_NAME is not None
+                and "-required" in _config.EVERGREEN_VARIANT_NAME
+                and not _config.EVERGREEN_PATCH_BUILD):
+            _config.FORCE_ARCHIVE_ALL_DATA_FILES = True
+
     _config.ARCHIVE_LIMIT_MB = config.pop("archive_limit_mb")
     _config.ARCHIVE_LIMIT_TESTS = config.pop("archive_limit_tests")
 
@@ -274,6 +343,16 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
 
     # Config Dir options.
     _config.CONFIG_DIR = config.pop("config_dir")
+
+    # Configure evergreen task documentation
+    if _config.EVERGREEN_TASK_NAME:
+        task_name = utils.get_task_name_without_suffix(_config.EVERGREEN_TASK_NAME,
+                                                       _config.EVERGREEN_VARIANT_NAME)
+        evg_task_doc_file = os.path.join(_config.CONFIG_DIR, "evg_task_doc", "evg_task_doc.yml")
+        if os.path.exists(evg_task_doc_file):
+            evg_task_doc = utils.load_yaml_file(evg_task_doc_file)
+            if task_name in evg_task_doc:
+                _config.EVERGREEN_TASK_DOC = evg_task_doc[task_name]
 
     _config.UNDO_RECORDER_PATH = config.pop("undo_recorder_path")
 
@@ -348,7 +427,9 @@ def _set_logging_config():
         # If the user provides a full valid path to a logging config
         # we don't need to search LOGGER_DIR for the file.
         if os.path.exists(pathname):
-            _config.LOGGING_CONFIG = utils.load_yaml_file(pathname).pop("logging")
+            logger_config = utils.load_yaml_file(pathname)
+            _config.LOGGING_CONFIG = logger_config.pop("logging")
+            _config.SHORTEN_LOGGER_NAME_CONFIG = logger_config.pop("shorten_logger_name")
             return
 
         root = os.path.abspath(_config.LOGGER_DIR)
@@ -359,7 +440,9 @@ def _set_logging_config():
                 config_file = os.path.join(root, filename)
                 if not os.path.isfile(config_file):
                     raise ValueError("Expected a logger YAML config, but got '%s'" % pathname)
-                _config.LOGGING_CONFIG = utils.load_yaml_file(config_file).pop("logging")
+                logger_config = utils.load_yaml_file(config_file)
+                _config.LOGGING_CONFIG = logger_config.pop("logging")
+                _config.SHORTEN_LOGGER_NAME_CONFIG = logger_config.pop("shorten_logger_name")
                 return
 
         raise ValueError("Unknown logger '%s'" % pathname)

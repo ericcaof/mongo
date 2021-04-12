@@ -101,8 +101,6 @@ public:
     virtual StatusWith<std::vector<std::string>> extendBackupCursor(
         OperationContext* opCtx) override;
 
-    virtual bool supportsCheckpoints() const override;
-
     virtual bool isDurable() const override;
 
     virtual bool isEphemeral() const override;
@@ -152,6 +150,8 @@ public:
     virtual Timestamp getAllDurableTimestamp() const override;
 
     boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final;
+
+    bool supportsClusteredIdIndex() const final;
 
     bool supportsReadConcernSnapshot() const final;
 
@@ -363,7 +363,8 @@ public:
         return _options.directoryPerDB;
     }
 
-    StatusWith<Timestamp> pinOldestTimestamp(const std::string& requestingServiceName,
+    StatusWith<Timestamp> pinOldestTimestamp(OperationContext* opCtx,
+                                             const std::string& requestingServiceName,
                                              Timestamp requestedTimestamp,
                                              bool roundUpIfTooOld) override;
 
@@ -378,8 +379,7 @@ private:
                          bool forRepair,
                          Timestamp minVisibleTs);
 
-    Status _dropCollectionsNoTimestamp(OperationContext* opCtx,
-                                       std::vector<NamespaceString>& toDrop);
+    Status _dropCollectionsNoTimestamp(OperationContext* opCtx, const std::vector<UUID>& toDrop);
 
     /**
      * When called in a repair context (_options.forRepair=true), attempts to recover a collection

@@ -5,9 +5,6 @@
  * null value. Prevously verify'd.
  *
  * This test also validates the error cases for SERVER-6239 (support $add and $subtract with dates)
- * @tags: [
- *   sbe_incompatible,
- * ]
  */
 
 /*
@@ -18,6 +15,7 @@
 
 // Load test utilities
 load('jstests/aggregation/extras/utils.js');
+load("jstests/libs/sbe_assert_error_override.js");  // Override error-code-checking APIs.
 
 // Clear db
 db.s6240.drop();
@@ -30,13 +28,16 @@ db.s6240.save({date: new Date()});
 assertErrorCode(db.s6240, {$project: {add: {$add: ["$date", "$date"]}}}, 16612);
 
 // Divide
-assertErrorCode(db.s6240, {$project: {divide: {$divide: ["$date", 2]}}}, 16609);
+assertErrorCode(
+    db.s6240, {$project: {divide: {$divide: ["$date", 2]}}}, [16609, ErrorCodes.TypeMismatch]);
 
 // Mod
 assertErrorCode(db.s6240, {$project: {mod: {$mod: ["$date", 2]}}}, 16611);
 
 // Multiply
-assertErrorCode(db.s6240, {$project: {multiply: {$multiply: ["$date", 2]}}}, 16555);
+assertErrorCode(
+    db.s6240, {$project: {multiply: {$multiply: ["$date", 2]}}}, [16555, ErrorCodes.TypeMismatch]);
 
 // Subtract
-assertErrorCode(db.s6240, {$project: {subtract: {$subtract: [2, "$date"]}}}, 16556);
+assertErrorCode(
+    db.s6240, {$project: {subtract: {$subtract: [2, "$date"]}}}, [16556, ErrorCodes.TypeMismatch]);

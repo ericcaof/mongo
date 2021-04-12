@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+import shlex
 import yaml
 
 VERSION_JSON = "version.json"
@@ -99,14 +100,8 @@ def generate_scons_cache_expansions():
             shared_mount_root = '/efs'
         default_cache_path = os.path.join(shared_mount_root, system_uuid, "scons-cache")
         expansions["scons_cache_path"] = default_cache_path
-        # Patches are read only, unless they are for a commit queue merge.
-        if os.getenv("IS_PATCH") and os.getenv("IS_COMMIT_QUEUE") != "true":
-            expansions[
-                "scons_cache_args"] = "--cache={0} --cache-dir='{1}' --cache-readonly".format(
-                    scons_cache_mode, default_cache_path)
-        else:
-            expansions["scons_cache_args"] = "--cache={0} --cache-dir='{1}'".format(
-                scons_cache_mode, default_cache_path)
+        expansions["scons_cache_args"] = "--cache={0} --cache-dir={1}".format(
+            scons_cache_mode, shlex.quote(default_cache_path))
 
     # Local shared cache - host-based
     elif os.getenv("SCONS_CACHE_SCOPE") == "local":
@@ -118,8 +113,8 @@ def generate_scons_cache_expansions():
 
         default_cache_path = os.path.join(default_cache_path_base, system_uuid)
         expansions["scons_cache_path"] = default_cache_path
-        expansions["scons_cache_args"] = "--cache={0} --cache-dir='{1}'".format(
-            scons_cache_mode, default_cache_path)
+        expansions["scons_cache_args"] = "--cache={0} --cache-dir={1}".format(
+            scons_cache_mode, shlex.quote(default_cache_path))
     # No cache
     else:
         # Anything else is 'none'
@@ -138,7 +133,7 @@ def match_verstr(verstr):
     r2.3.4-git234, r2.3.4-rc0-234-githash If the version is invalid (i.e.
     doesn't start with "2.3.4" or "2.3.4-rc0", this will return False.
     """
-    res = re.match(r'^r?(?:\d+\.\d+\.\d+(?:-rc\d+)?)(-.*)?', verstr)
+    res = re.match(r'^r?(?:\d+\.\d+\.\d+(?:-rc\d+|-alpha\d+)?)(-.*)?', verstr)
     if not res:
         return False
     return res.groups()

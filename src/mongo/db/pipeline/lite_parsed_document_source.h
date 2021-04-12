@@ -34,6 +34,7 @@
 #include <memory>
 #include <vector>
 
+#include "mongo/db/api_parameters.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/namespace_string.h"
@@ -53,10 +54,31 @@ class LiteParsedPipeline;
  */
 class LiteParsedDocumentSource {
 public:
-    LiteParsedDocumentSource(std::string parseTimeName)
-        : _parseTimeName(std::move(parseTimeName)) {}
+    /**
+     * Flags to mark stages with different allowance constrains when API versioning is enabled.
+     */
+    enum class AllowedWithApiStrict {
+        // The stage is always allowed in the pipeline regardless of API versions.
+        kAlways,
+        // This stage can be allowed in a stable API version, depending on the parameters.
+        kSometimes,
+        // The stage is allowed only for internal client when 'apiStrict' is set to true.
+        kInternal,
+        // The stage is never allowed in API version '1' when 'apiStrict' is set to true.
+        kNeverInVersion1
+    };
 
-    virtual ~LiteParsedDocumentSource() = default;
+    /**
+     * Determines the type of client which is permitted to use a particular stage in its command
+     * request. Ensures that only internal clients are permitted to send or deserialize certain
+     * stages.
+     */
+    enum class AllowedWithClientType {
+        // The stage can be specified in the command request of any client.
+        kAny,
+        // The stage can be specified in the command request of an internal client only.
+        kInternal,
+    };
 
     /*
      * This is the type of parser you should register using REGISTER_DOCUMENT_SOURCE. It need not
@@ -68,14 +90,36 @@ public:
      */
     using Parser = std::function<std::unique_ptr<LiteParsedDocumentSource>(const NamespaceString&,
                                                                            const BSONElement&)>;
+
+    struct LiteParserInfo {
+        Parser parser;
+        AllowedWithApiStrict allowedWithApiStrict;
+        AllowedWithClientType allowedWithClientType;
+    };
+
+    LiteParsedDocumentSource(std::string parseTimeName)
+        : _parseTimeName(std::move(parseTimeName)) {}
+
+    virtual ~LiteParsedDocumentSource() = default;
+
     /**
      * Registers a DocumentSource with a spec parsing function, so that when a stage with the given
      * name is encountered, it will call 'parser' to construct that stage's specification object.
+     * The flag 'allowedWithApiStrict' is used to control the allowance of the stage when
+     * 'apiStrict' is set to true.
      *
      * DO NOT call this method directly. Instead, use the REGISTER_DOCUMENT_SOURCE macro defined in
      * document_source.h.
      */
-    static void registerParser(const std::string& name, Parser parser);
+    static void registerParser(const std::string& name,
+                               Parser parser,
+                               AllowedWithApiStrict allowedWithApiStrict,
+                               AllowedWithClientType allowedWithClientType);
+
+    /**
+     * Returns the 'LiteParserInfo' for the specified stage name.
+     */
+    static const LiteParserInfo& getInfo(const std::string& stageName);
 
     /**
      * Constructs a LiteParsedDocumentSource from the user-supplied BSON, or throws a
@@ -99,13 +143,19 @@ public:
                                                bool bypassDocumentValidation) const = 0;
 
     /**
+     * Does any custom assertions necessary to validate this stage is permitted in the given API
+     * Version. For example, if certain stage parameters are permitted but others excluded, that
+     * should happen here.
+     */
+    virtual void assertPermittedInAPIVersion(const APIParameters&) const {
+        // By default there are no custom checks needed. The 'AllowedWithApiStrict' flag should take
+        // care of most cases.
+    }
+
+    /**
      * Returns true if this is a $collStats stage.
      */
     virtual bool isCollStats() const {
-        return false;
-    }
-
-    virtual bool isCollStatsWithCount() const {
         return false;
     }
 

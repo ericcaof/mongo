@@ -15,7 +15,6 @@ selector:
 
   # SERVER-17397 Drops of sharded namespaces may not fully succeed
   - jstests/concurrency/fsm_workloads/create_database.js
-  - jstests/concurrency/fsm_workloads/drop_database.js
 
   # Disabled due to SERVER-33753, '.count() without a predicate can be wrong on sharded
   # collections'. This bug is problematic for these workloads because they assert on count()
@@ -133,6 +132,9 @@ selector:
   # SERVER-44160 Modify cleanupOrphaned to wait for overlapping ranges to finish
   - jstests/concurrency/fsm_workloads/cleanupOrphanedWhileMigrating.js
 
+  # Time-series collections are not supported on mongos.
+  - jstests/concurrency/fsm_workloads/create_timeseries_collection.js
+
   exclude_with_any_tags:
   - assumes_balancer_off
   - does_not_support_causal_consistency
@@ -150,6 +152,10 @@ selector:
   - catches_command_failures
   # mongos has no system.profile collection.
   - requires_profiling
+  # mongos does not support inserts on timeseries collections
+  - requires_timeseries
+  - requires_full_ddl_support
+  - does_not_support_transactions
 
 executor:
   archive:
@@ -166,7 +172,6 @@ executor:
           runInsideTransaction: true
           runningWithSessions: true
           traceExceptions: false
-          usingReplicaSetShards: true
   hooks:
   - class: CheckReplDBHashInBackground
   - class: CheckReplDBHash

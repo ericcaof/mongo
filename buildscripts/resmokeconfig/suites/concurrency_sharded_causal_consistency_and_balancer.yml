@@ -11,7 +11,6 @@ selector:
 
   # SERVER-17397 Drops of sharded namespaces may not fully succeed
   - jstests/concurrency/fsm_workloads/create_database.js
-  - jstests/concurrency/fsm_workloads/drop_database.js
 
   # SERVER-14669 Multi-removes that use $where miscount removed documents
   - jstests/concurrency/fsm_workloads/remove_where.js
@@ -104,6 +103,9 @@ selector:
   # Inserts directly into system.views using applyOps, which is not available on mongos.
   - jstests/concurrency/fsm_workloads/view_catalog_direct_system_writes.js
 
+  # Time-series collections are not supported on mongos.
+  - jstests/concurrency/fsm_workloads/create_timeseries_collection.js
+
   exclude_with_any_tags:
   - does_not_support_causal_consistency
   # This suite uses secondary read preference, which isn't currently compatible with transactions.
@@ -116,6 +118,8 @@ selector:
   - uses_curop_agg_stage
   # mongos has no system.profile collection.
   - requires_profiling
+  # mongos does not support inserts on timeseries collections
+  - requires_timeseries
 
 executor:
   archive:
@@ -130,7 +134,6 @@ executor:
       global_vars:
         TestData:
           runningWithCausalConsistency: true
-          usingReplicaSetShards: true
   hooks:
   - class: CheckReplDBHashInBackground
   - class: CheckReplDBHash

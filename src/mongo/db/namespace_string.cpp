@@ -75,12 +75,17 @@ const NamespaceString NamespaceString::kTenantMigrationDonorsNamespace(Namespace
 const NamespaceString NamespaceString::kTenantMigrationRecipientsNamespace(
     NamespaceString::kConfigDb, "tenantMigrationRecipients");
 
+const NamespaceString NamespaceString::kTenantMigrationOplogView(
+    NamespaceString::kLocalDb, "system.tenantMigration.oplogView");
+
 const NamespaceString NamespaceString::kShardConfigCollectionsNamespace(NamespaceString::kConfigDb,
                                                                         "cache.collections");
 const NamespaceString NamespaceString::kShardConfigDatabasesNamespace(NamespaceString::kConfigDb,
                                                                       "cache.databases");
-const NamespaceString NamespaceString::kSystemKeysNamespace(NamespaceString::kAdminDb,
-                                                            "system.keys");
+const NamespaceString NamespaceString::kKeysCollectionNamespace(NamespaceString::kAdminDb,
+                                                                "system.keys");
+const NamespaceString NamespaceString::kExternalKeysCollectionNamespace(NamespaceString::kConfigDb,
+                                                                        "external_validation_keys");
 const NamespaceString NamespaceString::kRsOplogNamespace(NamespaceString::kLocalDb, "oplog.rs");
 const NamespaceString NamespaceString::kSystemReplSetNamespace(NamespaceString::kLocalDb,
                                                                "system.replset");
@@ -88,6 +93,8 @@ const NamespaceString NamespaceString::kIndexBuildEntryNamespace(NamespaceString
                                                                  "system.indexBuilds");
 const NamespaceString NamespaceString::kRangeDeletionNamespace(NamespaceString::kConfigDb,
                                                                "rangeDeletions");
+const NamespaceString NamespaceString::kRangeDeletionForRenameNamespace(NamespaceString::kConfigDb,
+                                                                        "rangeDeletionsForRename");
 const NamespaceString NamespaceString::kConfigReshardingOperationsNamespace(
     NamespaceString::kConfigDb, "reshardingOperations");
 
@@ -96,6 +103,9 @@ const NamespaceString NamespaceString::kDonorReshardingOperationsNamespace(
 
 const NamespaceString NamespaceString::kRecipientReshardingOperationsNamespace(
     NamespaceString::kConfigDb, "localReshardingOperations.recipient");
+
+const NamespaceString NamespaceString::kShardingDDLCoordinatorsNamespace(
+    NamespaceString::kConfigDb, "system.sharding_ddl_coordinators");
 
 const NamespaceString NamespaceString::kConfigSettingsNamespace(NamespaceString::kConfigDb,
                                                                 "settings");
@@ -108,11 +118,11 @@ const NamespaceString NamespaceString::kReshardingApplierProgressNamespace(
 const NamespaceString NamespaceString::kReshardingTxnClonerProgressNamespace(
     NamespaceString::kConfigDb, "localReshardingOperations.recipient.progress_txn_cloner");
 
-const NamespaceString NamespaceString::kKeysCollectionNamespace(NamespaceString::kAdminDb,
-                                                                "system.keys");
+const NamespaceString NamespaceString::kCollectionCriticalSectionsNamespace(
+    NamespaceString::kConfigDb, "collection_critical_sections");
 
-const NamespaceString NamespaceString::kExternalKeysCollectionNamespace(
-    NamespaceString::kAdminDb, "system.external_validation_keys");
+const NamespaceString NamespaceString::kForceOplogBatchBoundaryNamespace(
+    NamespaceString::kConfigDb, "system.forceOplogBatchBoundary");
 
 bool NamespaceString::isListCollectionsCursorNS() const {
     return coll() == listCollectionsCursorCol;
@@ -122,28 +132,25 @@ bool NamespaceString::isCollectionlessAggregateNS() const {
     return coll() == collectionlessAggregateCursorCol;
 }
 
-bool NamespaceString::isLegalClientSystemNS() const {
+bool NamespaceString::isLegalClientSystemNS(
+    const ServerGlobalParams::FeatureCompatibility& currentFCV) const {
     if (db() == kAdminDb) {
         if (coll() == "system.roles")
             return true;
         if (coll() == kServerConfigurationNamespace.coll())
             return true;
-        if (coll() == kSystemKeysNamespace.coll())
+        if (coll() == kKeysCollectionNamespace.coll())
             return true;
         if (coll() == "system.backup_users")
             return true;
-        if (coll() == kExternalKeysCollectionNamespace.coll()) {
-            // TODO (SERVER-53404): This was added to allow client in an integration test to
-            // manually insert the key document into this system collection. Remove this when the
-            // tenant migration donor does the copying by itself.
-            return true;
-        }
     } else if (db() == kConfigDb) {
         if (coll() == "system.sessions")
             return true;
         if (coll() == kIndexBuildEntryNamespace.coll())
             return true;
         if (coll().find(".system.resharding.") != std::string::npos)
+            return true;
+        if (coll() == kShardingDDLCoordinatorsNamespace.coll())
             return true;
     } else if (db() == kLocalDb) {
         if (coll() == kSystemReplSetNamespace.coll())
@@ -158,7 +165,11 @@ bool NamespaceString::isLegalClientSystemNS() const {
         return true;
     if (coll() == kSystemDotViewsCollectionName)
         return true;
-    if (isTemporaryReshardingCollection()) {
+    if (currentFCV.isGreaterThanOrEqualTo(
+            ServerGlobalParams::FeatureCompatibility::Version::kVersion47) &&
+        // While this FCV check is being added in 4.9, the namespace was allowed in 4.7 binaries
+        // without an FCV check.
+        isTemporaryReshardingCollection()) {
         return true;
     }
     if (isTimeseriesBucketsCollection()) {
@@ -177,7 +188,8 @@ bool NamespaceString::isLegalClientSystemNS() const {
  * processing each operation matches the primary's when committing that operation.
  */
 bool NamespaceString::mustBeAppliedInOwnOplogBatch() const {
-    return isSystemDotViews() || isServerConfigurationCollection() || isPrivilegeCollection();
+    return isSystemDotViews() || isServerConfigurationCollection() || isPrivilegeCollection() ||
+        _ns == kForceOplogBatchBoundaryNamespace.ns();
 }
 
 NamespaceString NamespaceString::makeListCollectionsNSS(StringData dbName) {
@@ -275,11 +287,9 @@ bool NamespaceString::isNamespaceAlwaysUnsharded() const {
     if (db() == NamespaceString::kLocalDb || db() == NamespaceString::kAdminDb)
         return true;
 
-    // Certain config collections can never be sharded
-    if (ns() == kSessionTransactionsTableNamespace.ns() || ns() == kRangeDeletionNamespace.ns() ||
-        ns() == kTransactionCoordinatorsNamespace.ns() || ns() == kVectorClockNamespace.ns() ||
-        ns() == kMigrationCoordinatorsNamespace.ns() || ns() == kIndexBuildEntryNamespace.ns())
-        return true;
+    // Config can only have the system.sessions as sharded
+    if (db() == NamespaceString::kConfigDb)
+        return *this != NamespaceString::kLogicalSessionsNamespace;
 
     if (isSystemDotProfile())
         return true;
@@ -287,15 +297,19 @@ bool NamespaceString::isNamespaceAlwaysUnsharded() const {
     if (isSystemDotViews())
         return true;
 
-    if (ns() == "config.cache.databases" || ns() == "config.cache.collections" ||
-        isConfigDotCacheDotChunks())
-        return true;
-
     return false;
 }
 
 bool NamespaceString::isConfigDotCacheDotChunks() const {
     return db() == "config" && coll().startsWith("cache.chunks.");
+}
+
+bool NamespaceString::isReshardingLocalOplogBufferCollection() const {
+    return db() == "config" && coll().startsWith(kReshardingLocalOplogBufferPrefix);
+}
+
+bool NamespaceString::isReshardingConflictStashCollection() const {
+    return db() == "config" && coll().startsWith(kReshardingConflictStashPrefix);
 }
 
 bool NamespaceString::isTemporaryReshardingCollection() const {

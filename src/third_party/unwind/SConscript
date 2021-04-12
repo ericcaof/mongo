@@ -13,7 +13,14 @@ Import("debugBuild")
 #      linux_x86_64
 #      linux_aarch64
 
-env = env.Clone()
+env = env.Clone(
+    # Libunwind wants to interpose (for better or for worse) on the
+    # libc `backtrace`. Buidling with hidden visibility probably
+    # breaks that. It also seems to interfere with building with the
+    # sanitizers, which use linker maps that reference backtrace. This
+    # may be an ld.gold bug.
+    DISALLOW_VISHIDDEN=True,
+)
 
 unwind_root = env.Dir(".").srcnode()
 unwind_platform = unwind_root.Dir("platform/${TARGET_OS}_${TARGET_ARCH}")
@@ -27,6 +34,7 @@ unwind_src_dir = env.Dir("dist/src")
 #       corresponding .o from that $PREREQ library.
 #     - Replace each .o with the source file (.c or .S) that generated it.
 #     - Ensure the the ${CC} arguments are preserved by SCons.
+#       Note you can skip NDEBUG defines as those should be inherited.
 unwind_sources = [
     'dwarf/global.c',
     'dwarf/Lexpr.c',
@@ -90,11 +98,9 @@ if env['TARGET_ARCH'] == 'aarch64':
 
 env.Append(
     CCFLAGS=[
-        '-fcommon',
         '-fexceptions',
         '-Wno-unused-result',
-        '-Wno-unused-value',
-        '-Wno-unused-variable',
+        '-Wno-pointer-sign'
     ])
 
 if env.ToolchainIs('clang'):

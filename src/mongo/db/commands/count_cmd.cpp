@@ -31,6 +31,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/auth/authorization_checks.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
@@ -125,10 +126,10 @@ public:
         }
 
         const auto hasTerm = false;
-        return authSession->checkAuthForFind(
-            CollectionCatalog::get(opCtx)->resolveNamespaceStringOrUUID(
-                opCtx, CommandHelpers::parseNsOrUUID(dbname, cmdObj)),
-            hasTerm);
+        return auth::checkAuthForFind(authSession,
+                                      CollectionCatalog::get(opCtx)->resolveNamespaceStringOrUUID(
+                                          opCtx, CommandHelpers::parseNsOrUUID(dbname, cmdObj)),
+                                      hasTerm);
     }
 
     Status explain(OperationContext* opCtx,
@@ -145,9 +146,9 @@ public:
                     AutoGetCollectionViewMode::kViewsPermitted);
         const auto nss = ctx->getNss();
 
-        CountCommand request(NamespaceStringOrUUID(NamespaceString{}));
+        CountCommandRequest request(NamespaceStringOrUUID(NamespaceString{}));
         try {
-            request = CountCommand::parse(IDLParserErrorContext("count"), opMsgRequest);
+            request = CountCommandRequest::parse(IDLParserErrorContext("count"), opMsgRequest);
         } catch (...) {
             return exceptionToStatus();
         }
@@ -163,17 +164,17 @@ public:
 
             auto viewAggCmd =
                 OpMsgRequest::fromDBAndBody(nss.db(), viewAggregation.getValue()).body;
-            auto viewAggRequest =
-                aggregation_request_helper::parseFromBSON(nss, viewAggCmd, verbosity);
-            if (!viewAggRequest.isOK()) {
-                return viewAggRequest.getStatus();
-            }
+            auto viewAggRequest = aggregation_request_helper::parseFromBSON(
+                nss,
+                viewAggCmd,
+                verbosity,
+                APIParameters::get(opCtx).getAPIStrict().value_or(false));
 
             // An empty PrivilegeVector is acceptable because these privileges are only checked on
             // getMore and explain will not open a cursor.
             return runAggregate(opCtx,
-                                viewAggRequest.getValue().getNamespace(),
-                                viewAggRequest.getValue(),
+                                viewAggRequest.getNamespace(),
+                                viewAggRequest,
                                 viewAggregation.getValue(),
                                 PrivilegeVector(),
                                 result);
@@ -222,9 +223,9 @@ public:
         const auto& nss = ctx->getNss();
 
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
-            &hangBeforeCollectionCount, opCtx, "hangBeforeCollectionCount", []() {}, false, nss);
+            &hangBeforeCollectionCount, opCtx, "hangBeforeCollectionCount", []() {}, nss);
 
-        auto request = CountCommand::parse(IDLParserErrorContext("count"), cmdObj);
+        auto request = CountCommandRequest::parse(IDLParserErrorContext("count"), cmdObj);
 
         // Check whether we are allowed to read from this node after acquiring our locks.
         auto replCoord = repl::ReplicationCoordinator::get(opCtx);

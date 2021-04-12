@@ -10,17 +10,12 @@
 load("jstests/libs/parallel_shell_helpers.js");
 load("jstests/libs/fail_point_util.js");
 
-const rst = new ReplSetTest({nodes: [{}, {rsConfig: {priority: 0, votes: 0}}]});
-rst.startSet();
-rst.initiate();
-
-const primary = rst.getPrimary();
-const secondary = rst.getSecondary();
-const primaryAdminDB = primary.getDB("admin");
-const secondaryAdminDB = secondary.getDB("admin");
-
 function runAwaitableHelloBeforeFCVChange(
     topologyVersionField, targetFCV, isPrimary, prevMinWireVersion, serverMaxWireVersion) {
+    const isUseSecondaryDelaySecsEnabled = db.adminCommand({
+                                                 getParameter: 1,
+                                                 featureFlagUseSecondaryDelaySecs: 1
+                                             }).featureFlagUseSecondaryDelaySecs.value;
     db.getMongo().setSecondaryOk();
     let response = assert.commandWorked(db.runCommand({
         hello: 1,
@@ -29,6 +24,22 @@ function runAwaitableHelloBeforeFCVChange(
         internalClient:
             {minWireVersion: NumberInt(0), maxWireVersion: NumberInt(serverMaxWireVersion)},
     }));
+    // If 'featureFlagUseSecondaryDelaySecs' is enabled, the primary will reconfig the replica
+    // set on dowgrade. This reconfig will increment the 'topologyVersion'
+    // before the 'minWireVersion' is updated. Therefore, we send another 'hello'
+    // command to wait for the downgrade to complete before validating the
+    // 'minWireVersion'.
+    if (isUseSecondaryDelaySecsEnabled && prevMinWireVersion === response.minWireVersion) {
+        jsTestLog("Min wire version didn't change: " + prevMinWireVersion + ". Retrying hello.");
+        topologyVersionField = response.topologyVersion;
+        response = assert.commandWorked(db.runCommand({
+            hello: 1,
+            topologyVersion: topologyVersionField,
+            maxAwaitTimeMS: 99999999,
+            internalClient:
+                {minWireVersion: NumberInt(0), maxWireVersion: NumberInt(serverMaxWireVersion)},
+        }));
+    }
 
     // We only expect to increment the server TopologyVersion when the minWireVersion has changed.
     // This can only happen in two scenarios:
@@ -56,6 +67,15 @@ function runAwaitableHelloBeforeFCVChange(
 
 function runTest(downgradeFCV) {
     jsTestLog("Running test with downgradeFCV: " + downgradeFCV);
+
+    const rst = new ReplSetTest({nodes: [{}, {rsConfig: {priority: 0, votes: 0}}]});
+    rst.startSet();
+    rst.initiate();
+
+    const primary = rst.getPrimary();
+    const secondary = rst.getSecondary();
+    const primaryAdminDB = primary.getDB("admin");
+    const secondaryAdminDB = secondary.getDB("admin");
 
     // This test manually runs hello with the 'internalClient' field, which means that to the
     // mongod, the connection appears to be from another server. This makes mongod to return an
@@ -314,10 +334,9 @@ function runTest(downgradeFCV) {
         secondaryAdminDB.serverStatus().connections.awaitingTopologyChanges;
     assert.eq(0, numAwaitingTopologyChangeOnPrimary);
     assert.eq(0, numAwaitingTopologyChangeOnSecondary);
+    rst.stopSet();
 }
 
 runTest(lastLTSFCV);
 runTest(lastContinuousFCV);
-
-rst.stopSet();
 })();

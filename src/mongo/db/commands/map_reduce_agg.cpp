@@ -59,7 +59,7 @@ namespace mongo::map_reduce_agg {
 namespace {
 
 auto makeExpressionContext(OperationContext* opCtx,
-                           const MapReduce& parsedMr,
+                           const MapReduceCommandRequest& parsedMr,
                            boost::optional<ExplainOptions::Verbosity> verbosity) {
     // AutoGetCollectionForReadCommand will throw if the sharding version for this connection is
     // out of date.
@@ -123,15 +123,14 @@ bool runAggregationMapReduce(OperationContext* opCtx,
 
     Timer cmdTimer;
 
-    auto parsedMr = MapReduce::parse(IDLParserErrorContext("MapReduce"), cmd);
+    auto parsedMr = MapReduceCommandRequest::parse(IDLParserErrorContext("mapReduce"), cmd);
     auto expCtx = makeExpressionContext(opCtx, parsedMr, verbosity);
     auto runnablePipeline = [&]() {
         auto pipeline = map_reduce_common::translateFromMR(parsedMr, expCtx);
         return expCtx->mongoProcessInterface->attachCursorSourceToPipelineForLocalRead(
             pipeline.release());
     }();
-    auto exec = plan_executor_factory::make(
-        expCtx, std::move(runnablePipeline), false /* isChangeStream */);
+    auto exec = plan_executor_factory::make(expCtx, std::move(runnablePipeline));
     auto&& explainer = exec->getPlanExplainer();
 
     {

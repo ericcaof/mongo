@@ -7,7 +7,6 @@
  *   # Sort optimizations added in 4.7 can generate a different plan in the presence of equality
  *   # predicates.
  *   requires_fcv_47,
- *   sbe_incompatible,
  * ]
  */
 (function() {

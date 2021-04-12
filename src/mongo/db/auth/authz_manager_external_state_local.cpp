@@ -34,9 +34,6 @@
 #include "mongo/db/auth/authz_manager_external_state_local.h"
 
 #include "mongo/base/status.h"
-#include "mongo/bson/mutable/algorithm.h"
-#include "mongo/bson/mutable/document.h"
-#include "mongo/bson/mutable/element.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/address_restriction.h"
 #include "mongo/db/auth/auth_options_gen.h"
@@ -254,13 +251,18 @@ bool AuthzManagerExternalStateLocal::hasAnyPrivilegeDocuments(OperationContext* 
 }
 
 AuthzManagerExternalStateLocal::RolesLocks::RolesLocks(OperationContext* opCtx) {
-    _adminLock =
-        std::make_unique<Lock::DBLock>(opCtx, NamespaceString::kAdminDb, LockMode::MODE_IS);
-    _rolesLock = std::make_unique<Lock::CollectionLock>(
-        opCtx, AuthorizationManager::rolesCollectionNamespace, LockMode::MODE_S);
+    if (!storageGlobalParams.disableLockFreeReads) {
+        _readLockFree = std::make_unique<AutoReadLockFree>(opCtx);
+    } else {
+        _adminLock =
+            std::make_unique<Lock::DBLock>(opCtx, NamespaceString::kAdminDb, LockMode::MODE_IS);
+        _rolesLock = std::make_unique<Lock::CollectionLock>(
+            opCtx, AuthorizationManager::rolesCollectionNamespace, LockMode::MODE_S);
+    }
 }
 
 AuthzManagerExternalStateLocal::RolesLocks::~RolesLocks() {
+    _readLockFree.reset(nullptr);
     _rolesLock.reset(nullptr);
     _adminLock.reset(nullptr);
 }
@@ -315,6 +317,12 @@ StatusWith<User> AuthzManagerExternalStateLocal::getUserObject(OperationContext*
     user.setIndirectRoles(makeRoleNameIteratorForContainer(data.roles.get()));
     user.addPrivileges(data.privileges.get());
     user.setIndirectRestrictions(data.restrictions.get());
+
+    LOGV2_DEBUG(5517200,
+                3,
+                "Acquired new user object",
+                "userName"_attr = userName,
+                "directRoles"_attr = directRoles);
 
     return std::move(user);
 } catch (const AssertionException& ex) {

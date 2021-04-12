@@ -41,11 +41,13 @@ namespace mongo {
 class PlanExplainerSBE final : public PlanExplainer {
 public:
     PlanExplainerSBE(const sbe::PlanStage* root,
+                     const stage_builder::PlanStageData* data,
                      const QuerySolution* solution,
                      std::vector<sbe::plan_ranker::CandidatePlan> rejectedCandidates,
                      bool isMultiPlan)
         : PlanExplainer{solution},
           _root{root},
+          _rootData{data},
           _solution{solution},
           _rejectedCandidates{std::move(rejectedCandidates)},
           _isMultiPlan{isMultiPlan} {}
@@ -54,6 +56,7 @@ public:
         return _isMultiPlan;
     }
 
+    const ExplainVersion& getVersion() const final;
     std::string getPlanSummary() const final;
     void getSummaryStats(PlanSummaryStats* statsOut) const final;
     PlanStatsDetails getWinningPlanStats(ExplainOptions::Verbosity verbosity) const final;
@@ -63,8 +66,20 @@ public:
                                                      ExplainOptions::Verbosity) const final;
 
 private:
+    boost::optional<BSONObj> buildExecPlanDebugInfo(
+        const sbe::PlanStage* root, const stage_builder::PlanStageData* data) const {
+        if (root && data) {
+            return BSON("slots" << data->debugString() << "stages"
+                                << sbe::DebugPrinter().print(*_root));
+        }
+        return boost::none;
+    }
+
+    // These fields are are owned elsewhere (e.g. the PlanExecutor or CandidatePlan).
     const sbe::PlanStage* _root{nullptr};
+    const stage_builder::PlanStageData* _rootData{nullptr};
     const QuerySolution* _solution{nullptr};
+
     const std::vector<sbe::plan_ranker::CandidatePlan> _rejectedCandidates;
     const bool _isMultiPlan{false};
 };

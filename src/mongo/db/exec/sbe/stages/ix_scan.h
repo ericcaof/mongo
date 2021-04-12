@@ -31,7 +31,7 @@
 
 #include "mongo/bson/ordering.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/exec/sbe/stages/lock_acquisition_callback.h"
+#include "mongo/db/exec/sbe/stages/collection_helpers.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
@@ -59,8 +59,8 @@ namespace mongo::sbe {
  */
 class IndexScanStage final : public PlanStage {
 public:
-    IndexScanStage(const NamespaceStringOrUUID& name,
-                   std::string_view indexName,
+    IndexScanStage(CollectionUUID collUuid,
+                   StringData indexName,
                    bool forward,
                    boost::optional<value::SlotId> recordSlot,
                    boost::optional<value::SlotId> recordIdSlot,
@@ -93,7 +93,14 @@ protected:
     void doAttachToTrialRunTracker(TrialRunTracker* tracker) override;
 
 private:
-    const NamespaceStringOrUUID _name;
+    /**
+     * When this stage is re-opened after being closed, or during yield recovery, called to verify
+     * that the index (and the index's collection) remain valid. If any validity check fails, throws
+     * a UserException that terminates execution of the query.
+     */
+    void restoreCollectionAndIndex();
+
+    const CollectionUUID _collUuid;
     const std::string _indexName;
     const bool _forward;
     const boost::optional<value::SlotId> _recordSlot;
@@ -102,6 +109,9 @@ private:
     const value::SlotVector _vars;
     const boost::optional<value::SlotId> _seekKeySlotLow;
     const boost::optional<value::SlotId> _seekKeySlotHigh;
+
+    NamespaceString _collName;
+    uint64_t _catalogEpoch;
 
     LockAcquisitionCallback _lockAcquisitionCallback;
 

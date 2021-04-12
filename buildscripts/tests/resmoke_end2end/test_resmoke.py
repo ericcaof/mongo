@@ -7,10 +7,11 @@ import os.path
 import sys
 import time
 import unittest
+from shutil import rmtree
+
 import yaml
 
 from buildscripts.resmokelib import core
-from buildscripts.resmokelib.utils import rmtree
 
 # pylint: disable=missing-docstring,protected-access
 
@@ -120,7 +121,7 @@ class TestTimeout(_ResmokeSelftest):
         rmtree(self.test_dir_inner, ignore_errors=True)
 
     def signal_resmoke(self):
-        hang_analyzer_options = f"-o=file -o=stdout -m=contains -d={self.resmoke_process.pid}"
+        hang_analyzer_options = f"-o=file -o=stdout -m=contains -p=python -d={self.resmoke_process.pid}"
         signal_resmoke_process = core.programs.make_process(
             self.logger, [sys.executable, "buildscripts/resmoke.py", "hang-analyzer"
                           ] + hang_analyzer_options.split())

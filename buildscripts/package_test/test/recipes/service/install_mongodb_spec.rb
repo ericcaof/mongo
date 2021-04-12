@@ -31,16 +31,6 @@ describe command("#{service} mongod stop") do
   its('exit_status') { should eq 0 }
 end
 
-if (os[:name] == 'amazon' and os[:release] == '2.0')
-  describe systemd_service('mongod') do
-    it { should_not be_running }
-  end
-else
-  describe service('mongod') do
-    it { should_not be_running }
-  end
-end
-
 describe command("#{service} mongod restart") do
   its('exit_status') { should eq 0 }
 end
@@ -55,17 +45,34 @@ else
   end
 end
 
-if os[:arch] == 'x86_64' and 
-  ((os[:name] == 'ubuntu' and os[:release].split('.')[0].to_i > 12) or 
-    (os[:family] == 'redhat' and os[:release].split('.')[0].to_i >= 7) or 
-    (os[:name] == 'debian' and os[:release].split('.')[0].to_i >= 10) or
-    os[:name] == 'amazon')
-  describe command("install_compass") do
-    its('exit_status') { should eq 0 }
+if os[:arch] == 'x86_64'
+  # install_compass does not run Amazon Linux but *does* run on Amazon Linux 2,
+  # but the 'redhat' family includes both, apparently. We need to specifically
+  # exclude Amazon Linux from the set of allowed distributions here because the
+  # version strings would otherwise pass it.
+  if ((os[:family] == 'redhat' and os[:name] != "amazon" and os[:release].split('.')[0].to_i >= 7) or
+      (os[:name] == 'ubuntu' and os[:release].split('.')[0].to_i >= 16) or
+      (os[:name] == 'debian' and os[:release].split('.')[0].to_i >= 9) or
+      (os[:name] == 'amazon' and os[:release].split('.')[0].to_i == 2))
+    describe command("install_compass") do
+      its('exit_status') { should eq 0 }
+      its('stderr') { should eq '' }
+    end
+  elsif os[:name] == 'suse'
+    describe command("install_compass") do
+      its('exit_status') { should eq 1 }
+      its('stderr') { should match /You are using an unsupported platform/ }
+    end
+  else
+    describe command("install_compass") do
+      its('exit_status') { should eq 1 }
+      its('stderr') { should match /You are using an unsupported Linux distribution/ }
+    end
   end
 else
   describe command("install_compass") do
-    its('exit_status') { should_not eq 0 }
+    its('exit_status') { should eq 1 }
+    its('stderr') { should match /Sorry, MongoDB Compass is only supported on 64-bit Intel platforms/ }
   end
 end
 
@@ -118,7 +125,14 @@ if sysvinit
 end
 
 if systemd
-  describe file('/lib/systemd/system/mongod.service') do
+  unit_file_prefix = ''
+  if os[:name] == 'suse'
+    # Putting systemd unit files in /usr, which may be a separate partition
+    # and therefore not available during isolated startups, is bad practice.
+    # But it's what SUSE has chosen to do, so we have to deal with it.
+    unit_file_prefix = '/usr'
+  end
+  describe file("#{unit_file_prefix}/lib/systemd/system/mongod.service") do
     it { should be_file }
   end
 end

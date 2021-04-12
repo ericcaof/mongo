@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2020 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -97,7 +97,7 @@ __wt_stats_aggregate(void *stats_arg, int slot)
     int64_t **stats, aggr_v;
     int i;
 
-    stats = stats_arg;
+    stats = (int64_t **)stats_arg;
     for (aggr_v = 0, i = 0; i < WT_COUNTER_SLOTS; i++)
         aggr_v += stats[i][slot];
 
@@ -128,7 +128,7 @@ __wt_stats_clear(void *stats_arg, int slot)
     int64_t **stats;
     int i;
 
-    stats = stats_arg;
+    stats = (int64_t **)stats_arg;
     for (i = 0; i < WT_COUNTER_SLOTS; i++)
         stats[i][slot] = 0;
 }
@@ -400,6 +400,7 @@ struct __wt_connection_stats {
     int64_t cache_eviction_pages_queued_post_lru;
     int64_t cache_eviction_pages_queued_urgent;
     int64_t cache_eviction_pages_queued_oldest;
+    int64_t cache_eviction_pages_queued_urgent_hs_dirty;
     int64_t cache_eviction_pages_already_queued;
     int64_t cache_eviction_fail;
     int64_t cache_eviction_fail_parent_has_overflow_items;
@@ -450,10 +451,8 @@ struct __wt_connection_stats {
     int64_t cursor_modify_bytes;
     int64_t cursor_modify_bytes_touch;
     int64_t cursor_next;
-    int64_t cursor_next_hs_tombstone_rts;
     int64_t cursor_restart;
     int64_t cursor_prev;
-    int64_t cursor_prev_hs_tombstone_rts;
     int64_t cursor_remove;
     int64_t cursor_remove_bytes;
     int64_t cursor_reserve;
@@ -477,6 +476,7 @@ struct __wt_connection_stats {
     int64_t dh_sweep_remove;
     int64_t dh_sweep_tod;
     int64_t dh_sweeps;
+    int64_t dh_sweep_skip_ckpt;
     int64_t dh_session_handles;
     int64_t dh_session_sweeps;
     int64_t lock_checkpoint_count;
@@ -576,6 +576,8 @@ struct __wt_connection_stats {
     int64_t perf_hist_opwrite_latency_lt1000;
     int64_t perf_hist_opwrite_latency_lt10000;
     int64_t perf_hist_opwrite_latency_gt10000;
+    int64_t rec_overflow_key_internal;
+    int64_t rec_overflow_key_leaf;
     int64_t rec_maximum_seconds;
     int64_t rec_pages_with_prepare;
     int64_t rec_pages_with_ts;
@@ -585,6 +587,7 @@ struct __wt_connection_stats {
     int64_t rec_time_window_prepared;
     int64_t rec_split_stashed_bytes;
     int64_t rec_split_stashed_objects;
+    int64_t flush_tier;
     int64_t session_open;
     int64_t session_query_ts;
     int64_t session_table_alter_fail;
@@ -623,21 +626,11 @@ struct __wt_connection_stats {
     int64_t page_del_rollback_blocked;
     int64_t child_modify_blocked_page;
     int64_t txn_prepared_updates_count;
-    int64_t txn_durable_queue_walked;
-    int64_t txn_durable_queue_empty;
-    int64_t txn_durable_queue_head;
-    int64_t txn_durable_queue_inserts;
-    int64_t txn_durable_queue_len;
     int64_t txn_prepare;
     int64_t txn_prepare_commit;
     int64_t txn_prepare_active;
     int64_t txn_prepare_rollback;
     int64_t txn_query_ts;
-    int64_t txn_read_queue_walked;
-    int64_t txn_read_queue_empty;
-    int64_t txn_read_queue_head;
-    int64_t txn_read_queue_inserts;
-    int64_t txn_read_queue_len;
     int64_t txn_rts;
     int64_t txn_rts_pages_visited;
     int64_t txn_rts_tree_walk_skip_pages;
@@ -683,6 +676,7 @@ struct __wt_connection_stats {
     int64_t txn_pinned_timestamp_oldest;
     int64_t txn_timestamp_oldest_active_read;
     int64_t txn_sync;
+    int64_t txn_walk_sessions;
     int64_t txn_commit;
     int64_t txn_rollback;
     int64_t lsm_checkpoint_throttle;
@@ -697,6 +691,7 @@ struct __wt_connection_stats {
     int64_t cache_eviction_target_page_ge128;
     int64_t cache_eviction_target_page_lt64;
     int64_t cache_eviction_target_page_lt128;
+    int64_t cache_eviction_target_page_reduced;
     int64_t cache_eviction_walks_abandoned;
     int64_t cache_eviction_walks_stopped;
     int64_t cache_eviction_walks_gave_up_no_targets;
@@ -776,13 +771,18 @@ struct __wt_connection_stats {
     int64_t rec_time_window_durable_stop_ts;
     int64_t rec_time_window_stop_ts;
     int64_t rec_time_window_stop_txn;
+    int64_t tiered_retention;
+    int64_t tiered_object_size;
     int64_t txn_read_race_prepare_update;
     int64_t txn_rts_hs_stop_older_than_newer_start;
+    int64_t txn_rts_inconsistent_ckpt;
     int64_t txn_rts_keys_removed;
     int64_t txn_rts_keys_restored;
     int64_t txn_rts_hs_restore_tombstones;
+    int64_t txn_rts_hs_restore_updates;
     int64_t txn_rts_sweep_hs_keys;
     int64_t txn_rts_hs_removed;
+    int64_t txn_checkpoint_obsolete_applied;
     int64_t txn_update_conflict;
 };
 
@@ -909,6 +909,7 @@ struct __wt_dsrc_stats {
     int64_t cache_eviction_target_page_ge128;
     int64_t cache_eviction_target_page_lt64;
     int64_t cache_eviction_target_page_lt128;
+    int64_t cache_eviction_target_page_reduced;
     int64_t cache_eviction_walks_abandoned;
     int64_t cache_eviction_walks_stopped;
     int64_t cache_eviction_walks_gave_up_no_targets;
@@ -988,13 +989,18 @@ struct __wt_dsrc_stats {
     int64_t rec_time_window_durable_stop_ts;
     int64_t rec_time_window_stop_ts;
     int64_t rec_time_window_stop_txn;
+    int64_t tiered_retention;
+    int64_t tiered_object_size;
     int64_t txn_read_race_prepare_update;
     int64_t txn_rts_hs_stop_older_than_newer_start;
+    int64_t txn_rts_inconsistent_ckpt;
     int64_t txn_rts_keys_removed;
     int64_t txn_rts_keys_restored;
     int64_t txn_rts_hs_restore_tombstones;
+    int64_t txn_rts_hs_restore_updates;
     int64_t txn_rts_sweep_hs_keys;
     int64_t txn_rts_hs_removed;
+    int64_t txn_checkpoint_obsolete_applied;
     int64_t txn_update_conflict;
 };
 

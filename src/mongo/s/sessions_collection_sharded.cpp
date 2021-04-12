@@ -34,7 +34,7 @@
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/canonical_query.h"
-#include "mongo/db/query/query_request.h"
+#include "mongo/db/query/query_request_helper.h"
 #include "mongo/db/sessions_collection_rs.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/op_msg.h"
@@ -42,16 +42,15 @@
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/cluster_write.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_find.h"
 #include "mongo/s/write_ops/batch_write_exec.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/s/write_ops/cluster_write.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
-
 namespace {
 
 BSONObj lsidQuery(const LogicalSessionId& lsid) {
@@ -135,7 +134,7 @@ void SessionsCollectionSharded::refreshSessions(OperationContext* opCtx,
         BatchedCommandResponse response;
         BatchWriteExecStats stats;
 
-        ClusterWriter::write(opCtx, request, &stats, &response);
+        cluster::write(opCtx, request, &stats, &response);
         uassertStatusOK(response.toStatus());
     };
 
@@ -154,7 +153,7 @@ void SessionsCollectionSharded::removeRecords(OperationContext* opCtx,
         BatchedCommandResponse response;
         BatchWriteExecStats stats;
 
-        ClusterWriter::write(opCtx, request, &stats, &response);
+        cluster::write(opCtx, request, &stats, &response);
         uassertStatusOK(response.toStatus());
     };
 
@@ -166,18 +165,20 @@ void SessionsCollectionSharded::removeRecords(OperationContext* opCtx,
 LogicalSessionIdSet SessionsCollectionSharded::findRemovedSessions(
     OperationContext* opCtx, const LogicalSessionIdSet& sessions) {
 
+    bool apiStrict = APIParameters::get(opCtx).getAPIStrict().value_or(false);
     auto send = [&](BSONObj toSend) -> BSONObj {
         // If there is no '$db', append it.
         toSend =
             OpMsgRequest::fromDBAndBody(NamespaceString::kLogicalSessionsNamespace.db(), toSend)
                 .body;
-        auto qr = QueryRequest::makeFromFindCommand(
-            toSend, false, NamespaceString::kLogicalSessionsNamespace);
+        auto findCommand = query_request_helper::makeFromFindCommand(
+            toSend, NamespaceString::kLogicalSessionsNamespace, apiStrict);
 
         const boost::intrusive_ptr<ExpressionContext> expCtx;
         auto cq = uassertStatusOK(
             CanonicalQuery::canonicalize(opCtx,
-                                         std::move(qr),
+                                         std::move(findCommand),
+                                         false,
                                          expCtx,
                                          ExtensionsCallbackNoop(),
                                          MatchExpressionParser::kBanAllSpecialFeatures));

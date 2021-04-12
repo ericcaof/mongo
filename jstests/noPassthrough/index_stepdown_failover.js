@@ -2,7 +2,7 @@
  * Confirms that index builds on a stepped down primary are not aborted and will
  * wait for a commitIndexBuild from the new primary before committing.
  * @tags: [
- *     requires_replication,
+ *   requires_replication,
  * ]
  */
 (function() {

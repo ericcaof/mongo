@@ -77,6 +77,7 @@ protected:
             return Status::OK();
         };
         _mockClient->setOperationTime(_operationTime);
+        _mockServer->setCommandReply("collStats", BSON("size" << 1));
     }
 
     std::unique_ptr<TenantDatabaseCloner> makeDatabaseCloner(
@@ -699,6 +700,8 @@ TEST_F(TenantDatabaseClonerTest, ResumingFromLastClonedCollection) {
     ASSERT_EQUALS(1U, collections.size());
     ASSERT_EQ(NamespaceString(_dbName, "b"), collections[0].first);
     ASSERT_BSONOBJ_EQ(BSON("uuid" << uuid[1]), collections[0].second.toBSON());
+
+    ASSERT_EQUALS(1, cloner->getStats().clonedCollectionsBeforeFailover);
 }
 
 TEST_F(TenantDatabaseClonerTest, LastClonedCollectionDeleted_AllGreater) {
@@ -746,6 +749,8 @@ TEST_F(TenantDatabaseClonerTest, LastClonedCollectionDeleted_AllGreater) {
     ASSERT_BSONOBJ_EQ(BSON("uuid" << uuid[1]), collections[0].second.toBSON());
     ASSERT_EQ(NamespaceString(_dbName, "c"), collections[1].first);
     ASSERT_BSONOBJ_EQ(BSON("uuid" << uuid[2]), collections[1].second.toBSON());
+
+    ASSERT_EQUALS(1, cloner->getStats().clonedCollectionsBeforeFailover);
 }
 
 TEST_F(TenantDatabaseClonerTest, LastClonedCollectionDeleted_SomeGreater) {
@@ -793,6 +798,8 @@ TEST_F(TenantDatabaseClonerTest, LastClonedCollectionDeleted_SomeGreater) {
     ASSERT_EQUALS(1U, collections.size());
     ASSERT_EQ(NamespaceString(_dbName, "c"), collections[0].first);
     ASSERT_BSONOBJ_EQ(BSON("uuid" << uuid[2]), collections[0].second.toBSON());
+
+    ASSERT_EQUALS(2, cloner->getStats().clonedCollectionsBeforeFailover);
 }
 
 TEST_F(TenantDatabaseClonerTest, LastClonedCollectionDeleted_AllLess) {
@@ -841,6 +848,8 @@ TEST_F(TenantDatabaseClonerTest, LastClonedCollectionDeleted_AllLess) {
 
     // Nothing to clone.
     ASSERT_EQUALS(0U, collections.size());
+
+    ASSERT_EQUALS(3, cloner->getStats().clonedCollectionsBeforeFailover);
 }
 
 }  // namespace repl

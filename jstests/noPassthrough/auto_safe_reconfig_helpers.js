@@ -1,7 +1,9 @@
 /**
  * Test that the 'reconfig' helper function correctly executes arbitrary reconfigs.
  *
- *  @tags: [requires_replication]
+ * @tags: [
+ *   requires_replication,
+ * ]
  */
 (function() {
 "use strict";

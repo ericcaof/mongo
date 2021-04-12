@@ -2,7 +2,9 @@
  * Test that the 'reconfig' helper function correctly executes reconfigs between configs that have
  * the maximum number of allowed voting nodes.
  *
- * @tags: [requires_replication]
+ * @tags: [
+ *   requires_replication,
+ * ]
  */
 (function() {
 "use strict";

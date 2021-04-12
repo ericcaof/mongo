@@ -57,15 +57,22 @@ using OplogSlot = repl::OpTime;
 struct InsertStatement {
 public:
     InsertStatement() = default;
-    explicit InsertStatement(BSONObj toInsert) : doc(toInsert) {}
+    explicit InsertStatement(BSONObj toInsert) : doc(std::move(toInsert)) {}
 
-    InsertStatement(StmtId statementId, BSONObj toInsert) : stmtId(statementId), doc(toInsert) {}
-    InsertStatement(StmtId statementId, BSONObj toInsert, OplogSlot os)
-        : stmtId(statementId), oplogSlot(os), doc(toInsert) {}
+    InsertStatement(std::vector<StmtId> statementIds, BSONObj toInsert)
+        : stmtIds(statementIds), doc(std::move(toInsert)) {}
+    InsertStatement(StmtId stmtId, BSONObj toInsert)
+        : InsertStatement(std::vector<StmtId>{stmtId}, std::move(toInsert)) {}
+
+    InsertStatement(std::vector<StmtId> statementIds, BSONObj toInsert, OplogSlot os)
+        : stmtIds(statementIds), oplogSlot(std::move(os)), doc(std::move(toInsert)) {}
+    InsertStatement(StmtId stmtId, BSONObj toInsert, OplogSlot os)
+        : InsertStatement(std::vector<StmtId>{stmtId}, std::move(toInsert), std::move(os)) {}
+
     InsertStatement(BSONObj toInsert, Timestamp ts, long long term)
-        : oplogSlot(repl::OpTime(ts, term)), doc(toInsert) {}
+        : oplogSlot(repl::OpTime(ts, term)), doc(std::move(toInsert)) {}
 
-    StmtId stmtId = kUninitializedStmtId;
+    std::vector<StmtId> stmtIds = {kUninitializedStmtId};
     OplogSlot oplogSlot;
     BSONObj doc;
 };
@@ -83,8 +90,8 @@ struct OplogLink {
 
 /**
  * Set the "lsid", "txnNumber", "stmtId", "prevOpTime", "preImageOpTime" and "postImageOpTime"
- * fields of the oplogEntry based on the given oplogLink for retryable writes (i.e. when stmtId !=
- * kUninitializedStmtId).
+ * fields of the oplogEntry based on the given oplogLink for retryable writes (i.e. when
+ * stmtIds.front() != kUninitializedStmtId).
  *
  * If the given oplogLink.prevOpTime is a null OpTime, both the oplogLink.prevOpTime and the
  * "prevOpTime" field of the oplogEntry will be set to the TransactionParticipant's lastWriteOpTime.
@@ -95,7 +102,7 @@ struct OplogLink {
 void appendOplogEntryChainInfo(OperationContext* opCtx,
                                MutableOplogEntry* oplogEntry,
                                OplogLink* oplogLink,
-                               StmtId stmtId);
+                               const std::vector<StmtId>& stmtIds);
 
 /**
  * Create a new capped collection for the oplog if it doesn't yet exist.
@@ -124,10 +131,12 @@ void createOplog(OperationContext* opCtx);
  * defined by the begin-end range.
  *
  */
-std::vector<OpTime> logInsertOps(OperationContext* opCtx,
-                                 MutableOplogEntry* oplogEntryTemplate,
-                                 std::vector<InsertStatement>::const_iterator begin,
-                                 std::vector<InsertStatement>::const_iterator end);
+std::vector<OpTime> logInsertOps(
+    OperationContext* opCtx,
+    MutableOplogEntry* oplogEntryTemplate,
+    std::vector<InsertStatement>::const_iterator begin,
+    std::vector<InsertStatement>::const_iterator end,
+    std::function<boost::optional<ShardId>(const BSONObj& doc)> getDestinedRecipientFn);
 
 /**
  * Returns the optime of the oplog entry written to the oplog.
@@ -136,7 +145,7 @@ std::vector<OpTime> logInsertOps(OperationContext* opCtx,
 OpTime logOp(OperationContext* opCtx, MutableOplogEntry* oplogEntry);
 
 // Flush out the cached pointer to the oplog.
-void clearLocalOplogPtr();
+void clearLocalOplogPtr(ServiceContext* service);
 
 /**
  * Establish the cached pointer to the local oplog.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2020 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -26,6 +26,10 @@
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 #
+# [TEST_TAGS]
+# ignored_file
+# [END_TAGS]
+#
 # WiredTigerTestCase
 #   parent class for all test cases
 #
@@ -39,7 +43,7 @@ except ImportError:
 
 from contextlib import contextmanager
 import errno, glob, os, re, shutil, sys, time, traceback
-import wiredtiger, wtscenario
+import wiredtiger, wtscenario, wthooks
 
 def shortenWithEllipsis(s, maxlen):
     if len(s) > maxlen:
@@ -179,6 +183,7 @@ class ExtensionList(list):
 class WiredTigerTestCase(unittest.TestCase):
     _globalSetup = False
     _printOnceSeen = {}
+    _ttyDescriptor = None   # set this early, to allow tty() to be called any time.
 
     # conn_config can be overridden to add to basic connection configuration.
     # Can be a string or a callable function or lambda expression.
@@ -196,14 +201,15 @@ class WiredTigerTestCase(unittest.TestCase):
     conn_extensions = ()
 
     @staticmethod
-    def globalSetup(preserveFiles = False, useTimestamp = False,
+    def globalSetup(preserveFiles = False, removeAtStart = True, useTimestamp = False,
                     gdbSub = False, lldbSub = False, verbose = 1, builddir = None, dirarg = None,
-                    longtest = False, ignoreStdout = False):
+                    longtest = False, ignoreStdout = False, seedw = 0, seedz = 0, hookmgr = None):
         WiredTigerTestCase._preserveFiles = preserveFiles
         d = 'WT_TEST' if dirarg == None else dirarg
         if useTimestamp:
             d += '.' + time.strftime('%Y%m%d-%H%M%S', time.localtime())
-        shutil.rmtree(d, ignore_errors=True)
+        if removeAtStart:
+            shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
         wtscenario.set_long_run(longtest)
         WiredTigerTestCase._parentTestdir = d
@@ -220,7 +226,14 @@ class WiredTigerTestCase(unittest.TestCase):
         WiredTigerTestCase._stderr = sys.stderr
         WiredTigerTestCase._concurrent = False
         WiredTigerTestCase._globalSetup = True
-        WiredTigerTestCase._ttyDescriptor = None
+        WiredTigerTestCase._seeds = [521288629, 362436069]
+        WiredTigerTestCase._randomseed = False
+        if hookmgr == None:
+            hookmgr = wthooks.WiredTigerHookManager()
+        WiredTigerTestCase._hookmgr = hookmgr
+        if seedw != 0 and seedz != 0:
+            WiredTigerTestCase._randomseed = True
+            WiredTigerTestCase._seeds = [seedw, seedz]
 
     def fdSetUp(self):
         self.captureout = CapturedFd('stdout.txt', 'standard output')
@@ -343,7 +356,6 @@ class WiredTigerTestCase(unittest.TestCase):
             print("Failed wiredtiger_open: dir '%s', config '%s'" % \
                 (home, conn_param))
             raise e
-        self.pr(repr(conn))
         return conn
 
     # Replacement for wiredtiger.wiredtiger_open that returns
@@ -470,7 +482,6 @@ class WiredTigerTestCase(unittest.TestCase):
             except:
                 pass
         self._connections = []
-
         try:
             self.fdTearDown()
             self.captureout.check(self)
@@ -757,6 +768,9 @@ def longtest(description):
 def islongtest():
     return WiredTigerTestCase._longtest
 
+def getseed():
+    return WiredTigerTestCase._seeds
+
 def runsuite(suite, parallel):
     suite_to_run = suite
     if parallel > 1:
@@ -766,6 +780,9 @@ def runsuite(suite, parallel):
         WiredTigerTestCase._concurrent = True
         suite_to_run = ConcurrentTestSuite(suite, fork_for_tests(parallel))
     try:
+        if WiredTigerTestCase._randomseed:
+            WiredTigerTestCase.prout("Starting test suite with seedw={0} and seedz={1}. Rerun this test with -seed {0}.{1} to get the same randomness"
+                .format(str(WiredTigerTestCase._seeds[0]), str(WiredTigerTestCase._seeds[1])))
         return unittest.TextTestRunner(
             verbosity=WiredTigerTestCase._verbose).run(suite_to_run)
     except BaseException as e:

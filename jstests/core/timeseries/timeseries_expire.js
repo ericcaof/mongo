@@ -2,13 +2,11 @@
  * Tests that a time-series collection created with the 'expireAfterSeconds' option will remove
  * buckets older than 'expireAfterSeconds' based on the bucket creation time.
  * @tags: [
- *     assumes_unsharded_collection,         # TODO(SERVER-53816): remove
- *     does_not_support_causal_consistency,  # TODO(SERVER-53819): remove
+ *     assumes_no_implicit_collection_creation_after_drop,
  *     does_not_support_stepdowns,
  *     requires_fcv_49,
  *     requires_find_command,
  *     requires_getmore,
- *     sbe_incompatible,
  * ]
  */
 (function() {
@@ -21,20 +19,17 @@ if (!TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo())) {
     return;
 }
 
-const testDB = db.getSiblingDB(jsTestName());
-assert.commandWorked(testDB.dropDatabase());
-
-const coll = testDB.getCollection('t');
-const bucketsColl = testDB.getCollection('system.buckets.' + coll.getName());
+const coll = db.timeseries_expire;
+const bucketsColl = db.getCollection('system.buckets.' + coll.getName());
 
 coll.drop();
 
 const timeFieldName = 'time';
 const expireAfterSeconds = NumberLong(5);
-assert.commandWorked(testDB.createCollection(
+assert.commandWorked(db.createCollection(
     coll.getName(),
     {timeseries: {timeField: timeFieldName, expireAfterSeconds: expireAfterSeconds}}));
-assert.contains(bucketsColl.getName(), testDB.getCollectionNames());
+assert.contains(bucketsColl.getName(), db.getCollectionNames());
 
 // Inserts a measurement with a time in the past to ensure the measurement will be removed
 // immediately.
@@ -47,7 +42,7 @@ const doc = {
     [timeFieldName]: t,
     x: 0
 };
-assert.commandWorked(coll.insert(doc), 'failed to insert doc: ' + tojson(doc));
+assert.commandWorked(coll.insert(doc, {ordered: false}), 'failed to insert doc: ' + tojson(doc));
 jsTestLog('Insertion took ' + ((new Date()).getTime() - start.getTime()) + ' ms.');
 
 // Wait for the document to be removed.

@@ -33,7 +33,6 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/aggregate_command_gen.h"
-#include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/s/query/cluster_client_cursor_params.h"
@@ -79,7 +78,7 @@ public:
      */
     static Status runAggregate(OperationContext* opCtx,
                                const Namespaces& namespaces,
-                               const AggregateCommand& request,
+                               const AggregateCommandRequest& request,
                                const LiteParsedPipeline& liteParsedPipeline,
                                const PrivilegeVector& privileges,
                                BSONObjBuilder* result);
@@ -89,7 +88,7 @@ public:
      */
     static Status runAggregate(OperationContext* opCtx,
                                const Namespaces& namespaces,
-                               const AggregateCommand& request,
+                               const AggregateCommandRequest& request,
                                const PrivilegeVector& privileges,
                                BSONObjBuilder* result);
 
@@ -103,7 +102,7 @@ public:
      * On success, populates 'result' with the command response.
      */
     static Status retryOnViewError(OperationContext* opCtx,
-                                   const AggregateCommand& request,
+                                   const AggregateCommandRequest& request,
                                    const ResolvedView& resolvedView,
                                    const NamespaceString& requestedNss,
                                    const PrivilegeVector& privileges,

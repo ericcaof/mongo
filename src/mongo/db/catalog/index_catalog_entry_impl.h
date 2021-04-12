@@ -39,7 +39,6 @@
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/record_id.h"
-#include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
 
@@ -161,6 +160,11 @@ public:
                      const KeyStringSet& multikeyMetadataKeys,
                      const MultikeyPaths& multikeyPaths) final;
 
+    void forceSetMultikey(OperationContext* const opCtx,
+                          const CollectionPtr& coll,
+                          bool isMultikey,
+                          const MultikeyPaths& multikeyPaths) final;
+
     bool isReady(OperationContext* opCtx) const final;
 
     bool isFrozen() const final;
@@ -168,10 +172,6 @@ public:
     bool isPresentInMySnapshot(OperationContext* opCtx) const final;
 
     bool isReadyInMySnapshot(OperationContext* opCtx) const final;
-
-    KVPrefix getPrefix() const final {
-        return _prefix;
-    }
 
     /**
      * If return value is not boost::none, reads with majority read concern using an older snapshot
@@ -209,8 +209,6 @@ private:
     void _catalogSetMultikey(OperationContext* opCtx,
                              const CollectionPtr& collection,
                              const MultikeyPaths& multikeyPaths);
-
-    KVPrefix _catalogGetPrefix(OperationContext* opCtx) const;
 
     // -----
 
@@ -260,10 +258,6 @@ private:
     // at 0) into the corresponding indexed field that represent what prefixes of the indexed field
     // causes the index to be multikey.
     MultikeyPaths _indexMultikeyPaths;
-
-    // KVPrefix used to differentiate between index entries in different logical indexes sharing the
-    // same underlying sorted data interface.
-    const KVPrefix _prefix;
 
     // The earliest snapshot that is allowed to read this index.
     boost::optional<Timestamp> _minVisibleSnapshot;
